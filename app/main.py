@@ -142,6 +142,41 @@ def transaction(conn: sqlite3.Connection):
         raise
 
 
+def apply_schema_migrations(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL)")
+    def migration(version: int,name: str,apply):
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE version=?",(version,)).fetchone():
+            return
+        with transaction(conn):
+            # Recheck inside the write transaction: concurrent workers may start together.
+            if conn.execute("SELECT 1 FROM schema_migrations WHERE version=?",(version,)).fetchone():
+                return
+            apply()
+            conn.execute("INSERT INTO schema_migrations VALUES(?,?,?)",(version,name,now_iso()))
+    def add_sales_customer_id():
+        columns={r[1] for r in conn.execute("PRAGMA table_info(sales)").fetchall()}
+        if "customer_id" not in columns:
+            conn.execute("ALTER TABLE sales ADD COLUMN customer_id TEXT REFERENCES customers(id)")
+    def add_product_metadata():
+        columns={r[1] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
+        for column,sql in (("category","ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''"),("barcode","ALTER TABLE products ADD COLUMN barcode TEXT"),("min_stock_milli","ALTER TABLE products ADD COLUMN min_stock_milli INTEGER NOT NULL DEFAULT 0")):
+            if column not in columns:
+                conn.execute(sql)
+    def add_barcode_index():
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS products_company_barcode ON products(company_id, barcode) WHERE barcode IS NOT NULL AND barcode <> ''")
+    def backfill_paid_payables():
+        conn.execute("""INSERT OR IGNORE INTO payable_payments(id,company_id,payable_id,amount_cents,payment_date,reference,idempotency_key,created_by,created_at)
+            SELECT 'legacy-payment:'||ap.id,ap.company_id,ap.id,ap.amount_cents,substr(COALESCE(ap.paid_at,ap.created_at),1,10),
+                   CASE WHEN length(trim(ap.payment_note))>=3 THEN trim(ap.payment_note) ELSE 'Baixa manual histórica registrada antes do ledger' END,
+                   'legacy-paid:'||ap.id,ap.created_by,COALESCE(ap.paid_at,ap.created_at)
+            FROM accounts_payable ap
+            WHERE ap.status='paid' AND NOT EXISTS (SELECT 1 FROM payable_payments pp WHERE pp.company_id=ap.company_id AND pp.payable_id=ap.id)""")
+    migration(1,"sales_customer_id",add_sales_customer_id)
+    migration(2,"product_metadata",add_product_metadata)
+    migration(3,"company_barcode_unique_index",add_barcode_index)
+    migration(4,"backfill_legacy_paid_payables",backfill_paid_payables)
+
+
 def init_db() -> None:
     conn = connect_db()
     try:
@@ -309,16 +344,7 @@ def init_db() -> None:
         CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_events
             BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
         """)
-        sales_columns={r[1] for r in conn.execute("PRAGMA table_info(sales)").fetchall()}
-        if "customer_id" not in sales_columns:
-            conn.execute("ALTER TABLE sales ADD COLUMN customer_id TEXT REFERENCES customers(id)")
-        existing_columns = {r[1] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
-        for column, sql in (("category", "ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''"),
-                            ("barcode", "ALTER TABLE products ADD COLUMN barcode TEXT"),
-                            ("min_stock_milli", "ALTER TABLE products ADD COLUMN min_stock_milli INTEGER NOT NULL DEFAULT 0")):
-            if column not in existing_columns:
-                conn.execute(sql)
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS products_company_barcode ON products(company_id, barcode) WHERE barcode IS NOT NULL AND barcode <> ''")
+        apply_schema_migrations(conn)
         for segment_id, segment in SEGMENT_CATALOG.items():
             conn.execute("INSERT OR REPLACE INTO segment_catalog(id,name,questions_json,active) VALUES(?,?,?,1)",
                          (segment_id, segment["name"], json.dumps(segment["questions"], ensure_ascii=False)))

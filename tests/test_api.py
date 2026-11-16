@@ -318,6 +318,7 @@ def test_legacy_product_schema_migrates_without_losing_catalog(tmp_path, monkeyp
     conn=main.connect_db()
     try:
         conn.execute("DROP INDEX IF EXISTS products_company_barcode")
+        conn.execute("DELETE FROM schema_migrations WHERE version IN (2,3)")
         conn.execute("ALTER TABLE products DROP COLUMN min_stock_milli")
         conn.execute("ALTER TABLE products DROP COLUMN barcode")
         conn.execute("ALTER TABLE products DROP COLUMN category")
@@ -418,6 +419,36 @@ def test_manual_expenses_and_partial_payable_payments_are_audited_idempotent_and
     finally: conn.close()
     assert count==2
     assert world.get('/v1/audit-events',headers=auth(owner)).json()['items']
+
+
+def test_schema_migrations_are_versioned_and_idempotent(world):
+    main.init_db()
+    main.init_db()
+    conn=main.connect_db()
+    try:
+        versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
+    finally: conn.close()
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables')]
+
+
+def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
+    from datetime import date,timedelta
+    owner=company(world)
+    created=world.post('/v1/finance/expenses',headers={**auth(owner),'Idempotency-Key':'legacy-expense'},json={'description':'Conta histórica','amount':'25.00','due_date':(date.today()+timedelta(days=1)).isoformat()}).json()
+    conn=main.connect_db()
+    try:
+        conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=?",(date.today().isoformat()+'T12:00:00+00:00','Baixa informada antiga',created['id']))
+        conn.execute("DELETE FROM schema_migrations WHERE version=4")
+    finally: conn.close()
+    main.init_db()
+    main.init_db()
+    conn=main.connect_db()
+    try:
+        rows=conn.execute('SELECT amount_cents,reference,idempotency_key FROM payable_payments WHERE payable_id=?',(created['id'],)).fetchall()
+        assert len(rows)==1 and rows[0]['amount_cents']==2500
+        assert rows[0]['reference']=='Baixa informada antiga'
+        assert rows[0]['idempotency_key']=='legacy-paid:'+created['id']
+    finally: conn.close()
 
 
 def test_supplier_purchase_receipt_updates_inventory_once_and_audits(world):
