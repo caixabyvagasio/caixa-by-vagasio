@@ -1181,14 +1181,22 @@ def adjust_stock(product_id: str, data: StockAdjustmentIn, conn: DB, user: USER)
 
 
 @app.get("/v1/stock-movements")
-def list_stock_movements(conn: DB, user: USER, limit: int = Query(default=100, ge=1, le=200)):
-    rows = conn.execute("""SELECT m.*,p.sku,p.name,u.full_name AS actor_name FROM stock_movements m
-        JOIN products p ON p.id=m.product_id JOIN users u ON u.id=m.actor_id
-        WHERE m.company_id=? ORDER BY m.created_at DESC LIMIT ?""", (user["company_id"], limit)).fetchall()
+def list_stock_movements(conn: DB, user: USER, limit: int = Query(default=100, ge=1, le=200), offset: int = Query(default=0,ge=0),
+                        product_id: str | None = None, kind: str | None = None):
+    allowed={"adjustment_in","adjustment_out","sale","reversal"}
+    if kind and kind not in allowed: raise HTTPException(422,"Tipo de movimentação inválido.")
+    clauses=["m.company_id=?"];params=[user["company_id"]]
+    if product_id: clauses.append("m.product_id=?");params.append(product_id)
+    if kind: clauses.append("m.kind=?");params.append(kind)
+    where=" AND ".join(clauses)
+    rows = conn.execute(f"""SELECT m.*,p.sku,p.name,u.full_name AS actor_name FROM stock_movements m
+        JOIN products p ON p.id=m.product_id JOIN users u ON u.id=m.actor_id WHERE {where}
+        ORDER BY m.created_at DESC,m.id DESC LIMIT ? OFFSET ?""", (*params,limit,offset)).fetchall()
+    count=conn.execute(f"SELECT count(*) FROM stock_movements m WHERE {where}",params).fetchone()[0]
     return {"items": [{"id": r["id"], "product_id": r["product_id"], "sku": r["sku"], "product": r["name"],
                        "actor": r["actor_name"], "kind": r["kind"], "quantity": milli_to_decimal(abs(r["quantity_milli"])),
                        "before": milli_to_decimal(r["before_milli"]), "after": milli_to_decimal(r["after_milli"]),
-                       "reason": r["reason"], "sale_id": r["sale_id"], "created_at": r["created_at"]} for r in rows]}
+                       "reason": r["reason"], "sale_id": r["sale_id"], "created_at": r["created_at"]} for r in rows],"total":count,"limit":limit,"offset":offset}
 
 
 @app.post("/v1/registers/open", status_code=201)

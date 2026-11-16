@@ -18,3 +18,5 @@
 .customer-table table{min-width:420px}
 
 #view-finance .purchase-orders-panel{margin-top:15px}.metric-grid{margin-bottom:14px}#view-finance .metric small{line-height:1.4}
+
+.stock-filters select{height:34px;border:1px solid #e5dce0;border-radius:8px;background:#fff;padding:0 9px;font-size:10px;color:var(--ink)}#view-stock-history table{min-width:800px}

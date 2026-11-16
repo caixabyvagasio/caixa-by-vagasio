@@ -43,3 +43,8 @@
 - Gerente, administrador ou titular pode cancelar venda paga da própria empresa com justificativa obrigatória. Em uma transação: marca como cancelada, restaura estoque com movimentos `reversal`, estorna total no caixa e anexa auditoria; repetição é rejeitada.
 - A devolução em espécie ao cliente continua manual; UI e resposta informam que não houve integração nem confirmação do pagamento.
 - Testes locais: 34 passaram; UI de listagem agora apresenta venda cancelada e controle de cancelamento. CI remoto após commit pendente. Sem deploy.
+
+## Incremento de histórico de estoque
+- Endpoint com filtros por empresa/produto/tipo, paginação e total de movimentos.
+- Nova tela do portal empresarial lista data, item, tipo, quantidade, saldo antes/depois, responsável e justificativa; filtro para entradas, saídas, vendas e estornos.
+- Testes locais: 35 aprovados; UI e API estão apenas na branch de desenvolvimento até CI. Sem deploy.

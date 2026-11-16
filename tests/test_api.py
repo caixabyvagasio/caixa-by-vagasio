@@ -496,3 +496,17 @@ def test_operator_cannot_void_sale_or_foreign_sale(world):
     assert world.post(f"/v1/sales/{sale['id']}/void",headers=auth(operator),json={'reason':'Solicitação de cliente'}).status_code==403
     other=company(world,'Outra loja','outra-loja','outro@example.test')
     assert world.post(f"/v1/sales/{sale['id']}/void",headers=auth(other),json={'reason':'Solicitação de cliente'}).status_code==404
+
+
+def test_stock_movement_history_filters_by_company_product_and_kind(world):
+    one=company(world)
+    p=product(world,one,sku='HIST-1')
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(one),json={'direction':'in','quantity':'4','reason':'Recebimento'})
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(one),json={'direction':'out','quantity':'1','reason':'Quebra registrada'})
+    all_rows=world.get('/v1/stock-movements',headers=auth(one)).json()
+    assert all_rows['total']==2
+    filtered=world.get(f"/v1/stock-movements?product_id={p['id']}&kind=adjustment_out",headers=auth(one)).json()
+    assert filtered['total']==1 and filtered['items'][0]['reason']=='Quebra registrada'
+    assert world.get('/v1/stock-movements?kind=invalid',headers=auth(one)).status_code==422
+    two=company(world,'Loja Dois','loja-dois','two@example.test')
+    assert world.get('/v1/stock-movements',headers=auth(two)).json()['total']==0
