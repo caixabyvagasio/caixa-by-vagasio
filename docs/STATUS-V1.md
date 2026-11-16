@@ -37,3 +37,9 @@
 - Tela financeira mostra vendas em dinheiro, contas a pagar abertas/vencidas e baixa manual auditada, identificada explicitamente como não confirmada pelo banco.
 - Não há conciliação bancária, contas a receber a prazo, fluxo de caixa completo, DRE nem provedor financeiro. Valores do resumo são parciais, não faturamento contábil.
 - Testes: 32 aprovados localmente; alerta conhecido de depreciação da dependência Starlette TestClient/httpx. Sem deploy.
+
+
+## Incremento de cancelamento de vendas
+- Gerente, administrador ou titular pode cancelar venda paga da própria empresa com justificativa obrigatória. Em uma transação: marca como cancelada, restaura estoque com movimentos `reversal`, estorna total no caixa e anexa auditoria; repetição é rejeitada.
+- A devolução em espécie ao cliente continua manual; UI e resposta informam que não houve integração nem confirmação do pagamento.
+- Testes locais: 34 passaram; UI de listagem agora apresenta venda cancelada e controle de cancelamento. CI remoto após commit pendente. Sem deploy.

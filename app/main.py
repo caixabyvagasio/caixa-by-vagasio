@@ -596,6 +596,17 @@ class CashMovementIn(StrictModel):
     reason: str = Field(min_length=3, max_length=240)
 
 
+class SaleVoidIn(StrictModel):
+    reason: str = Field(min_length=5,max_length=240)
+
+    @field_validator("reason")
+    @classmethod
+    def trim_reason(cls,value):
+        value=value.strip()
+        if len(value)<5: raise ValueError("Informe o motivo do cancelamento")
+        return value
+
+
 class SaleLineIn(StrictModel):
     product_id: str
     quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=3)
@@ -1324,6 +1335,27 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
         result = conn.execute("SELECT * FROM sales WHERE id=?", (sale_id,)).fetchone()
         output = sale_json(conn, result)
     return output
+
+
+@app.post("/v1/sales/{sale_id}/void")
+def void_sale(sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager")
+    created=now_iso()
+    with transaction(conn):
+        sale=conn.execute("SELECT * FROM sales WHERE id=? AND company_id=?",(sale_id,user["company_id"])).fetchone()
+        if not sale: raise HTTPException(404,"Venda não encontrada nesta empresa.")
+        if sale["status"]!="paid": raise HTTPException(409,"Somente venda paga pode ser cancelada.")
+        items=conn.execute("SELECT * FROM sale_items WHERE sale_id=?",(sale_id,)).fetchall()
+        for item in items:
+            product=conn.execute("SELECT stock_milli FROM products WHERE id=? AND company_id=?",(item["product_id"],user["company_id"])).fetchone()
+            if not product: raise HTTPException(409,"Produto da venda não existe mais; estorno de estoque interrompido.")
+            before=product["stock_milli"];after=before+item["quantity_milli"]
+            conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,item["product_id"],user["company_id"]))
+            conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],item["product_id"],user["id"],"reversal",item["quantity_milli"],before,after,"Cancelamento venda "+sale_id+": "+data.reason,sale_id,created))
+        conn.execute("UPDATE sales SET status='voided' WHERE id=? AND company_id=?",(sale_id,user["company_id"]))
+        conn.execute("INSERT INTO cash_movements VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],sale["register_id"],user["id"],"withdrawal",-sale["total_cents"],"Estorno venda "+sale_id+": "+data.reason,sale_id,created))
+        audit(conn,user["company_id"],user["id"],"sale.voided","sale",sale_id,{"reason":data.reason,"amount":cents_to_money(sale["total_cents"]),"stock_items":len(items)})
+    return {"id":sale_id,"status":"voided","reason":data.reason,"voided_at":created,"note":"Estorno registrado no livro local; devolução de dinheiro ao cliente é manual e não confirmada por provedor."}
 
 
 @app.get("/v1/sales")

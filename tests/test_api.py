@@ -466,3 +466,33 @@ def test_purchase_receipt_without_due_date_does_not_create_payable_and_past_date
     assert response.status_code==422
     assert world.get('/v1/products',headers=auth(owner)).json()['items'][0]['stock']=='0'
     assert world.get('/v1/finance/payables',headers=auth(owner)).json()['items']==[]
+
+
+def test_sale_void_restores_stock_reverses_cash_and_is_manager_only(world):
+    owner=company(world)
+    p=product(world,owner,sku='VOID-1',price='5.00')
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(owner),json={'direction':'in','quantity':'3','reason':'Estoque inicial'})
+    world.post('/v1/registers/open',headers=auth(owner),json={'label':'Caixa','opening_amount':'20.00'})
+    sale=world.post('/v1/sales',headers={**auth(owner),'Idempotency-Key':'void-sale-1'},json={'items':[{'product_id':p['id'],'quantity':'2'}],'payment_method':'cash','received_amount':'10.00'}).json()
+    result=world.post(f"/v1/sales/{sale['id']}/void",headers=auth(owner),json={'reason':'Cliente desistiu da compra'})
+    assert result.status_code==200 and result.json()['status']=='voided'
+    assert world.get('/v1/products',headers=auth(owner)).json()['items'][0]['stock']=='3'
+    current=world.get('/v1/registers/current',headers=auth(owner)).json()
+    assert current['expected_amount']=='20.00'
+    assert world.get('/v1/dashboard/summary',headers=auth(owner)).json()['sales_today']==0
+    repeat=world.post(f"/v1/sales/{sale['id']}/void",headers=auth(owner),json={'reason':'Tentativa repetida'})
+    assert repeat.status_code==409
+    assert any(e['action']=='sale.voided' for e in world.get('/v1/audit-events',headers=auth(owner)).json()['items'])
+
+
+def test_operator_cannot_void_sale_or_foreign_sale(world):
+    owner=company(world)
+    p=product(world,owner,sku='V-1')
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(owner),json={'direction':'in','quantity':'2','reason':'Entrada'})
+    world.post('/v1/registers/open',headers=auth(owner),json={'label':'Caixa','opening_amount':'0'})
+    sale=world.post('/v1/sales',headers={**auth(owner),'Idempotency-Key':'void-role'},json={'items':[{'product_id':p['id'],'quantity':'1'}],'payment_method':'cash','received_amount':'10.50'}).json()
+    world.post('/v1/users',headers=auth(owner),json={'full_name':'Operador','email':'voidop@example.test','password':'secure-password-123','role':'operator'})
+    operator=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'voidop@example.test','password':'secure-password-123'}).json()['access_token']
+    assert world.post(f"/v1/sales/{sale['id']}/void",headers=auth(operator),json={'reason':'Solicitação de cliente'}).status_code==403
+    other=company(world,'Outra loja','outra-loja','outro@example.test')
+    assert world.post(f"/v1/sales/{sale['id']}/void",headers=auth(other),json={'reason':'Solicitação de cliente'}).status_code==404
