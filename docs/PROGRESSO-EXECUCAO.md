@@ -24,8 +24,8 @@ Data: 2026-11-16. Branch alvo `development-v1`.
 - Código/refinamento de migrations commitado em `9f2608002a72099e167096d512204d806bb89fce`, CI `43952022632` success. Suíte local final: 50 passed, 1 warning. Não publicar o bloco financeiro sem autorização.
 
 ## PostgreSQL Render e pendências
-- PostgreSQL Free criado na conta Caixa: `dpg-dbtmtfqfngtc739jvhk0-a`, Ohio, PG18, vence em 16/12/2026. Base vazia. Dados anteriores do SQLite efêmero não são recuperáveis. Endpoint interno não é acessível a partir do sandbox; runtime de Render tem de confirmar conexão.
-- Adapter PostgreSQL e workflow CI real em implementação local. Suite SQLite 51 passed/1 skipped; não houve CI PostgreSQL testado ou deploy do código com adapter neste checkpoint.
-- Próximos passos: validar workflow PostgreSQL com cada suíte numa DB isolada por teste, corrigir erros SQL, executar CI, commitar e só então configurar conexão em Render e testar reinício/login antes de abrir signup.
-- PostgreSQL free expira 30 dias depois de criação e sem backups/PITR; usuário solicitou plano grátis e depois atualizar. Migração para plano/destino superior deverá ocorrer antes da data de expiração para manter acesso e continuidade.
-- Prosseguir com Portal Master, filiais, entitlements, backup/restore, recebíveis/parcelamentos, conciliação, DRE, integração fiscal/pagamentos, operação offline e módulos especializados; nenhuma homologação externa ainda.
+- PostgreSQL Free criado: `dpg-dbtmtfqfngtc739jvhk0-a`, Ohio, PG18, vence em 16/12/2026. Base vazia; dados anteriores do SQLite efêmero não são recuperáveis. Endpoint interno não é acessível diretamente deste sandbox; conexão deve ser validada pelo serviço Render.
+- Adapter psycopg2 e workflow CI PostgreSQL real implementados no worktree. Primeira CI `43960213644` falhou com problemas reais de comparação date/text, upsert e teste signup; correções foram aplicadas. Suite SQLite final: 51 passed, 1 skipped, 1 warning.
+- Novo commit/CI PostgreSQL precisa passar antes de conectar DATABASE_URL no Render. Depois ativar guard CAIXA_REQUIRE_POSTGRES e testar health/login/criação fictícia/reinício, sem publicar a connection string.
+- Banco grátis expira em 30 dias e não tem backups/PITR; o usuário instruirá atualização posterior, mas necessita migrar antes de 16/12/2026.
+- Prosseguir com Portal Master, filiais, entitlements, backup/restore, recebíveis/parcelamentos, conciliação, DRE, fiscal/pagamentos, offline e módulos especializados.

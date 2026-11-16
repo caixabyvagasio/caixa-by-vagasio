@@ -60,6 +60,8 @@ class PostgresConnection:
             return "INSERT INTO segment_catalog(id,name,questions_json,active) VALUES(%s,%s,%s,1) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,questions_json=EXCLUDED.questions_json,active=1", None
         if "INSERT OR REPLACE INTO FEATURE_CATALOG" in raw_sql.upper():
             return "INSERT INTO feature_catalog(id,name,description,category,recommended_segments_json,dependencies_json,available) VALUES(%s,%s,%s,%s,%s,%s,1) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,category=EXCLUDED.category,recommended_segments_json=EXCLUDED.recommended_segments_json,dependencies_json=EXCLUDED.dependencies_json,available=1", None
+        if "ON CONFLICT(COMPANY_ID) DO UPDATE" in raw_sql.upper():
+            return re.sub(r"ON CONFLICT\(company_id\) DO UPDATE SET (.*)",lambda m:"ON CONFLICT(company_id) DO UPDATE SET "+re.sub(r"excluded\.([a-z_]+)",r"EXCLUDED.\1",m.group(1),flags=re.I),sql.replace("?","%s"),flags=re.I|re.S), None
         ignore_insert=bool(re.search(r"^\s*INSERT OR IGNORE INTO",sql,re.I))
         sql=re.sub(r"^\s*INSERT OR IGNORE INTO", "INSERT INTO",sql,flags=re.I)
         sql=sql.replace("?", "%s")
@@ -72,6 +74,7 @@ class PostgresConnection:
         sql=re.sub(r"strftime\('%Y-%m',\s*([a-zA-Z0-9_.]+)\)",r"to_char(CAST(SUBSTRING(\1 FROM 1 FOR 10) AS date),'YYYY-MM')",sql,flags=re.I)
         sql=re.sub(r"date\(([a-zA-Z0-9_.]+)\)",r"CAST(SUBSTRING(\1 FROM 1 FOR 10) AS date)",sql,flags=re.I)
         sql=sql.replace("date(%s)","CAST(%s AS date)")
+        sql=re.sub(r"([a-zA-Z0-9_.]+)\s*<\s*CURRENT_DATE",r"CAST(\1 AS date)<CURRENT_DATE",sql,flags=re.I)
         sql=re.sub(r"date\(([^)]+)\)\s*=\s*CURRENT_DATE",r"CAST(SUBSTRING(\1 FROM 1 FOR 10) AS date)=CURRENT_DATE",sql,flags=re.I)
         sql=re.sub(r"SUM\(MAX\(0,", "SUM(GREATEST(0,",sql,flags=re.I)
         sql=re.sub(r"\s+COLLATE\s+NOCASE\b", "", sql, flags=re.I)
@@ -220,7 +223,8 @@ FEATURES = [
 ]
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Keep deterministic ordering for sequential audit/profile events created within one second.
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def new_id() -> str:

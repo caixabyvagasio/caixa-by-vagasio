@@ -68,9 +68,11 @@ def test_postgres_sql_translation_handles_existing_sqlite_queries(monkeypatch):
     assert "amount BIGINT NOT NULL" in sql
     sql,_=conn._sql("INSERT OR IGNORE INTO sample(id) VALUES(?)")
     assert sql=="INSERT INTO sample(id) VALUES(%s) ON CONFLICT DO NOTHING"
-    sql,_=conn._sql("SELECT date('now'),strftime('%Y-%m',created_at),SUM(MAX(0, amount)) FROM sample WHERE created_at>=date(?)")
+    sql,_=conn._sql("SELECT date('now'),strftime('%Y-%m',created_at),SUM(MAX(0, amount)) FROM sample WHERE created_at>=date(?) AND due_date<date('now')")
     assert "CURRENT_DATE" in sql and "to_char(CAST(SUBSTRING(created_at FROM 1 FOR 10) AS date),'YYYY-MM')" in sql
-    assert "SUM(GREATEST(0," in sql and "CAST(%s AS date)" in sql
+    assert "SUM(GREATEST(0," in sql and "CAST(%s AS date)" in sql and "CAST(due_date AS date)<CURRENT_DATE" in sql
+    sql,params=conn._sql("INSERT INTO company_profiles(company_id,primary_segment) VALUES(?,?) ON CONFLICT(company_id) DO UPDATE SET primary_segment=excluded.primary_segment")
+    assert "EXCLUDED.primary_segment" in sql and "%s" in sql and params is None
 
 
 def test_frontend_is_served_from_same_app(world):
@@ -272,7 +274,7 @@ def test_public_signup_creates_isolated_owner_when_enabled(tmp_path, monkeypatch
         payload = {"company_name":"Nova Empresa","company_slug":"Nova-Empresa","owner_name":"Pessoa Teste",
                    "email":"NOVO@EXAMPLE.TEST","password":"strong-test-password-123"}
         result = client.post("/v1/companies/register", json=payload)
-        assert result.status_code == 503, result.text
+        assert result.status_code == 201, result.text
         assert client.post("/v1/companies/register", json=payload).status_code == 409
         login = client.post("/v1/auth/login", json={"company_slug":"nova-empresa","email":"novo@example.test",
                                                        "password":"strong-test-password-123"})
