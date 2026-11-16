@@ -61,6 +61,6 @@ Não provisionar banco pago, disco, backups, provedor de pagamento, gateway fisc
 - [x] `stock` sem create/update catálogo ou preços (`292e336`, CI `43914431760`).
 - [x] Na etapa local de hardening, `stock` não vê custo de produtos, fornecedores PII, vendas, caixa, dashboard, relatórios de estoque/vendas, auditoria nem clientes; operadores têm nome de cliente apenas e sem endpoints de histórico/PII. Testes API atualizados.
 - [x] Overflow do resumo de valuation alterado para aritmética inteira Python; teste de valor grande.
-- [ ] Commit/CI dos últimos ajustes de RBAC/overflow/UI, aplicar apenas branch; deploy de desenvolvimento aguardando autorização expressa.
+- [x] Commit/CI dos últimos ajustes de RBAC/overflow/UI no commit `fe4faba`, CI `43916794723` success. Não deployar sem autorização.
 - [ ] Continuar fases 3–11; conclusão global não atingida.
-- [x] Agregados testes estruturais de frontend: refs de elementos, form balanceado, proteção UI PII, breakpoints móveis e presença de security headers; total atual de suíte local 47 passed.
+- [x] Agregados testes estruturais de frontend: refs de elementos, form balanceado, proteção UI PII, breakpoints móveis e presença de security headers; total de suíte local 47 passed no checkpoint pré-final. Ver CI `fe4faba` para versão commitada.

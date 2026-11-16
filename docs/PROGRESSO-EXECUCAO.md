@@ -27,6 +27,6 @@ Data: 2026-11-16. Branch `development-v1`; base do ciclo `ff72d7a2a3606eec2cdcd1
 - Adicionada proteção adicional no endpoint `/v1/registers/current`; testes de acesso a vendas/caixa/dashboard/relatórios/auditoria por operator e stock.
 - Removido `cost` dos produtos em resposta de operator/stock; stock sem relatório de estoque, com dados de fornecedor PII, vendas, caixa, dashboard, auditoria, customers e report financeiro. Endpoint supplier retorna somente id/nome/ativo para stock. Operador só vê nome de clientes e o formulário de campos pessoais e botão de histórico são ocultados; proteção principal é server-side.
 - Valorização agregada Python para impedir overflow SQLite; teste com grande estoque e preço válido.
-- Suíte worktree completa no checkpoint após esses ajustes: 44 passed, 1 warning TestClient/httpx. Sem commit/CI para essas edições locais até este ponto.
+- Suíte worktree completa no checkpoint após esses ajustes: 44 passed, 1 warning TestClient/httpx. Commit final de hardening `fe4faba5f6305769c6d91773a94d1dbe2fb45a6b` pushed à branch; CI run `43916794723` success. Continua sem deploy dessas edições.
 - Deploy `cc92667` no ambiente Render Free de desenvolvimento efetivado após confirmação; chamada real de cadastro retornou 404, health e home HTTP 200. Deploy contém cadastro bloqueado durante demo e RBAC/PII inicial. Commit `292e336` e ajustes locais posteriores não foram publicados. Não é produção.
 - Incluí testes estáticos de proteção UI/IDs/forms/breakpoints/security headers; suite worktree passou 47 testes após rodar integralmente.
