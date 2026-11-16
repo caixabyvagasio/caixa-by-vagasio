@@ -21,7 +21,7 @@ Data: 2026-11-16. Branch alvo `development-v1`.
 - Migrações agora ficam registradas na tabela `schema_migrations` com versões 1–4 e transações: coluna sales.customer_id, metadados product, índice único barcode e backfill idempotente de contas antigas pagas.
 - Teste de versão/execução repetida e compatibilidade com schema legado adicionados. Suíte local final: **50 passed, 1 warning** (Starlette TestClient/httpx). AST Python OK; IDs referenciados na UI sem faltantes; 15 forms balanceadas.
 - Não há node/deno/bun nem browser E2E disponível nesta sessão. Resultado não prova UX renderizada ou browser.
-- Código/refinamento de migrations estão no worktree, ainda precisam commit+CI; não publicar o bloco financeiro sem autorização.
+- Código/refinamento de migrations commitado em `9f2608002a72099e167096d512204d806bb89fce`, CI `43952022632` success. Suíte local final: 50 passed, 1 warning. Não publicar o bloco financeiro sem autorização.
 
 ## Pendências
 - Commit/CI do refinement de migrations e documentação atual.
