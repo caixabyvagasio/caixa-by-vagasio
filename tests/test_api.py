@@ -1,0 +1,150 @@
+import pytest
+from fastapi.testclient import TestClient
+
+from app import main
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "caixa-test.sqlite3"))
+    monkeypatch.setattr(main, "TOKEN_SECRET", "test-only-token-secret-with-entropy-123456789")
+    monkeypatch.setattr(main, "BOOTSTRAP_SECRET", "test-only-provisioning-secret-123456")
+    with TestClient(main.app) as client:
+        yield client
+
+
+def company(client, name="Mercado Um", slug="mercado-um", email="owner@example.test"):
+    response = client.post("/v1/bootstrap", headers={"X-Bootstrap-Key": "test-only-provisioning-secret-123456"}, json={
+        "company_name": name, "company_slug": slug.upper(), "owner_name": "Ana Teste",
+        "email": email, "password": "strong-test-password-123"
+    })
+    assert response.status_code == 201, response.text
+    login = client.post("/v1/auth/login", json={"company_slug": slug.upper(), "email": email.upper(), "password": "strong-test-password-123"})
+    assert login.status_code == 200, login.text
+    return login.json()["access_token"]
+
+
+def auth(token):
+    return {"Authorization": "Bearer " + token}
+
+
+def product(client, token, sku="SKU-1", name="Cafe", price="10.50"):
+    response = client.post("/v1/products", headers=auth(token), json={"sku": sku, "name": name, "unit": "un", "price": price, "cost": "5.00"})
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def test_frontend_is_served_from_same_app(world):
+    assert world.get("/").status_code == 200
+    assert "Entrar na sua empresa" in world.get("/").text
+    assert "V1 está em desenvolvimento" in world.get("/").text
+    assert world.get("/static/app.js").status_code == 200
+    assert world.get("/static/app.css").status_code == 200
+
+
+def test_health_and_provisioning_gate(world):
+    assert world.get("/health").json()["integrations"] == {"payments": False, "fiscal": False}
+    denied = world.post("/v1/bootstrap", json={"company_name":"Xx","company_slug":"xx","owner_name":"AA","email":"a@b.co","password":"strong-test-password-123"})
+    assert denied.status_code == 403
+    assert world.get("/v1/products").status_code == 401
+
+
+def test_company_scope_products_and_authentication(world):
+    t1 = company(world)
+    t2 = company(world, "Mercado Dois", "mercado-dois", "owner2@example.test")
+    p1 = product(world, t1)
+    assert world.get("/v1/products", headers=auth(t2)).json()["items"] == []
+    assert world.post(f"/v1/products/{p1['id']}/stock-adjustments", headers=auth(t2), json={"direction":"in","quantity":"5","reason":"Recebimento"}).status_code == 404
+    assert world.post("/v1/products", headers=auth(t2), json={"sku":"SKU-1","name":"Cafe 2","price":"1.00","cost":"0.50"}).status_code == 201
+
+
+def test_company_user_management_and_deactivation(world):
+    token = company(world)
+    created = world.post("/v1/users", headers=auth(token), json={"full_name":"Bia Caixa","email":"BIA@EXAMPLE.TEST","password":"strong-user-password-123","role":"operator"})
+    assert created.status_code == 201, created.text
+    assert created.json()["email"] == "bia@example.test"
+    assert world.get("/v1/users", headers=auth(token)).status_code == 200
+    user_id = created.json()["id"]
+    assert world.patch(f"/v1/users/{user_id}", headers=auth(token), json={"active":False}).status_code == 200
+    assert world.post("/v1/auth/login", json={"company_slug":"mercado-um","email":"bia@example.test","password":"strong-user-password-123"}).status_code == 401
+    assert any(event["action"] == "user.status_changed" for event in world.get("/v1/audit-events", headers=auth(token)).json()["items"])
+
+
+def test_stock_adjustment_rejects_negative_and_audits(world):
+    token = company(world)
+    p = product(world, token)
+    add = world.post(f"/v1/products/{p['id']}/stock-adjustments", headers=auth(token), json={"direction":"in","quantity":"3.250","reason":"Entrada nota 1"})
+    assert add.status_code == 201 and add.json()["after"] == "3.25"
+    insufficient = world.post(f"/v1/products/{p['id']}/stock-adjustments", headers=auth(token), json={"direction":"out","quantity":"3.251","reason":"Contagem incorreta"})
+    assert insufficient.status_code == 409
+    assert world.get("/v1/products", headers=auth(token)).json()["items"][0]["stock"] == "3.25"
+    assert any(x["action"] == "stock.adjusted" for x in world.get("/v1/audit-events", headers=auth(token)).json()["items"])
+
+
+def test_sale_register_stock_cash_and_idempotency(world):
+    token = company(world)
+    p = product(world, token, price="10.00")
+    assert world.post(f"/v1/products/{p['id']}/stock-adjustments", headers=auth(token), json={"direction":"in","quantity":"5","reason":"Recebimento"}).status_code == 201
+    reg = world.post("/v1/registers/open", headers=auth(token), json={"label":"Caixa 01","opening_amount":"50.00"})
+    assert reg.status_code == 201, reg.text
+    headers = {**auth(token), "Idempotency-Key":"integration-test-sale-001"}
+    payload = {"items":[{"product_id":p["id"],"quantity":"2","discount":"0"}],"payment_method":"cash","received_amount":"25.00"}
+    sale = world.post("/v1/sales", headers=headers, json=payload)
+    assert sale.status_code == 201, sale.text
+    assert sale.json()["total"] == "20.00" and sale.json()["change"] == "5.00"
+    replay = world.post("/v1/sales", headers=headers, json=payload)
+    assert replay.status_code == 200 and replay.json()["id"] == sale.json()["id"]
+    conflict = world.post("/v1/sales", headers=headers, json={**payload,"received_amount":"30.00"})
+    assert conflict.status_code == 409
+    assert world.get("/v1/products", headers=auth(token)).json()["items"][0]["stock"] == "3"
+    current = world.get("/v1/registers/current", headers=auth(token)).json()
+    assert current["expected_amount"] == "70.00"
+    assert world.get("/v1/sales", headers=auth(token)).json()["items"][0]["id"] == sale.json()["id"]
+
+
+def test_no_sale_without_register_or_stock_and_role_limits(world):
+    token = company(world)
+    p = product(world, token, price="8.00")
+    payload = {"items":[{"product_id":p["id"],"quantity":"1","discount":"0"}],"payment_method":"cash","received_amount":"8.00"}
+    assert world.post("/v1/sales", headers={**auth(token),"Idempotency-Key":"no-reg"}, json=payload).status_code == 409
+    world.post(f"/v1/products/{p['id']}/stock-adjustments", headers=auth(token), json={"direction":"in","quantity":"1","reason":"Entrada"})
+    world.post("/v1/registers/open", headers=auth(token), json={"label":"Caixa 01","opening_amount":"0"})
+    assert world.post("/v1/sales", headers={**auth(token),"Idempotency-Key":"insufficient-receipt"}, json={**payload,"received_amount":"7.99"}).status_code == 422
+    assert world.post("/v1/sales", headers={**auth(token),"Idempotency-Key":"discount"}, json={"items":[{"product_id":p["id"],"quantity":"1","discount":"1.00"}],"payment_method":"cash","received_amount":"7.00"}).status_code == 201
+
+
+def test_cash_movement_and_close_reconciliation(world):
+    token = company(world)
+    opened = world.post("/v1/registers/open", headers=auth(token), json={"label":"Caixa 01","opening_amount":"100.00"}).json()
+    supply = world.post(f"/v1/registers/{opened['id']}/movements", headers=auth(token), json={"kind":"supply","amount":"20.00","reason":"Troco extra"})
+    assert supply.status_code == 201
+    withdrawal = world.post(f"/v1/registers/{opened['id']}/movements", headers=auth(token), json={"kind":"withdrawal","amount":"15.00","reason":"Sangria autorizada"})
+    assert withdrawal.status_code == 201
+    closed = world.post(f"/v1/registers/{opened['id']}/close", headers=auth(token), json={"counted_amount":"105.00"})
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["expected_amount"] == "105.00"
+    assert closed.json()["difference"] == "0.00"
+    assert world.get("/v1/registers/current", headers=auth(token)).json()["register"] is None
+
+
+def test_operator_cannot_adjust_stock_or_give_discount(world):
+    token = company(world)
+    conn = main.connect_db()
+    try:
+        comp = conn.execute("SELECT id FROM companies WHERE slug='mercado-um'").fetchone()[0]
+        created = main.now_iso()
+        user_id = main.new_id()
+        conn.execute("INSERT INTO users VALUES(?,?,?,?,?,'operator',1,?)", (user_id, comp, "op@example.test", "Operador", main.password_hash("strong-operator-password"), created))
+        user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        product_id = main.new_id()
+        conn.execute("INSERT INTO products(id,company_id,sku,name,unit,price_cents,cost_cents,stock_milli,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (product_id, comp, "OP-1", "Item operador", "un", 1000, 500, 5000, created))
+        conn.execute("INSERT INTO cash_registers(id,company_id,label,status,opening_cents,opened_by,opened_at) VALUES(?,?,?,'open',?,?,?)",
+                     (main.new_id(), comp, "Caixa Operador", 0, user_id, created))
+    finally:
+        conn.close()
+    operator_login = world.post("/v1/auth/login", json={"company_slug":"mercado-um","email":"op@example.test","password":"strong-operator-password"})
+    op_token = operator_login.json()["access_token"]
+    assert world.post(f"/v1/products/{product_id}/stock-adjustments", headers=auth(op_token), json={"direction":"in","quantity":"1","reason":"Tentativa"}).status_code == 403
+    discounted = world.post("/v1/sales", headers={**auth(op_token),"Idempotency-Key":"operator-discount"}, json={"items":[{"product_id":product_id,"quantity":"1","discount":"1.00"}],"payment_method":"cash","received_amount":"9.00"})
+    assert discounted.status_code == 403
