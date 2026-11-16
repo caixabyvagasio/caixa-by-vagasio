@@ -1353,6 +1353,11 @@ def void_sale(sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
         sale=conn.execute("SELECT * FROM sales WHERE id=? AND company_id=?",(sale_id,user["company_id"])).fetchone()
         if not sale: raise HTTPException(404,"Venda não encontrada nesta empresa.")
         if sale["status"]!="paid": raise HTTPException(409,"Somente venda paga pode ser cancelada.")
+        register=conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1",(user["company_id"],)).fetchone()
+        if not register: raise HTTPException(409,"Abra um caixa para registrar o estorno em dinheiro.")
+        current_movements=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements WHERE register_id=?",(register["id"],)).fetchone()[0]
+        expected_cash=register["opening_cents"]+current_movements
+        if expected_cash<sale["total_cents"]: raise HTTPException(409,"O caixa aberto não tem saldo esperado suficiente para registrar a devolução em dinheiro.")
         items=conn.execute("SELECT * FROM sale_items WHERE sale_id=?",(sale_id,)).fetchall()
         for item in items:
             product=conn.execute("SELECT stock_milli FROM products WHERE id=? AND company_id=?",(item["product_id"],user["company_id"])).fetchone()
@@ -1361,9 +1366,9 @@ def void_sale(sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
             conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,item["product_id"],user["company_id"]))
             conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],item["product_id"],user["id"],"reversal",item["quantity_milli"],before,after,"Cancelamento venda "+sale_id+": "+data.reason,sale_id,created))
         conn.execute("UPDATE sales SET status='voided' WHERE id=? AND company_id=?",(sale_id,user["company_id"]))
-        conn.execute("INSERT INTO cash_movements VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],sale["register_id"],user["id"],"withdrawal",-sale["total_cents"],"Estorno venda "+sale_id+": "+data.reason,sale_id,created))
-        audit(conn,user["company_id"],user["id"],"sale.voided","sale",sale_id,{"reason":data.reason,"amount":cents_to_money(sale["total_cents"]),"stock_items":len(items)})
-    return {"id":sale_id,"status":"voided","reason":data.reason,"voided_at":created,"note":"Estorno registrado no livro local; devolução de dinheiro ao cliente é manual e não confirmada por provedor."}
+        conn.execute("INSERT INTO cash_movements VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],register["id"],user["id"],"withdrawal",-sale["total_cents"],"Estorno venda "+sale_id+": "+data.reason,sale_id,created))
+        audit(conn,user["company_id"],user["id"],"sale.voided","sale",sale_id,{"reason":data.reason,"amount":cents_to_money(sale["total_cents"]),"stock_items":len(items),"refund_register_id":register["id"],"refund_method":"cash_manual"})
+    return {"id":sale_id,"status":"voided","reason":data.reason,"voided_at":created,"refund_register_id":register["id"],"note":"Estorno registrado no caixa aberto; a entrega do dinheiro ao cliente é manual e não confirmada por provedor."}
 
 
 @app.get("/v1/sales")

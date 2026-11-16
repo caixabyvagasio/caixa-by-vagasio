@@ -48,3 +48,8 @@
 - Endpoint com filtros por empresa/produto/tipo, paginação e total de movimentos.
 - Nova tela do portal empresarial lista data, item, tipo, quantidade, saldo antes/depois, responsável e justificativa; filtro para entradas, saídas, vendas e estornos.
 - Testes locais: 35 aprovados; UI e API estão apenas na branch de desenvolvimento até CI. Sem deploy.
+
+
+## Correção de segurança do cancelamento em dinheiro
+- Cancelamento agora exige caixa aberto e saldo esperado suficiente; lança estorno contra o caixa aberto corrente, sem reescrever caixa já fechado. Falta de caixa mantém a transação atômica: venda paga e estoque não muda. UI comunica baixa/devolução manual.
+- Validação ampliada: 36 testes locais passaram; CI aguarda commit.

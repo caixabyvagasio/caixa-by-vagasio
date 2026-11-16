@@ -510,3 +510,27 @@ def test_stock_movement_history_filters_by_company_product_and_kind(world):
     assert world.get('/v1/stock-movements?kind=invalid',headers=auth(one)).status_code==422
     two=company(world,'Loja Dois','loja-dois','two@example.test')
     assert world.get('/v1/stock-movements',headers=auth(two)).json()['total']==0
+
+
+def test_void_requires_open_cash_with_enough_balance_and_never_rewrites_closed_register(world):
+    owner=company(world)
+    p=product(world,owner,sku='VOID-CLOSED',price='5.00')
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(owner),json={'direction':'in','quantity':'2','reason':'Entrada'})
+    oldreg=world.post('/v1/registers/open',headers=auth(owner),json={'label':'Caixa antigo','opening_amount':'0'}).json()
+    sale=world.post('/v1/sales',headers={**auth(owner),'Idempotency-Key':'void-closed-sale'},json={'items':[{'product_id':p['id'],'quantity':'1'}],'payment_method':'cash','received_amount':'5.00'}).json()
+    closed=world.post(f"/v1/registers/{oldreg['id']}/close",headers=auth(owner),json={'counted_amount':'5.00'})
+    assert closed.status_code==200
+    no_register=world.post(f"/v1/sales/{sale['id']}/void",headers=auth(owner),json={'reason':'Cancelamento solicitado'})
+    assert no_register.status_code==409
+    assert world.get('/v1/products',headers=auth(owner)).json()['items'][0]['stock']=='1'
+    newreg=world.post('/v1/registers/open',headers=auth(owner),json={'label':'Caixa atual','opening_amount':'4.99'}).json()
+    insufficient=world.post(f"/v1/sales/{sale['id']}/void",headers=auth(owner),json={'reason':'Cancelamento solicitado'})
+    assert insufficient.status_code==409
+    assert world.get('/v1/products',headers=auth(owner)).json()['items'][0]['stock']=='1'
+    # Opening balance is enough; this successful void is recorded only against the new open drawer.
+    world.post(f"/v1/registers/{newreg['id']}/movements",headers=auth(owner),json={'kind':'supply','amount':'0.01','reason':'Troco para teste'})
+    done=world.post(f"/v1/sales/{sale['id']}/void",headers=auth(owner),json={'reason':'Cancelamento solicitado'})
+    assert done.status_code==200
+    old=world.get(f"/v1/registers/{oldreg['id']}",headers=auth(owner))
+    assert old.status_code==404 or old.json()['difference']=='0.00'
+    assert world.get('/v1/registers/current',headers=auth(owner)).json()['expected_amount']=='0.00'
