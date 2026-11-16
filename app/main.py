@@ -227,6 +227,16 @@ def init_db() -> None:
             secondary_segments_json TEXT NOT NULL, answers_json TEXT NOT NULL, modules_json TEXT NOT NULL,
             updated_by TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS company_profile_versions (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+            profile_json TEXT NOT NULL, actor_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS company_profile_versions_history
+            ON company_profile_versions(company_id, created_at);
+        CREATE TRIGGER IF NOT EXISTS profile_versions_no_update BEFORE UPDATE ON company_profile_versions
+            BEGIN SELECT RAISE(ABORT, 'profile versions are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS profile_versions_no_delete BEFORE DELETE ON company_profile_versions
+            BEGIN SELECT RAISE(ABORT, 'profile versions are append-only'); END;
         CREATE INDEX IF NOT EXISTS products_company_active ON products(company_id, active, name);
         CREATE INDEX IF NOT EXISTS sales_company_created ON sales(company_id, created_at);
         CREATE INDEX IF NOT EXISTS audit_company_created ON audit_events(company_id, created_at);
@@ -671,6 +681,14 @@ def configuration_catalog(conn: DB, user: USER):
             "plan_entitlements": "not_configured", "activation_note": "Módulos sugeridos não significam contratação nem ativação de recursos ainda não implementados."}
 
 
+@app.get("/v1/company/profile/history")
+def company_profile_history(conn: DB, user: USER):
+    require_role(user,"owner","admin","manager")
+    rows=conn.execute("SELECT * FROM company_profile_versions WHERE company_id=? ORDER BY created_at DESC LIMIT 100",
+                      (user["company_id"],)).fetchall()
+    return {"items":[{"id":r["id"],"profile":json.loads(r["profile_json"]),"actor_id":r["actor_id"],"created_at":r["created_at"]} for r in rows]}
+
+
 @app.put("/v1/company/profile")
 def update_company_profile(data: CompanyProfileIn, conn: DB, user: USER):
     require_role(user, "owner", "admin")
@@ -681,7 +699,8 @@ def update_company_profile(data: CompanyProfileIn, conn: DB, user: USER):
     if set(data.answers) - question_ids:
         raise HTTPException(422, "As respostas incluem campos que não pertencem aos segmentos selecionados.")
     modules = {"sales", "inventory"}
-    if any(data.answers.get(k,False) for k in ("barcode","weighed_items")): modules.add("barcode" if data.answers.get("barcode") else "weighed_items")
+    if data.answers.get("barcode"): modules.add("barcode")
+    if data.answers.get("weighed_items"): modules.add("weighed_items")
     if data.answers.get("perishables"): modules.add("expiry_control")
     if any(data.answers.get(k,False) for k in ("tables","tabs")): modules.add("tables_tabs")
     if data.answers.get("delivery"): modules.add("delivery")
@@ -694,6 +713,11 @@ def update_company_profile(data: CompanyProfileIn, conn: DB, user: USER):
     modules = sorted(modules)
     updated = now_iso()
     with transaction(conn):
+        snapshot = {"primary_segment":data.primary_segment,
+                    "secondary_segments":list(dict.fromkeys(data.secondary_segments)),
+                    "answers":data.answers,"modules":modules}
+        conn.execute("INSERT INTO company_profile_versions VALUES(?,?,?,?,?)",
+                     (new_id(),user["company_id"],json.dumps(snapshot,ensure_ascii=False,sort_keys=True),user["id"],updated))
         conn.execute("""INSERT INTO company_profiles(company_id,primary_segment,secondary_segments_json,answers_json,modules_json,updated_by,updated_at)
             VALUES(?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET primary_segment=excluded.primary_segment,
             secondary_segments_json=excluded.secondary_segments_json,answers_json=excluded.answers_json,
@@ -701,7 +725,8 @@ def update_company_profile(data: CompanyProfileIn, conn: DB, user: USER):
             (user["company_id"],data.primary_segment,json.dumps(list(dict.fromkeys(data.secondary_segments))),
              json.dumps(data.answers,sort_keys=True),json.dumps(modules),user["id"],updated))
         audit(conn,user["company_id"],user["id"],"company.profile_configured","company_profile",user["company_id"],
-              {"primary_segment":data.primary_segment,"secondary_segments":list(dict.fromkeys(data.secondary_segments)),"modules":modules})
+              {"primary_segment":data.primary_segment,"secondary_segments":list(dict.fromkeys(data.secondary_segments)),
+               "answers":data.answers,"modules":modules})
     return {"primary_segment":data.primary_segment,"secondary_segments":list(dict.fromkeys(data.secondary_segments)),
             "answers":data.answers,"modules":modules,"updated_at":updated,
             "status":"suggested","notice":"Esta configuração é auditável, mas não habilita funções ainda não implementadas nem comprova contratação de plano."}

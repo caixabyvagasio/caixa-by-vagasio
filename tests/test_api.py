@@ -215,15 +215,22 @@ def test_segment_catalog_and_profile_configuration_are_tenant_scoped_and_audited
     assert catalog.status_code == 200
     assert {x["id"] for x in catalog.json()["segments"]} >= {"retail", "grocery", "restaurant", "apparel", "services", "construction"}
     payload = {"primary_segment":"restaurant", "secondary_segments":["grocery"],
-               "answers":{"tables":True,"delivery":True,"kitchen":False,"weighed_items":True,"perishables":True}}
+               "answers":{"tables":True,"delivery":True,"kitchen":False,"barcode":True,"weighed_items":True,"perishables":True}}
     saved = world.put("/v1/company/profile", headers=auth(owner), json=payload)
     assert saved.status_code == 200, saved.text
-    assert set(saved.json()["modules"]) == {"sales","inventory","tables_tabs","delivery","weighed_items","expiry_control"}
+    assert set(saved.json()["modules"]) == {"sales","inventory","tables_tabs","delivery","barcode","weighed_items","expiry_control"}
     profile = world.get("/v1/configuration/catalog", headers=auth(owner)).json()["profile"]
     assert profile["primary_segment"] == "restaurant"
     assert world.get("/v1/configuration/catalog", headers=auth(other)).json()["profile"] is None
     events=world.get("/v1/audit-events", headers=auth(owner)).json()["items"]
     assert any(e["action"]=="company.profile_configured" for e in events)
+    updated=world.put("/v1/company/profile",headers=auth(owner),json={"primary_segment":"retail","answers":{"barcode":True}})
+    assert updated.status_code==200
+    history=world.get("/v1/company/profile/history",headers=auth(owner)).json()["items"]
+    assert len(history)==2
+    assert history[0]["profile"]["primary_segment"]=="retail"
+    assert history[1]["profile"]["primary_segment"]=="restaurant"
+    assert history[1]["profile"]["answers"]["tables"] is True
 
 
 def test_profile_configuration_rejects_unknown_segment_or_answer(world):
