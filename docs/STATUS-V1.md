@@ -68,4 +68,4 @@
 
 ## Correção após validação live
 - A validação com requests concorrentes detectou `sqlite3.ProgrammingError` na liberação de conexão entre threads FastAPI; configurada conexão por request para permitir uso sequencial pela thread de cleanup e adicionado teste. 38 testes locais passaram.
-- Corrigido também o título no topo para todas as telas incluídas. Esta correção está em preparação para publicação urgente no mesmo serviço.
+- Corrigido também o título no topo para todas as telas incluídas. A correção está publicada no commit `9c85e7e`; health 200, interface `/` e relatório de vendas foram verificados após o deploy. O catálogo respondeu 500 de forma intermitente durante a validação; logs apontaram conexão SQLite encerrada de thread diferente. A revisão na correção live segue em andamento.
