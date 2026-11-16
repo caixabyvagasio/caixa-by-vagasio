@@ -27,6 +27,9 @@ APP_VERSION = "0.1.0"
 DB_PATH = os.environ.get("CAIXA_DB_PATH", "data/caixa.sqlite3")
 TOKEN_SECRET = os.environ.get("CAIXA_TOKEN_SECRET", "")
 BOOTSTRAP_SECRET = os.environ.get("CAIXA_BOOTSTRAP_SECRET", "")
+DEMO_MODE = os.environ.get("CAIXA_DEMO_MODE", "").strip().lower() == "true"
+DEMO_COMPANY_ID = "00000000-0000-4000-8000-000000000001"
+DEMO_OWNER_ID = "00000000-0000-4000-8000-000000000002"
 TOKEN_TTL_SECONDS = int(os.environ.get("CAIXA_TOKEN_TTL_SECONDS", "28800"))
 ROLES = {"owner", "admin", "manager", "operator", "stock"}
 
@@ -155,6 +158,34 @@ def audit(conn: sqlite3.Connection, company_id: str, actor_id: str | None,
     conn.execute("INSERT INTO audit_events VALUES(?,?,?,?,?,?,?,?)",
                  (new_id(), company_id, actor_id, action, entity_type, entity_id,
                   json.dumps(details, ensure_ascii=False, sort_keys=True), now_iso()))
+
+
+def seed_demo_data() -> None:
+    """Create a fictional, disposable demo tenant. Never mix it with customer data."""
+    conn = connect_db()
+    try:
+        with transaction(conn):
+            created = now_iso()
+            conn.execute("INSERT OR IGNORE INTO companies(id,name,slug,status,created_at) VALUES(?,?,?,'active',?)",
+                         (DEMO_COMPANY_ID, "Mercado Modelo — Demonstração", "caixa-demo", created))
+            conn.execute("INSERT OR IGNORE INTO users(id,company_id,email,full_name,password_hash,role,active,created_at) VALUES(?,?,?,?,?,'owner',1,?)",
+                         (DEMO_OWNER_ID, DEMO_COMPANY_ID, "demo@caixa.local", "Conta de Demonstração",
+                          password_hash("demo-somente-dados-ficticios"), created))
+            examples = [
+                ("00000000-0000-4000-8000-000000000011", "BEB-001", "Água mineral 500 ml", "un", 350, 180, 24_000),
+                ("00000000-0000-4000-8000-000000000012", "MER-002", "Café torrado 250 g", "un", 1290, 790, 12_000),
+                ("00000000-0000-4000-8000-000000000013", "LIM-003", "Detergente neutro 500 ml", "un", 275, 150, 18_000),
+            ]
+            for product_id, sku, name, unit, price, cost, stock in examples:
+                exists = conn.execute("SELECT 1 FROM products WHERE id=?", (product_id,)).fetchone()
+                if not exists:
+                    conn.execute("INSERT INTO products(id,company_id,sku,name,unit,price_cents,cost_cents,stock_milli,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                                 (product_id, DEMO_COMPANY_ID, sku, name, unit, price, cost, stock, created))
+                    conn.execute("INSERT INTO stock_movements(id,company_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,sale_id,created_at) VALUES(?,?,?,?,'adjustment_in',?,0,?,?,NULL,?)",
+                                 (new_id(), DEMO_COMPANY_ID, product_id, DEMO_OWNER_ID, stock, stock,
+                                  "Saldo inicial de demonstração — dados fictícios", created))
+    finally:
+        conn.close()
 
 
 def password_hash(password: str, salt: bytes | None = None) -> str:
@@ -348,6 +379,8 @@ async def lifespan(_app):
         if len(secret.encode()) < 32:
             raise RuntimeError(f"{name} deve conter no mínimo 32 bytes. Use um segredo aleatório forte.")
     init_db()
+    if DEMO_MODE:
+        seed_demo_data()
     yield
 
 
@@ -446,6 +479,19 @@ def frontend_index():
 def health():
     return {"status": "ok", "service": "caixa-api", "version": APP_VERSION,
             "mode": "development-foundation", "integrations": {"payments": False, "fiscal": False}}
+
+
+@app.post("/v1/auth/demo")
+def demo_login(conn: DB):
+    if not DEMO_MODE:
+        raise HTTPException(404, "Modo de demonstração não está habilitado.")
+    row = conn.execute("SELECT * FROM users WHERE id=? AND company_id=? AND active=1",
+                       (DEMO_OWNER_ID, DEMO_COMPANY_ID)).fetchone()
+    if not row:
+        raise HTTPException(503, "Conta demonstrativa indisponível.")
+    return {"access_token": create_token(row), "token_type": "bearer", "expires_in": TOKEN_TTL_SECONDS,
+            "user": {"id": row["id"], "company_id": row["company_id"], "email": row["email"],
+                     "name": row["full_name"], "role": row["role"]}, "demo": True}
 
 
 @app.post("/v1/bootstrap", status_code=201)

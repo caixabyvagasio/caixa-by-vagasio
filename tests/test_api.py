@@ -37,7 +37,7 @@ def product(client, token, sku="SKU-1", name="Cafe", price="10.50"):
 def test_frontend_is_served_from_same_app(world):
     assert world.get("/").status_code == 200
     assert "Entrar na sua empresa" in world.get("/").text
-    assert "V1 está em desenvolvimento" in world.get("/").text
+    assert "Acessar demonstração fictícia" in world.get("/").text
     assert world.get("/static/app.js").status_code == 200
     assert world.get("/static/app.css").status_code == 200
 
@@ -148,3 +148,26 @@ def test_operator_cannot_adjust_stock_or_give_discount(world):
     assert world.post(f"/v1/products/{product_id}/stock-adjustments", headers=auth(op_token), json={"direction":"in","quantity":"1","reason":"Tentativa"}).status_code == 403
     discounted = world.post("/v1/sales", headers={**auth(op_token),"Idempotency-Key":"operator-discount"}, json={"items":[{"product_id":product_id,"quantity":"1","discount":"1.00"}],"payment_method":"cash","received_amount":"9.00"})
     assert discounted.status_code == 403
+
+
+def test_demo_mode_is_opt_in_and_seeds_only_fictional_tenant(world):
+    assert world.post("/v1/auth/demo").status_code == 404
+
+
+def test_demo_login_and_sample_catalog_are_available_only_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "demo.sqlite3"))
+    monkeypatch.setattr(main, "TOKEN_SECRET", "test-only-token-secret-with-entropy-123456789")
+    monkeypatch.setattr(main, "BOOTSTRAP_SECRET", "test-only-provisioning-secret-123456")
+    monkeypatch.setattr(main, "DEMO_MODE", True)
+    with TestClient(main.app) as client:
+        result = client.post("/v1/auth/demo")
+        assert result.status_code == 200, result.text
+        assert result.json()["demo"] is True
+        token = result.json()["access_token"]
+        catalog = client.get("/v1/products", headers=auth(token))
+        assert catalog.status_code == 200
+        assert catalog.json()["total"] == 3
+        assert {x["name"] for x in catalog.json()["items"]} == {
+            "Água mineral 500 ml", "Café torrado 250 g", "Detergente neutro 500 ml"
+        }
+        assert result.json()["user"]["company_id"] == main.DEMO_COMPANY_ID
