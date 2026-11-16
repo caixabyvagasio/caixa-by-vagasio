@@ -127,6 +127,22 @@ def test_cash_movement_and_close_reconciliation(world):
     assert world.get("/v1/registers/current", headers=auth(token)).json()["register"] is None
 
 
+def test_stock_role_cannot_view_inventory_valuation_or_customer_supplier_pii(world):
+    owner=company(world)
+    world.post('/v1/customers',headers=auth(owner),json={'name':'Cliente Privado','email':'p@example.test','tax_id':'12345678900','notes':'Privado'})
+    world.post('/v1/suppliers',headers=auth(owner),json={'name':'Fornecedor Privado','email':'s@example.test','tax_id':'9988776655','notes':'Privado'})
+    p=product(world,owner,sku='COST-PII',price='10.00')
+    worker=world.post('/v1/users',headers=auth(owner),json={'full_name':'Estoque leitura','email':'stock-read@example.test','password':'strong-stock-password-902','role':'stock'}).json()
+    token=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'stock-read@example.test','password':'strong-stock-password-902'}).json()['access_token']
+    visible=world.get('/v1/products',headers=auth(token)).json()['items'][0]
+    assert visible['id']==p['id'] and 'cost' not in visible
+    assert world.get('/v1/reports/inventory',headers=auth(token)).status_code==403
+    supplier=world.get('/v1/suppliers',headers=auth(token)).json()['items'][0]
+    assert set(supplier)=={'id','name','active'}
+    assert world.get('/v1/sales',headers=auth(token)).status_code==403
+    assert world.get('/v1/dashboard/summary',headers=auth(token)).status_code==403
+
+
 def test_stock_role_cannot_change_catalog_price_or_unit_cost(world):
     owner=company(world)
     p=product(world,owner,sku="LOCK-PRICE",price="10.00")
@@ -422,6 +438,7 @@ def test_customer_pii_access_is_restricted_by_role(world):
     stock=world.post("/v1/users",headers=auth(owner),json={"full_name":"Estoque","email":"stock-pii@example.test","password":"strong-stock-password-789","role":"stock"}).json()
     stock_token=world.post("/v1/auth/login",json={"company_slug":"mercado-um","email":"stock-pii@example.test","password":"strong-stock-password-789"}).json()["access_token"]
     assert world.get("/v1/customers",headers=auth(stock_token)).status_code==403
+    assert world.get(f"/v1/customers/{c['id']}",headers=auth(stock_token)).status_code==403
     assert world.get(f"/v1/customers/{c['id']}",headers=auth(owner)).json()["customer"]["tax_id"]=="12345678900"
 
 
@@ -580,6 +597,21 @@ def test_sales_report_periods_totals_and_tenant_isolation(world):
     world.post(f"/v1/sales/{sale['id']}/void",headers=auth(owner),json={'reason':'Cancelamento relatório'})
     report=world.get('/v1/reports/sales?start_date=2026-01-01&end_date=2026-12-31&group_by=day',headers=auth(owner)).json()
     assert report['totals']=={'sale_count':1,'paid_count':0,'voided_count':1,'gross_paid':'0.00','voided_value':'5.00'}
+    op=world.post('/v1/users',headers=auth(owner),json={'full_name':'Operador Relatório','email':'report-op@example.test','password':'strong-operator-password-234','role':'operator'}).json()
+    operator=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'report-op@example.test','password':'strong-operator-password-234'}).json()['access_token']
+    assert world.get('/v1/reports/sales?start_date=2026-01-01&end_date=2026-12-31',headers=auth(operator)).status_code==403
+    assert world.get('/v1/audit-events',headers=auth(operator)).status_code==403
+    assert world.get('/v1/registers/current',headers=auth(operator)).status_code==200
+    assert world.get('/v1/sales',headers=auth(operator)).status_code==200
+    stock=world.post('/v1/users',headers=auth(owner),json={'full_name':'Estoque Relatório','email':'report-stock@example.test','password':'strong-stock-password-234','role':'stock'}).json()
+    stock_token=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'report-stock@example.test','password':'strong-stock-password-234'}).json()['access_token']
+    assert world.get('/v1/sales',headers=auth(stock_token)).status_code==403
+    assert world.get('/v1/registers/current',headers=auth(stock_token)).status_code==403
+    assert world.get('/v1/dashboard/summary',headers=auth(stock_token)).status_code==403
+    assert world.get('/v1/audit-events',headers=auth(stock_token)).status_code==403
+    assert world.get('/v1/reports/sales?start_date=2026-01-01&end_date=2026-12-31',headers=auth(stock_token)).status_code==403
+    assert world.get('/v1/reports/inventory',headers=auth(stock_token)).status_code==403
+    assert world.get('/v1/customers',headers=auth(stock_token)).status_code==403
     assert world.get('/v1/reports/sales?start_date=2026-12-31&end_date=2026-01-01',headers=auth(owner)).status_code==422
     assert world.get('/v1/reports/sales?start_date=2025-01-01&end_date=2026-12-31',headers=auth(owner)).status_code==422
     two=company(world,'Outra','outra','outra@example.test')
@@ -595,6 +627,19 @@ def test_sqlite_request_connection_can_be_cleaned_up_from_worker_thread(monkeypa
     worker.start();worker.join()
     conn.close()
     assert outcomes==[1]
+
+
+def test_inventory_report_large_values_do_not_overflow_sqlite_sum(world):
+    owner=company(world)
+    p=world.post('/v1/products',headers=auth(owner),json={'sku':'BIG-INV','name':'Lote grande','unit':'un','price':'9999999999.99','cost':'9999999999.99','minimum_stock':'0'}).json()
+    conn=main.connect_db()
+    try:
+        conn.execute("UPDATE products SET stock_milli=? WHERE id=?",(999999999999,p['id']))
+    finally:
+        conn.close()
+    response=world.get('/v1/reports/inventory',headers=auth(owner))
+    assert response.status_code==200,response.text
+    assert response.json()['summary']['estimated_cost_value']=='9999999999980000000.00'
 
 
 def test_inventory_report_estimated_values_and_role_scope(world):

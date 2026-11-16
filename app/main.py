@@ -950,6 +950,8 @@ def create_customer(data: CustomerIn,conn: DB,user: USER):
 def list_suppliers(conn: DB,user: USER,active: bool=True):
     require_role(user,"owner","admin","manager","stock")
     rows=conn.execute("SELECT * FROM suppliers WHERE company_id=? AND active=? ORDER BY name",(user["company_id"],int(active))).fetchall()
+    if user["role"]=="stock":
+        return {"items":[{"id":r["id"],"name":r["name"],"active":bool(r["active"])} for r in rows]}
     return {"items":[{"id":r["id"],"name":r["name"],"tax_id":r["tax_id"],"email":r["email"],"phone":r["phone"],"notes":r["notes"],"active":bool(r["active"]),"created_at":r["created_at"]} for r in rows]}
 
 
@@ -1156,7 +1158,10 @@ def list_products(conn: DB, user: USER, search: str = Query(default="", max_leng
     rows = conn.execute("""SELECT * FROM products WHERE company_id=? AND active=1 AND (?='' OR name LIKE ? ESCAPE '\\' OR sku LIKE ? ESCAPE '\\' OR COALESCE(barcode,'') LIKE ? ESCAPE '\\')
         ORDER BY name LIMIT ? OFFSET ?""", (user["company_id"], search.strip(), term, term, term, limit, offset)).fetchall()
     count = conn.execute("SELECT count(*) FROM products WHERE company_id=? AND active=1", (user["company_id"],)).fetchone()[0]
-    return {"items": [product_json(row) for row in rows], "total": count, "limit": limit, "offset": offset}
+    items=[product_json(row) for row in rows]
+    if user["role"] in {"operator","stock"}:
+        for item in items: item.pop("cost",None)
+    return {"items": items, "total": count, "limit": limit, "offset": offset}
 
 
 @app.get("/v1/products/low-stock")
@@ -1228,6 +1233,7 @@ def open_register(data: RegisterOpenIn, conn: DB, user: USER):
 
 @app.get("/v1/registers/current")
 def current_register(conn: DB, user: USER):
+    require_role(user,"owner","admin","manager","operator")
     row = conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1", (user["company_id"],)).fetchone()
     if not row:
         return {"register": None}
@@ -1384,6 +1390,7 @@ def void_sale(sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
 
 @app.get("/v1/sales")
 def list_sales(conn: DB, user: USER, limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0)):
+    require_role(user,"owner","admin","manager","operator")
     rows = conn.execute("SELECT * FROM sales WHERE company_id=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
                          (user["company_id"], limit, offset)).fetchall()
     return {"items": [sale_json(conn, row) for row in rows], "limit": limit, "offset": offset}
@@ -1422,23 +1429,29 @@ def sales_report(conn: DB,user: USER,start_date: date,end_date: date,group_by: s
 
 @app.get("/v1/reports/inventory")
 def inventory_report(conn: DB,user: USER,search: str=Query(default="",max_length=100),limit: int=Query(default=200,ge=1,le=500),offset: int=Query(default=0,ge=0)):
-    require_role(user,"owner","admin","manager","stock")
+    require_role(user,"owner","admin","manager")
     term="%"+search.strip().replace("%","\\%").replace("_","\\_")+"%"
     rows=conn.execute("""SELECT * FROM products WHERE company_id=? AND active=1 AND (?='' OR name LIKE ? ESCAPE '\\' OR sku LIKE ? ESCAPE '\\')
         ORDER BY name LIMIT ? OFFSET ?""",(user["company_id"],search.strip(),term,term,limit,offset)).fetchall()
     total=conn.execute("SELECT COUNT(*) FROM products WHERE company_id=? AND active=1",(user["company_id"],)).fetchone()[0]
     low=conn.execute("SELECT COUNT(*) FROM products WHERE company_id=? AND active=1 AND min_stock_milli>0 AND stock_milli<=min_stock_milli",(user["company_id"],)).fetchone()[0]
-    count=conn.execute("SELECT COALESCE(SUM(stock_milli*cost_cents),0),COALESCE(SUM(stock_milli*price_cents),0),COALESCE(SUM(stock_milli),0) FROM products WHERE company_id=? AND active=1",(user["company_id"],)).fetchone()
+    # Keep monetary valuation in arbitrary-precision integer arithmetic. SQLite
+    # SUM(stock_milli * cents) can overflow signed 64-bit for valid inputs.
+    valuation_rows=conn.execute("SELECT stock_milli,cost_cents,price_cents FROM products WHERE company_id=? AND active=1",(user["company_id"],)).fetchall()
+    total_stock_milli=sum(r["stock_milli"] for r in valuation_rows)
+    estimated_cost_cents=sum((r["stock_milli"]*r["cost_cents"]+500)//1000 for r in valuation_rows)
+    estimated_retail_cents=sum((r["stock_milli"]*r["price_cents"]+500)//1000 for r in valuation_rows)
     items=[]
     for r in rows:
         cost_total=(r["stock_milli"]*r["cost_cents"]+500)//1000
         retail_total=(r["stock_milli"]*r["price_cents"]+500)//1000
         items.append({"product_id":r["id"],"sku":r["sku"],"name":r["name"],"category":r["category"],"unit":r["unit"],"stock":milli_to_decimal(r["stock_milli"]),"minimum_stock":milli_to_decimal(r["min_stock_milli"]),"low_stock":r["min_stock_milli"]>0 and r["stock_milli"]<=r["min_stock_milli"],"unit_cost":cents_to_money(r["cost_cents"]),"unit_price":cents_to_money(r["price_cents"]),"cost_value":cents_to_money(cost_total),"retail_value":cents_to_money(retail_total)})
-    return {"items":items,"total":total,"limit":limit,"offset":offset,"summary":{"product_count":total,"low_stock_products":low,"stock_units":milli_to_decimal(count[2]),"estimated_cost_value":cents_to_money((count[0]+500)//1000),"estimated_retail_value":cents_to_money((count[1]+500)//1000)},"note":"Avaliação estimada pelo custo e preço atuais do cadastro, sem método contábil de custeio, impostos ou movimentação em trânsito."}
+    return {"items":items,"total":total,"limit":limit,"offset":offset,"summary":{"product_count":total,"low_stock_products":low,"stock_units":milli_to_decimal(total_stock_milli),"estimated_cost_value":cents_to_money(estimated_cost_cents),"estimated_retail_value":cents_to_money(estimated_retail_cents)},"note":"Avaliação estimada pelo custo e preço atuais do cadastro, sem método contábil de custeio, impostos ou movimentação em trânsito."}
 
 
 @app.get("/v1/dashboard/summary")
 def dashboard_summary(conn: DB, user: USER):
+    require_role(user,"owner","admin","manager","operator")
     company_id = user["company_id"]
     sales = conn.execute("SELECT COUNT(*) AS count,COALESCE(SUM(total_cents),0) AS total FROM sales WHERE company_id=? AND status='paid' AND date(created_at)=date('now')", (company_id,)).fetchone()
     product_count = conn.execute("SELECT count(*) FROM products WHERE company_id=? AND active=1", (company_id,)).fetchone()[0]

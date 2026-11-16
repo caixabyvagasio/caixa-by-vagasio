@@ -55,3 +55,12 @@ Stack: FastAPI/Python, SQLite, HTML/CSS/JavaScript sem framework, pytest/TestCli
 ## Restrições / dependências
 
 Não provisionar banco pago, disco, backups, provedor de pagamento, gateway fiscal, certificados, domínio ou device sem autorização específica/custo aprovado. Não transferir nem apagar dados de produção. O Render atual é demo descartável e não é produção nem destino de dados reais. Código local/branch de desenvolvimento não equivale a feature pronta/publicada/homologada.
+
+### Continuação após testes por papel (sem deploy)
+- [x] AUD-02/03 corrigidos e CI/deploy de desenvolvimento confirmados em `cc92667` (`dep-dbtjga88v5cc7396nd3g` live); esse deploy foi ao Render Free de desenvolvimento, nunca produção. Signup público retorna 404 em demo; leitura de PII minimizada por role.
+- [x] `stock` sem create/update catálogo ou preços (`292e336`, CI `43914431760`).
+- [x] Na etapa local de hardening, `stock` não vê custo de produtos, fornecedores PII, vendas, caixa, dashboard, relatórios de estoque/vendas, auditoria nem clientes; operadores têm nome de cliente apenas e sem endpoints de histórico/PII. Testes API atualizados.
+- [x] Overflow do resumo de valuation alterado para aritmética inteira Python; teste de valor grande.
+- [ ] Commit/CI dos últimos ajustes de RBAC/overflow/UI, aplicar apenas branch; deploy de desenvolvimento aguardando autorização expressa.
+- [ ] Continuar fases 3–11; conclusão global não atingida.
+- [x] Agregados testes estruturais de frontend: refs de elementos, form balanceado, proteção UI PII, breakpoints móveis e presença de security headers; total atual de suíte local 47 passed.

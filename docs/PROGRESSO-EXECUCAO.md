@@ -21,3 +21,12 @@ Data: 2026-11-16. Branch `development-v1`; base do ciclo `ff72d7a2a3606eec2cdcd1
 3. Arquitetar/implementar migrations formais e suporte PostgreSQL em branch, testar em banco local/CI sem provisionar serviço pago.
 4. Prosseguir Portal Master, entitlements verdadeiros e módulos e fluxos pendentes sem afirmar completude nem publicar no ambiente público.
 5. Integrações fiscais/pagamentos requerem contratos, credenciais e homologação; infraestrutura persistente/backups requerem provider/custo aprovado. Não inventar sucesso nem contratar.
+6. Deploy de `cc92667` ao Render desenvolvimento foi feito e confirmado live `dep-dbtjga88v5cc7396nd3g` após CI success: endpoint de cadastro público retornou 404, home 200, health 200. Commit `292e336` e auditoria r3 depois dele foram ainda não deployados nesse checkpoint.
+
+### Revisão continuada após 42-test checkpoint
+- Adicionada proteção adicional no endpoint `/v1/registers/current`; testes de acesso a vendas/caixa/dashboard/relatórios/auditoria por operator e stock.
+- Removido `cost` dos produtos em resposta de operator/stock; stock sem relatório de estoque, com dados de fornecedor PII, vendas, caixa, dashboard, auditoria, customers e report financeiro. Endpoint supplier retorna somente id/nome/ativo para stock. Operador só vê nome de clientes e o formulário de campos pessoais e botão de histórico são ocultados; proteção principal é server-side.
+- Valorização agregada Python para impedir overflow SQLite; teste com grande estoque e preço válido.
+- Suíte worktree completa no checkpoint após esses ajustes: 44 passed, 1 warning TestClient/httpx. Sem commit/CI para essas edições locais até este ponto.
+- Deploy `cc92667` no ambiente Render Free de desenvolvimento efetivado após confirmação; chamada real de cadastro retornou 404, health e home HTTP 200. Deploy contém cadastro bloqueado durante demo e RBAC/PII inicial. Commit `292e336` e ajustes locais posteriores não foram publicados. Não é produção.
+- Incluí testes estáticos de proteção UI/IDs/forms/breakpoints/security headers; suite worktree passou 47 testes após rodar integralmente.
