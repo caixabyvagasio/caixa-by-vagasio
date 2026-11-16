@@ -228,6 +228,7 @@ FEATURES = [
 ]
 
 IMPLEMENTED_FEATURES = {"sales", "inventory", "purchasing", "customers", "finance", "reports", "staff", "profile_setup"}
+AVAILABLE_FEATURES = IMPLEMENTED_FEATURES | {"barcode"}
 
 def now_iso() -> str:
     # Keep deterministic ordering for sequential audit/profile events created within one second.
@@ -506,7 +507,7 @@ def init_db() -> None:
         for feature_id, name, description, category, recommended, dependencies in FEATURES:
             conn.execute("INSERT OR REPLACE INTO feature_catalog(id,name,description,category,recommended_segments_json,dependencies_json,available) VALUES(?,?,?,?,?,?,?)",
                          (feature_id, name, description, category, json.dumps(recommended), json.dumps(dependencies),
-                          int(feature_id in IMPLEMENTED_FEATURES)))
+                          int(feature_id in AVAILABLE_FEATURES)))
     finally:
         conn.close()
 
@@ -991,8 +992,8 @@ def demo_login(conn: DB):
 
 
 def resolve_profile_modules(answers: dict[str, bool]) -> list[str]:
-    """Return only implemented modules; preserve questionnaire requests separately."""
-    return sorted(IMPLEMENTED_FEATURES)
+    """Only persist modules already implemented in this release; recommendations stay in answers."""
+    return sorted(IMPLEMENTED_FEATURES-{"barcode"})
 
 
 def validate_initial_profile(data: BootstrapIn, *, required: bool = False):
@@ -1103,13 +1104,14 @@ def configuration_catalog(conn: DB, user: USER):
     all_features = conn.execute("SELECT * FROM feature_catalog ORDER BY category,name").fetchall()
     profile = conn.execute("SELECT * FROM company_profiles WHERE company_id=?", (user["company_id"],)).fetchone()
     selected_segments = ([profile["primary_segment"], *json.loads(profile["secondary_segments_json"])] if profile else [])
-    feature_rows = [r for r in all_features if "*" in json.loads(r["recommended_segments_json"])
-                    or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected_segments)]
+    feature_rows = all_features
     active_modules = set(json.loads(profile["modules_json"])) if profile else IMPLEMENTED_FEATURES
     return {"segments": [{"id":r["id"],"name":r["name"],"questions":json.loads(r["questions_json"])} for r in segments],
             "features": [{"id":r["id"],"name":r["name"],"description":r["description"],"category":r["category"],
                           "recommended_segments":json.loads(r["recommended_segments_json"]),"dependencies":json.loads(r["dependencies_json"]),
-                          "available":bool(r["available"]),"enabled":bool(r["available"] and r["id"] in active_modules)} for r in feature_rows],
+                          "available":bool(r["available"]),"enabled":bool(r["available"] and r["id"] in active_modules and ("*" in json.loads(r["recommended_segments_json"]) or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected_segments))),
+                          "status":("NOT_IMPLEMENTED" if not r["available"] else "ENABLED" if r["id"] in active_modules and ("*" in json.loads(r["recommended_segments_json"]) or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected_segments)) else "DISABLED" if selected_segments and not ("*" in json.loads(r["recommended_segments_json"]) or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected_segments)) else "REQUIRES_CONFIGURATION" if r["id"]=="barcode" else "AVAILABLE"),
+                          "required_plan":None,"plan_eligible":None if r["id"]=="barcode" else True} for r in feature_rows],
             "profile": ({"primary_segment":profile["primary_segment"],
                          "secondary_segments":json.loads(profile["secondary_segments_json"]),
                          "answers":json.loads(profile["answers_json"]),"modules":json.loads(profile["modules_json"]),

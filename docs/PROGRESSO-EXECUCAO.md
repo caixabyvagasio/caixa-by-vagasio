@@ -24,3 +24,11 @@
 - Pagamentos, fiscal e integrações externas continuam desligados; catálogo de segmentos não ativa recursos ausentes.
 - Portal Master, filiais, planos/entitlements funcionais, recebíveis, conciliação, DRE, módulos especializados e offline seguem em aberto.
 - Persistência agora testada após um redeploy de app em conta fictícia, mas sem restore testado, sem garantias comerciais e Free tem limite temporal. Não chamar de plataforma final homologada.
+
+## Ordem mestre — execução por fatias verificáveis (16/11/2026)
+- Conferido o ponto de partida `a02eb05b2b22c7385a9c58110c5f605b15cc6945`: API FastAPI, PostgreSQL persistente, catálogo de segmentos e menu filtrado; sem modelagem de planos, filiais ou entitlements comerciais.
+- Incremento desta etapa: catálogo da API passa a fornecer estados de recurso (`ENABLED`, `AVAILABLE`, `DISABLED`, `NOT_IMPLEMENTED`, `REQUIRES_CONFIGURATION`), além da disponibilidade e compatibilidade; respostas de segmento não elevam funções não implementadas a ativas. Na tela Perfil do negócio, lista de ferramentas mostra descrição, compatibilidade e estado, sem botão de ativação até existir elegibilidade de plano e fluxo de confirmação real.
+- Leitura por código de barras segue não habilitada: embora produto já aceite código e busca de catálogo considere o campo, ainda não há entitlement/ativação com confirmação nem integração com balanças. Não anunciar o módulo como ativado.
+- Validação local após esta etapa: 54 passed, 1 skipped (teste restrito a PostgreSQL de CI), 1 aviso de depreciação de TestClient/httpx. Verificação adicional: Python compila; referências de IDs da interface presentes; 15 formulários abertos/fechados balanceados; chaves CSS balanceadas.
+- Próximas fatias: persistência de entitlements/planos/filiais antes de qualquer ativação opcional; fluxo de proposta/aceite transacional e trilha de ativação; depois módulos operacionais em vertical slices com APIs, UI, permissões e fluxos fim a fim. A ordem extensa dos seis segmentos não cabe num incremento único, e nenhum segmento pode ser declarado completo sem fluxos e testes de aceitação próprios.
+- Não criar dados na empresa `vagasio-2026`, não habilitar custos externos nem promover para produção. PostgreSQL Render Free continua com data limite 16/12/2026, sem backup/PITR.

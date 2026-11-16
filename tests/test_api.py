@@ -346,8 +346,19 @@ def test_feature_catalog_marks_only_implemented_features_available(world):
     assert {'sales','inventory','purchasing','customers','finance','reports','staff','profile_setup'} <= set(by_id)
     assert all(by_id[item]['available'] for item in main.IMPLEMENTED_FEATURES)
     assert all(by_id[item]['enabled'] for item in main.IMPLEMENTED_FEATURES)
-    assert not any(item['available'] or item['enabled'] for item in by_id.values() if item['id'] not in main.IMPLEMENTED_FEATURES)
-    assert not any(by_id[item]['available'] for item in ('barcode','weighed_items','expiry_control','tables_tabs','delivery','kitchen','variants','returns','commissions','appointments','measurement_sales') if item in by_id)
+    assert by_id['barcode']['available'] and not by_id['barcode']['enabled']
+    assert by_id['tables_tabs']['status']=='NOT_IMPLEMENTED'
+
+
+def test_barcode_feature_auto_enables_only_when_requested_on_compatible_segment(world):
+    owner=company(world)
+    headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    restaurant={x['id']:x for x in world.get('/v1/configuration/catalog',headers=headers).json()['features']}
+    assert restaurant['barcode']['status']=='DISABLED' and restaurant['barcode']['enabled'] is False
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'grocery','answers':{'barcode':True}})
+    grocery={x['id']:x for x in world.get('/v1/configuration/catalog',headers=headers).json()['features']}
+    assert grocery['barcode']['status']=='REQUIRES_CONFIGURATION' and grocery['barcode']['enabled'] is False
 
 
 def test_segment_catalog_and_profile_configuration_are_tenant_scoped_and_audited(world):
@@ -360,7 +371,7 @@ def test_segment_catalog_and_profile_configuration_are_tenant_scoped_and_audited
                "answers":{"tables":True,"delivery":True,"kitchen":False,"barcode":True,"weighed_items":True,"perishables":True}}
     saved = world.put("/v1/company/profile", headers=auth(owner), json=payload)
     assert saved.status_code == 200, saved.text
-    assert set(saved.json()["modules"]) == main.IMPLEMENTED_FEATURES
+    assert set(saved.json()["modules"]) == main.IMPLEMENTED_FEATURES - {'barcode'}
     profile = world.get("/v1/configuration/catalog", headers=auth(owner)).json()["profile"]
     assert profile["primary_segment"] == "restaurant"
     assert world.get("/v1/configuration/catalog", headers=auth(other)).json()["profile"] is None
