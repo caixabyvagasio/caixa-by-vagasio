@@ -1,32 +1,30 @@
 # Progresso de execução — auditoria e correções prioritárias
 
-Data: 2026-11-16. Branch `development-v1`; base do ciclo `ff72d7a2a3606eec2cdcd188b3a2ad313db17955`.
+Data: 2026-11-16. Branch alvo `development-v1`; commits mais recentes registrados no fim deste arquivo.
 
-## Concluído
-- Auditoria da API, telas, schema/migrações inline, configurações, deploy e testes. Inventário e achados priorizados em `PLANO-AUDITORIA-E-EXECUCAO.md`.
-- Testes originais do HEAD: 39 passed. Smoke público de página e health: HTTP 200. Conferida tela do relatório de estoque.
-- Commit de hardening `cc9266726412e5db42b14347d33c5a7c569b64c6` na branch de desenvolvimento; CI run `43913857996` success. Cadastro público de empresa é bloqueado durante modo demo mesmo se signup estiver configurado como true. Os endpoints de clientes agora têm RBAC e minimizam o retorno do operador; somente owner/admin/manager veem PII/histórico; operador vê nomes para lookup PDV e só pode cadastrar nome; estoque sem leitura de clientes.
-- Suíte sobre esse estado: 41 passed, 1 warning depreciação TestClient/httpx.
-- Na revisão aprofundada foi visto que papel `stock` podia editar preço e custo via PUT/POST de produtos. Corrigido no worktree seguinte: somente owner/admin/manager podem criar/editar produto; adicionado teste negativo.
-- Suíte do worktree após esse ajuste adicional: 42 passed, 1 warning. Commit `292e336139e358b9b9e7c3652293a7a63a1bdcdd` pushed à branch dev; CI run `43914431760` success.
+## Estado herdado e auditoria
+- Auditoria do commit inicial `ff72d7a2a3606eec2cdcd188b3a2ad313db17955`: API FastAPI/Python, SQLite, HTML/CSS/JS, 39 testes; deploy Render Free e banco `/tmp/caixa.sqlite3`, cadastro público ligado e demo mutável, sem DB durável/backup. Relatório detalhado em `PLANO-AUDITORIA-E-EXECUCAO.md`.
+- Funcionalidades já implementadas antes: organização/usuário, catálogo e saldo de estoque, compras/recebimento idempotente, clientes, caixa/venda apenas dinheiro, estorno manual, contas a pagar de compras, perfil sugerido por segmento e relatórios operacionais. Não representam V1 comercial completa.
 
-## Estado Git/deploy
-- O commit `cc92667` já foi pushed para `development-v1`, CI success; **não foi deployed**. O serviço público permanece com HEAD `ff72d7a` e autodeploy off, em respeito à instrução de não publicar sem autorização.
-- O bloqueio do signup durante demo e PII endpoints estão no commit acima. Restrição de editar preço/custo para estoque foi commitada em `292e336`; CI `43914431760` passou. Nenhuma das duas correções foi publicada no serviço. Não publicar sem autorização.
-- O sistema segue Render Free + SQLite `/tmp`, demo pública compartilhada, sem backup durável; não é para dados reais.
+## Hardening aplicado antes do bloco financeiro
+- Commit `cc9266726412e5db42b14347d33c5a7c569b64c6`: signup bloqueado no modo demo, PII/histórico de clientes sob RBAC e operador com nome apenas. CI `43913857996` success. Foi explicitamente deployado ao Render Free de desenvolvimento (`dep-dbtjga88v5cc7396nd3g` live); não produção. Health/home HTTP 200; POST de signup no ambiente de desenvolvimento retornou 404 conforme esperado.
+- Commit `292e336139e358b9b9e7c3652293a7a63a1bdcdd`: papel stock não cria/altera catálogo e preços; CI `43914431760` success.
+- Commit `fe4faba5f6305769c6d91773a94d1dbe2fb45a6b`: proteção extra de endpoints/campos por papel, UI cliente esconde campos privados a operador e cálculo Python sem overflow SQLite; teste de limite e estrutural UI. CI `43916794723` success. Não publicado.
 
-## Próximas tarefas
-1. Commit e CI do RBAC de produto; atualizar plano/progresso e revisar mais cada endpoint de permissão.
-2. Cobertura de logs/auditoria, segurança de conteúdo/PII, acessibilidade e testes E2E.
-3. Arquitetar/implementar migrations formais e suporte PostgreSQL em branch, testar em banco local/CI sem provisionar serviço pago.
-4. Prosseguir Portal Master, entitlements verdadeiros e módulos e fluxos pendentes sem afirmar completude nem publicar no ambiente público.
-5. Integrações fiscais/pagamentos requerem contratos, credenciais e homologação; infraestrutura persistente/backups requerem provider/custo aprovado. Não inventar sucesso nem contratar.
-6. Deploy de `cc92667` ao Render desenvolvimento foi feito e confirmado live `dep-dbtjga88v5cc7396nd3g` após CI success: endpoint de cadastro público retornou 404, home 200, health 200. Commit `292e336` e auditoria r3 depois dele foram ainda não deployados nesse checkpoint.
+## Incremento financeiro implementado no worktree (ainda não commitado)
+- Criada tabela append-only `payable_payments` indexada por organização/conta, com idempotência, FKs e triggers que impedem update/delete; detalhe de despesas persiste centro de custo e hash de criação idempotente.
+- `POST /v1/finance/expenses` cria uma despesa como conta a pagar, centro de custo livre e exige `Idempotency-Key`; replay idêntico retorna mesmo registro (200), payload diferente mesma chave 409. Pode declarar pagamento total manual opcional na criação; nunca descrito como banco confirmado.
+- `POST /v1/finance/payables/{id}/payments` registra parcelas manuais: idempotência, reference, data não futura, limite ao saldo, parcial e quitação, auditoria transacional e tenant scope.
+- Endpoint existente de quitação manual agora registra pagamento total restante no ledger append-only, preservando compatibilidade.
+- GET contas retorna pago, saldo e centro de custo; resumo considera saldo após parcelas; `/v1/finance/cashflow` soma por dia vendas em dinheiro pagas separadamente das baixas manuais declaradas, limitado a 366 dias.
+- Portal financeiro agora tem formulário de despesa, pagamentos parciais/quit. saldo e fluxo por período, sem alegar conciliação. A UI mantém a chave idempotente da despesa enquanto um envio falha e usa chave do pagamento associada à obrigação.
+- Testes locais após a rodada: 48 passed, 1 aviso depreciação Starlette TestClient/httpx. Checagem Python sintaxe e refs HTML/JS: sem refs ausentes; 15 forms balanceadas. Runtimes Node/Deno/Bun não estão disponíveis, então JS não foi syntax-checked por runtime nem testado em browser; não considerar validação visual/E2E. Não há runtime Node/browser E2E instalado/verificado nesta sessão.
+- Documento técnico em `docs/FINANCEIRO-PARCIAL-V1.md` descreve rotas, semântica e limites.
 
-### Revisão continuada após 42-test checkpoint
-- Adicionada proteção adicional no endpoint `/v1/registers/current`; testes de acesso a vendas/caixa/dashboard/relatórios/auditoria por operator e stock.
-- Removido `cost` dos produtos em resposta de operator/stock; stock sem relatório de estoque, com dados de fornecedor PII, vendas, caixa, dashboard, auditoria, customers e report financeiro. Endpoint supplier retorna somente id/nome/ativo para stock. Operador só vê nome de clientes e o formulário de campos pessoais e botão de histórico são ocultados; proteção principal é server-side.
-- Valorização agregada Python para impedir overflow SQLite; teste com grande estoque e preço válido.
-- Suíte worktree completa no checkpoint após esses ajustes: 44 passed, 1 warning TestClient/httpx. Commit final de hardening `fe4faba5f6305769c6d91773a94d1dbe2fb45a6b` pushed à branch; CI run `43916794723` success. Continua sem deploy dessas edições.
-- Deploy `cc92667` no ambiente Render Free de desenvolvimento efetivado após confirmação; chamada real de cadastro retornou 404, health e home HTTP 200. Deploy contém cadastro bloqueado durante demo e RBAC/PII inicial. Commit `292e336` e ajustes locais posteriores não foram publicados. Não é produção.
-- Incluí testes estáticos de proteção UI/IDs/forms/breakpoints/security headers; suite worktree passou 47 testes após rodar integralmente.
+## Pendências
+- Nova versão do frontend tem fluxo de caixa; a busca de data inicia com o mês atual. HTML IDs todos referenciados, forms balanceadas; validar renderização em browser permanece necessário.
+- Bloco financeiro ainda no worktree sem commit/CI; conferir novamente diff, executar suíte, commitar no branch dev e aguardar CI. Não publicar sem autorização.
+- Próxima tarefa executável: migrations versionadas/abstração banco em desenvolvimento sem contratar serviço, explorar Postgres local/CI se disponível; persistência/backup real continua bloqueada por provider/custo.
+- Faltam contas a receber, parcelamento de venda/recebimento, conciliação, DRE, cadastro estruturado de centro de custo, Portal Master, filiais, entitlements funcionais, integração pagamento/fiscal, operação offline e módulos especializados.
+- Sem produto real: deploy Render Free usa SQLite volátil em `/tmp`; dados da demonstração são fictícios, compartilhados e modificáveis. Não usar operação comercial.
+- O pedido do usuário veda publicar produção sem autorização. Nenhum deploy do bloco financeiro foi feito.

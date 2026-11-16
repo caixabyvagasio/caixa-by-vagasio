@@ -209,6 +209,24 @@ def init_db() -> None:
             created_at TEXT NOT NULL, paid_at TEXT, payment_note TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS payable_company_due ON accounts_payable(company_id,status,due_date);
+        CREATE TABLE IF NOT EXISTS payable_payments (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+            payable_id TEXT NOT NULL REFERENCES accounts_payable(id), amount_cents INTEGER NOT NULL CHECK(amount_cents>0),
+            payment_date TEXT NOT NULL, reference TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+            created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+            UNIQUE(company_id,idempotency_key)
+        );
+        CREATE INDEX IF NOT EXISTS payable_payments_parent ON payable_payments(company_id,payable_id);
+        CREATE TABLE IF NOT EXISTS payable_expense_details (
+            payable_id TEXT PRIMARY KEY REFERENCES accounts_payable(id), company_id TEXT NOT NULL REFERENCES companies(id),
+            cost_center TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', request_hash TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS expense_idempotency
+            ON payable_expense_details(company_id,idempotency_key) WHERE idempotency_key<>'';
+        CREATE TRIGGER IF NOT EXISTS payable_payments_no_update BEFORE UPDATE ON payable_payments
+            BEGIN SELECT RAISE(ABORT, 'payable payments are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS payable_payments_no_delete BEFORE DELETE ON payable_payments
+            BEGIN SELECT RAISE(ABORT, 'payable payments are append-only'); END;
         CREATE TABLE IF NOT EXISTS purchase_receipt_items (
             id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL REFERENCES purchase_receipts(id),
             purchase_order_item_id TEXT NOT NULL REFERENCES purchase_order_items(id), product_id TEXT NOT NULL REFERENCES products(id),
@@ -564,6 +582,40 @@ class PayablePaidIn(StrictModel):
     def trim_payment_note(cls,value):
         value=value.strip()
         if len(value)<3: raise ValueError("Informe uma referência ou justificativa")
+        return value
+
+
+class ExpenseIn(StrictModel):
+    description: str = Field(min_length=2,max_length=240)
+    amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
+    due_date: date
+    cost_center: str = Field(default="",max_length=120)
+    payment_date: date | None = None
+    payment_reference: str = Field(default="",max_length=240)
+
+    @field_validator("description","cost_center","payment_reference")
+    @classmethod
+    def trim_expense_fields(cls,value):
+        return value.strip()
+
+    @field_validator("payment_reference")
+    @classmethod
+    def require_expense_payment_reference(cls,value,info):
+        if info.data.get("payment_date") and len(value)<3:
+            raise ValueError("Informe referência/justificativa da baixa manual")
+        return value
+
+
+class PayablePartialIn(StrictModel):
+    amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
+    payment_date: date
+    reference: str = Field(min_length=3,max_length=240)
+
+    @field_validator("reference")
+    @classmethod
+    def trim_partial_reference(cls,value):
+        value=value.strip()
+        if len(value)<3: raise ValueError("Informe referência/justificativa da baixa manual")
         return value
 
 
@@ -990,10 +1042,14 @@ def create_purchase_order(data: PurchaseCreateIn,conn: DB,user: USER):
 def list_payables(conn: DB,user: USER,status_filter: str=Query(default="all",alias="status"),limit: int=Query(default=100,ge=1,le=200)):
     require_role(user,"owner","admin","manager")
     if status_filter not in {"all","open","paid","cancelled"}: raise HTTPException(422,"Filtro de situação inválido.")
-    rows=conn.execute("""SELECT ap.*,s.name AS supplier_name FROM accounts_payable ap LEFT JOIN suppliers s ON s.id=ap.supplier_id
+    rows=conn.execute("""SELECT ap.*,s.name AS supplier_name,
+        COALESCE((SELECT SUM(pp.amount_cents) FROM payable_payments pp WHERE pp.company_id=ap.company_id AND pp.payable_id=ap.id),0) AS paid_cents,
+        COALESCE(ed.cost_center,'') AS cost_center
+        FROM accounts_payable ap LEFT JOIN suppliers s ON s.id=ap.supplier_id
+        LEFT JOIN payable_expense_details ed ON ed.payable_id=ap.id AND ed.company_id=ap.company_id
         WHERE ap.company_id=? AND (?='all' OR ap.status=?) ORDER BY ap.due_date,ap.created_at DESC LIMIT ?""",
         (user["company_id"],status_filter,status_filter,limit)).fetchall()
-    return {"items":[{"id":r["id"],"supplier_id":r["supplier_id"],"supplier":r["supplier_name"],"source_receipt_id":r["source_receipt_id"],"description":r["description"],"amount":cents_to_money(r["amount_cents"]),"due_date":r["due_date"],"status":r["status"],"created_at":r["created_at"],"paid_at":r["paid_at"],"payment_note":r["payment_note"]} for r in rows]}
+    return {"items":[{"id":r["id"],"supplier_id":r["supplier_id"],"supplier":r["supplier_name"],"source_receipt_id":r["source_receipt_id"],"description":r["description"],"amount":cents_to_money(r["amount_cents"]),"paid":cents_to_money(r["paid_cents"]),"remaining":cents_to_money(max(0,r["amount_cents"]-r["paid_cents"])),"cost_center":r["cost_center"],"due_date":r["due_date"],"status":r["status"],"created_at":r["created_at"],"paid_at":r["paid_at"],"payment_note":r["payment_note"]} for r in rows]}
 
 
 @app.post("/v1/finance/payables/{payable_id}/mark-paid")
@@ -1004,18 +1060,101 @@ def mark_payable_paid(payable_id: str,data: PayablePaidIn,conn: DB,user: USER):
         row=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=?",(payable_id,user["company_id"])).fetchone()
         if not row: raise HTTPException(404,"Conta a pagar não encontrada nesta empresa.")
         if row["status"]!="open": raise HTTPException(409,"A conta não está em aberto.")
+        already=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0]
+        remaining=row["amount_cents"]-already
+        if remaining<=0: raise HTTPException(409,"Conta sem saldo pendente.")
+        payment_id=new_id()
+        conn.execute("INSERT INTO payable_payments VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,remaining,date.today().isoformat(),data.payment_note,"legacy-full-"+payment_id,user["id"],paid_at))
         conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=?",(paid_at,data.payment_note,payable_id,user["company_id"]))
-        audit(conn,user["company_id"],user["id"],"payable.manually_marked_paid","accounts_payable",payable_id,{"amount":cents_to_money(row["amount_cents"]),"payment_note":data.payment_note,"warning":"Baixa declarada pelo operador; não confirmada por integração bancária."})
+        audit(conn,user["company_id"],user["id"],"payable.manually_marked_paid","accounts_payable",payable_id,{"amount":cents_to_money(remaining),"payment_note":data.payment_note,"warning":"Baixa declarada manualmente; não confirmada por integração bancária."})
     return {"id":payable_id,"status":"paid","paid_at":paid_at,"note":"Baixa manual registrada; não representa confirmação bancária."}
+
+
+@app.post("/v1/finance/payables/{payable_id}/payments",status_code=201)
+def record_payable_payment(payable_id: str,data: PayablePartialIn,request: Request,conn: DB,user: USER,
+                           idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
+    require_role(user,"owner","admin","manager")
+    if not idempotency_key or not 1<=len(idempotency_key)<=128:
+        raise HTTPException(400,"Envie Idempotency-Key para registrar a baixa sem duplicidade.")
+    amount_cents=decimal_money_cents(data.amount)
+    if amount_cents<=0: raise HTTPException(422,"Valor deve ser de ao menos R$ 0,01.")
+    if data.payment_date>date.today(): raise HTTPException(422,"Data de pagamento não pode ser futura.")
+    created=now_iso()
+    with transaction(conn):
+        prior=conn.execute("SELECT * FROM payable_payments WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
+        if prior:
+            if prior["payable_id"]!=payable_id or prior["amount_cents"]!=amount_cents or prior["reference"]!=data.reference or prior["payment_date"]!=data.payment_date.isoformat():
+                raise HTTPException(409,"Chave de idempotência reutilizada com dados diferentes.")
+            if response is not None: response.status_code=200
+            payable=conn.execute("SELECT amount_cents,status FROM accounts_payable WHERE id=? AND company_id=?",(payable_id,user["company_id"])).fetchone()
+            paid=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0]
+            return {"id":prior["id"],"status":payable["status"],"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,payable["amount_cents"]-paid)),"note":"Baixa manual registrada; não confirmada por banco."}
+        payable=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=?",(payable_id,user["company_id"])).fetchone()
+        if not payable: raise HTTPException(404,"Conta a pagar não encontrada nesta empresa.")
+        if payable["status"]!="open": raise HTTPException(409,"Conta não está em aberto.")
+        already=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0]
+        remaining=payable["amount_cents"]-already
+        if amount_cents>remaining: raise HTTPException(409,"O pagamento supera o saldo restante.")
+        payment_id=new_id()
+        conn.execute("INSERT INTO payable_payments VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,amount_cents,data.payment_date.isoformat(),data.reference,idempotency_key,user["id"],created))
+        paid=already+amount_cents
+        new_status="paid" if paid==payable["amount_cents"] else "open"
+        if new_status=="paid": conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=?",(created,data.reference,payable_id,user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"payable.payment_recorded","payable_payment",payment_id,{"payable_id":payable_id,"amount":cents_to_money(amount_cents),"paid_to_date":cents_to_money(paid),"remaining":cents_to_money(payable["amount_cents"]-paid),"payment_date":data.payment_date.isoformat(),"reference":data.reference,"status":"manual_not_bank_confirmed"})
+    return {"id":payment_id,"status":new_status,"paid":cents_to_money(paid),"remaining":cents_to_money(payable["amount_cents"]-paid),"note":"Baixa manual registrada; não confirmada por banco."}
+
+
+@app.post("/v1/finance/expenses",status_code=201)
+def create_expense(data: ExpenseIn,conn: DB,user: USER,
+                   idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
+    require_role(user,"owner","admin","manager")
+    if not idempotency_key or not 1<=len(idempotency_key)<=128:
+        raise HTTPException(400,"Envie Idempotency-Key para evitar duplicidade.")
+    amount_cents=decimal_money_cents(data.amount)
+    if amount_cents<=0: raise HTTPException(422,"Valor deve ser de ao menos R$ 0,01.")
+    normalized={"description":data.description,"amount":amount_cents,"due_date":data.due_date.isoformat(),"cost_center":data.cost_center,"payment_date":data.payment_date.isoformat() if data.payment_date else None,"payment_reference":data.payment_reference}
+    request_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    payable_id,created=new_id(),now_iso()
+    with transaction(conn):
+        prior=conn.execute("SELECT ed.payable_id,ed.request_hash,ap.status,ap.amount_cents,ap.due_date,ed.cost_center FROM payable_expense_details ed JOIN accounts_payable ap ON ap.id=ed.payable_id AND ap.company_id=ed.company_id WHERE ed.company_id=? AND ed.idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
+        if prior:
+            if prior["request_hash"]!=request_hash: raise HTTPException(409,"Chave de idempotência reutilizada com dados diferentes.")
+            if response is not None: response.status_code=200
+            return {"id":prior["payable_id"],"amount":cents_to_money(prior["amount_cents"]),"due_date":prior["due_date"],"status":prior["status"],"cost_center":prior["cost_center"],"note":"Registro já existente; eventuais baixas seguem declaradas manualmente."}
+        conn.execute("INSERT INTO accounts_payable(id,company_id,supplier_id,source_receipt_id,description,amount_cents,due_date,status,created_by,created_at) VALUES(?,?,NULL,NULL,?,?,?,'open',?,?)",(payable_id,user["company_id"],data.description.strip(),amount_cents,data.due_date.isoformat(),user["id"],created))
+        conn.execute("INSERT INTO payable_expense_details VALUES(?,?,?,?,?)",(payable_id,user["company_id"],data.cost_center.strip(),idempotency_key,request_hash))
+        if data.payment_date:
+            if data.payment_date>date.today(): raise HTTPException(422,"Data de pagamento não pode ser futura.")
+            if len(data.payment_reference.strip())<3: raise HTTPException(422,"Informe referência/justificativa para baixa manual.")
+            payment_id=new_id()
+            conn.execute("INSERT INTO payable_payments VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,amount_cents,data.payment_date.isoformat(),data.payment_reference.strip(),"expense-"+payment_id,user["id"],created))
+            conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=?",(created,data.payment_reference.strip(),payable_id,user["company_id"]))
+            audit(conn,user["company_id"],user["id"],"expense.manually_marked_paid","payable_payment",payment_id,{"payable_id":payable_id,"amount":cents_to_money(amount_cents),"cost_center":data.cost_center.strip(),"status":"manual_not_bank_confirmed"})
+        audit(conn,user["company_id"],user["id"],"expense.created","accounts_payable",payable_id,{"description":data.description.strip(),"amount":cents_to_money(amount_cents),"due_date":data.due_date.isoformat(),"cost_center":data.cost_center.strip(),"payment_status":"paid_manual" if data.payment_date else "open"})
+        expense_status="paid" if data.payment_date else "open"
+    return {"id":payable_id,"amount":cents_to_money(amount_cents),"due_date":data.due_date.isoformat(),"status":expense_status,"cost_center":data.cost_center.strip(),"note":"Despesa registrada. Qualquer baixa declarada é manual, não confirmação bancária."}
 
 
 @app.get("/v1/finance/summary")
 def finance_summary(conn: DB,user: USER):
     require_role(user,"owner","admin","manager")
     sales=conn.execute("SELECT COALESCE(SUM(total_cents),0) FROM sales WHERE company_id=? AND status='paid'",(user["company_id"],)).fetchone()[0]
-    open_amount=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM accounts_payable WHERE company_id=? AND status='open'",(user["company_id"],)).fetchone()[0]
-    overdue=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM accounts_payable WHERE company_id=? AND status='open' AND due_date<date('now')",(user["company_id"],)).fetchone()[0]
-    return {"cash_sales_total":cents_to_money(sales),"open_payables":cents_to_money(open_amount),"overdue_payables":cents_to_money(overdue),"note":"Vendas em dinheiro não incluem outras formas; baixa é manual e sem conciliação bancária."}
+    open_amount=conn.execute("SELECT COALESCE(SUM(MAX(0,ap.amount_cents-COALESCE(p.paid_cents,0))),0) FROM accounts_payable ap LEFT JOIN (SELECT company_id,payable_id,SUM(amount_cents) AS paid_cents FROM payable_payments GROUP BY company_id,payable_id) p ON p.company_id=ap.company_id AND p.payable_id=ap.id WHERE ap.company_id=? AND ap.status='open'",(user["company_id"],)).fetchone()[0]
+    overdue=conn.execute("SELECT COALESCE(SUM(MAX(0,ap.amount_cents-COALESCE(p.paid_cents,0))),0) FROM accounts_payable ap LEFT JOIN (SELECT company_id,payable_id,SUM(amount_cents) AS paid_cents FROM payable_payments GROUP BY company_id,payable_id) p ON p.company_id=ap.company_id AND p.payable_id=ap.id WHERE ap.company_id=? AND ap.status='open' AND ap.due_date<date('now')",(user["company_id"],)).fetchone()[0]
+    return {"cash_sales_total":cents_to_money(sales),"open_payables":cents_to_money(open_amount),"overdue_payables":cents_to_money(overdue),"note":"Vendas em dinheiro não incluem outras formas; baixas manuais não são conciliação bancária."}
+
+
+@app.get("/v1/finance/cashflow")
+def finance_cashflow(conn: DB,user: USER,start_date: date=Query(...),end_date: date=Query(...)):
+    require_role(user,"owner","admin","manager")
+    if end_date<start_date: raise HTTPException(422,"Data final deve ser igual ou posterior à inicial.")
+    if (end_date-start_date).days>365: raise HTTPException(422,"Período máximo do relatório é 366 dias.")
+    start=start_date.isoformat(); end=end_date.isoformat()
+    sales=conn.execute("SELECT substr(created_at,1,10) AS day,SUM(total_cents) AS cents,COUNT(*) AS count FROM sales WHERE company_id=? AND status='paid' AND substr(created_at,1,10) BETWEEN ? AND ? GROUP BY day ORDER BY day",(user["company_id"],start,end)).fetchall()
+    payments=conn.execute("SELECT pp.payment_date AS day,SUM(pp.amount_cents) AS cents,COUNT(*) AS count FROM payable_payments pp JOIN accounts_payable ap ON ap.id=pp.payable_id AND ap.company_id=pp.company_id WHERE pp.company_id=? AND pp.payment_date BETWEEN ? AND ? GROUP BY pp.payment_date ORDER BY pp.payment_date",(user["company_id"],start,end)).fetchall()
+    sale_days={r["day"]:{"amount":cents_to_money(r["cents"]),"count":r["count"]} for r in sales}
+    manual_days={r["day"]:{"amount":cents_to_money(r["cents"]),"count":r["count"]} for r in payments}
+    return {"start_date":start,"end_date":end,"items":[{"date":day,"cash_sales":sale_days.get(day,{"amount":"0.00","count":0}),"manual_payments_out":{"amount":manual_days.get(day,{"amount":"0.00","count":0})["amount"],"count":manual_days.get(day,{"amount":"0.00","count":0})["count"]}} for day in sorted(set(sale_days)|set(manual_days))],"note":"Vendas pagas em dinheiro registradas no sistema. Saídas são baixas declaradas manualmente; não confirmadas por banco e não equivalem a conciliação."}
 
 
 @app.get("/v1/purchase-orders")

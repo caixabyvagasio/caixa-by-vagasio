@@ -355,6 +355,71 @@ def test_product_edit_rejects_cross_tenant_and_duplicate_barcode(world):
     assert world.put(f"/v1/products/{own['id']}",headers=auth(one),json={"sku":"P2","name":"Produto dois","price":"2.00","barcode":"12345678"}).status_code==409
 
 
+def test_manual_expenses_and_partial_payable_payments_are_audited_idempotent_and_tenant_scoped(world):
+    from datetime import date,timedelta
+    owner=company(world)
+    other=company(world,'Loja Financeiro','loja-financeiro','finance@example.test')
+    due=(date.today()+timedelta(days=5)).isoformat()
+    created=world.post('/v1/finance/expenses',headers={**auth(owner),'Idempotency-Key':'expense-create-main'},json={'description':'Conta de internet','amount':'100.00','due_date':due,'cost_center':'Administrativo'})
+    assert created.status_code==201,created.text
+    payable=created.json()['id']
+    assert created.json()['status']=='open'
+    replay_create=world.post('/v1/finance/expenses',headers={**auth(owner),'Idempotency-Key':'expense-create-main'},json={'description':'Conta de internet','amount':'100.00','due_date':due,'cost_center':'Administrativo'})
+    assert replay_create.status_code==200 and replay_create.json()['id']==payable
+    conflict_create=world.post('/v1/finance/expenses',headers={**auth(owner),'Idempotency-Key':'expense-create-main'},json={'description':'Conta diferente','amount':'100.00','due_date':due,'cost_center':'Administrativo'})
+    assert conflict_create.status_code==409
+    assert world.post('/v1/finance/expenses',headers=auth(owner),json={'description':'Sem chave','amount':'1.00','due_date':due}).status_code==400
+    assert world.post('/v1/finance/expenses',headers={**auth(owner),'Idempotency-Key':'expense-zero'},json={'description':'Valor zero','amount':'0.001','due_date':due}).status_code==422
+    assert world.get('/v1/finance/payables',headers=auth(other)).json()['items']==[]
+    overdue=world.post('/v1/finance/expenses',headers={**auth(owner),'Idempotency-Key':'expense-create-overdue'},json={'description':'Conta vencida','amount':'1.00','due_date':(date.today()-timedelta(days=1)).isoformat()})
+    assert overdue.status_code==201 and overdue.json()['status']=='open'
+    assert world.post('/v1/finance/expenses',headers={**auth(owner),'Idempotency-Key':'expense-created-paid'},json={'description':'Licença anual','amount':'12.00','due_date':due,'payment_date':date.today().isoformat(),'payment_reference':'Comprovante declarado'}).json()['status']=='paid'
+    payload={'amount':'30.00','payment_date':date.today().isoformat(),'reference':'PIX declarado'}
+    headers={**auth(owner),'Idempotency-Key':'expense-payment-a'}
+    first=world.post(f'/v1/finance/payables/{payable}/payments',headers=headers,json=payload)
+    assert first.status_code==201,first.text
+    replay=world.post(f'/v1/finance/payables/{payable}/payments',headers=headers,json=payload)
+    assert replay.status_code==200 and replay.json()['paid']=='30.00'
+    assert world.post(f'/v1/finance/payables/{payable}/payments',headers={**auth(owner),'Idempotency-Key':'expense-payment-b'},json={'amount':'70.01','payment_date':date.today().isoformat(),'reference':'Transferência'}).status_code==409
+    assert next(x for x in world.get('/v1/finance/payables',headers=auth(owner)).json()['items'] if x['id']==payable)['remaining']=='70.00'
+    assert world.get('/v1/finance/summary',headers=auth(owner)).json()['open_payables']=='71.00'
+    cashflow=world.get(f"/v1/finance/cashflow?start_date={date.today().isoformat()}&end_date={date.today().isoformat()}",headers=auth(owner))
+    assert cashflow.status_code==200,cashflow.text
+    assert cashflow.json()['items']==[{'date':date.today().isoformat(),'cash_sales':{'amount':'0.00','count':0},'manual_payments_out':{'amount':'42.00','count':2}}]
+    assert 'não confirmadas por banco' in cashflow.json()['note']
+    product_id=product(world,owner,sku='CASHFLOW-1',price='8.00')['id']
+    world.post(f'/v1/products/{product_id}/stock-adjustments',headers=auth(owner),json={'direction':'in','quantity':'2','reason':'Entrada fluxo'})
+    world.post('/v1/registers/open',headers=auth(owner),json={'label':'Caixa fluxo','opening_amount':'0'})
+    sale=world.post('/v1/sales',headers={**auth(owner),'Idempotency-Key':'cashflow-sale-1'},json={'items':[{'product_id':product_id,'quantity':'1'}],'payment_method':'cash','received_amount':'8.00'})
+    assert sale.status_code==201,sale.text
+    cashflow=world.get(f"/v1/finance/cashflow?start_date={date.today().isoformat()}&end_date={date.today().isoformat()}",headers=auth(owner)).json()
+    current=next(x for x in cashflow['items'] if x['date']==date.today().isoformat())
+    assert current['cash_sales']=={'amount':'8.00','count':1}
+    assert current['manual_payments_out']=={'amount':'42.00','count':2}
+    future=world.post(f'/v1/finance/payables/{payable}/payments',headers={**auth(owner),'Idempotency-Key':'payment-future'},json={'amount':'1.00','payment_date':(date.today()+timedelta(days=1)).isoformat(),'reference':'Futuro inválido'})
+    assert future.status_code==422
+    assert world.get('/v1/finance/cashflow?start_date=2026-02-01&end_date=2026-01-01',headers=auth(owner)).status_code==422
+    other_flow=world.get(f"/v1/finance/cashflow?start_date={date.today().isoformat()}&end_date={date.today().isoformat()}",headers=auth(other))
+    assert other_flow.status_code==200 and other_flow.json()['items']==[]
+    op=world.post('/v1/users',headers=auth(owner),json={'full_name':'Operador finanças','email':'finance-op@example.test','password':'strong-operator-password-567','role':'operator'})
+    op_token=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'finance-op@example.test','password':'strong-operator-password-567'}).json()['access_token']
+    assert world.get(f"/v1/finance/cashflow?start_date={date.today().isoformat()}&end_date={date.today().isoformat()}",headers=auth(op_token)).status_code==403
+    final=world.post(f'/v1/finance/payables/{payable}/payments',headers={**auth(owner),'Idempotency-Key':'expense-payment-c'},json={'amount':'70.00','payment_date':date.today().isoformat(),'reference':'Segunda parte'} )
+    assert final.status_code==201 and final.json()['status']=='paid' and final.json()['remaining']=='0.00'
+    listing=world.get('/v1/finance/payables?status=paid',headers=auth(owner)).json()['items']
+    paid_expense=next(x for x in listing if x['id']==payable)
+    assert paid_expense['paid']=='100.00' and paid_expense['cost_center']=='Administrativo'
+    assert world.post(f'/v1/finance/payables/{payable}/payments',headers={**auth(other),'Idempotency-Key':'cross-tenant'},json=payload).status_code==404
+    conn=main.connect_db()
+    try:
+        count=conn.execute('SELECT COUNT(*) FROM payable_payments WHERE company_id=? AND payable_id=?',(conn.execute('SELECT id FROM companies WHERE slug=?',('mercado-um',)).fetchone()[0],payable)).fetchone()[0]
+        with pytest.raises(Exception): conn.execute('UPDATE payable_payments SET reference=? WHERE payable_id=?',('alterado',payable))
+        with pytest.raises(Exception): conn.execute('DELETE FROM payable_payments WHERE payable_id=?',(payable,))
+    finally: conn.close()
+    assert count==2
+    assert world.get('/v1/audit-events',headers=auth(owner)).json()['items']
+
+
 def test_supplier_purchase_receipt_updates_inventory_once_and_audits(world):
     owner=company(world)
     supplier=world.post("/v1/suppliers",headers=auth(owner),json={"name":"Fornecedor Local","email":"vendas@example.test"})

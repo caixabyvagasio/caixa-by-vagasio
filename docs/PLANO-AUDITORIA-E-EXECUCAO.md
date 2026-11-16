@@ -45,6 +45,12 @@ Stack: FastAPI/Python, SQLite, HTML/CSS/JavaScript sem framework, pytest/TestCli
 11. **Preparação de homologação:** pentest, accessibility/mobile/E2E/carga, backup/restore, runbooks, monitoramento, documentação, release e rollback. Aceite: CI e validação operacional completos; deploy produtivo exige autorização expressa.
 
 ## Progresso deste ciclo
+- [x] Próximo incremento financeiro desenvolvido no worktree: despesa com centro de custo, pagamentos parciais idempotentes append-only, total pago/saldo por obrigação, baixa completa compatível com ledger, summary e fluxo operacional por período distinguindo vendas em dinheiro de baixas declaradas. Tela financeira acrescenta cadastro de despesa, pagamentos e tabela por período.
+- [x] Testes de tenant, roles, baixa parcial/final, replay/conflict, excesso, anotação manual, imutabilidade do ledger, expense create idempotência, cashflow com venda+saída e segurança de interface; 48 passed, 1 warning no suite local.
+- [ ] Commit/CI deste bloco financeiro e documentação; sem deploy até autorização.
+- [ ] O módulo continua parcial: sem contas a receber, conciliação, DRE e integração bancária. Centro de custo atualmente é rótulo, não cadastro analítico.
+
+## Progresso deste ciclo
 - [x] Auditar commit atual, ambiente, endpoints, esquemas, papeis, dependências, testes e implantação.
 - [x] Reproduzir localmente os 39 testes do commit (`39 passed`, 1 warning conhecido de depreciação TestClient/httpx).
 - [x] Corrigir signup público na demonstração e exposição de dados de clientes; adicionar testes (`cc92667`, CI success; sem deploy por ordem de não publicar).
