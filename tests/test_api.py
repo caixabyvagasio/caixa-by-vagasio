@@ -324,7 +324,7 @@ def test_public_signup_creates_isolated_owner_when_enabled(tmp_path, monkeypatch
         assert profile['primary_segment']=='restaurant'
         assert profile['secondary_segments']==['grocery']
         assert profile['answers']==payload['answers']
-        assert set(profile['modules'])=={'sales','inventory','tables_tabs','delivery','barcode','weighed_items'}
+        assert set(profile['modules'])==main.IMPLEMENTED_FEATURES
         history=client.get('/v1/company/profile/history',headers=auth(token)).json()['items']
         assert len(history)==1 and history[0]['profile']['primary_segment']=='restaurant'
 
@@ -339,6 +339,17 @@ def test_login_rate_limits_repeated_wrong_passwords(world, monkeypatch):
     assert statuses[8] == 429
 
 
+def test_feature_catalog_marks_only_implemented_features_available(world):
+    owner=company(world)
+    catalog=world.get('/v1/configuration/catalog',headers=auth(owner)).json()
+    by_id={item['id']:item for item in catalog['features']}
+    assert {'sales','inventory','purchasing','customers','finance','reports','staff','profile_setup'} <= set(by_id)
+    assert all(by_id[item]['available'] for item in main.IMPLEMENTED_FEATURES)
+    assert all(by_id[item]['enabled'] for item in main.IMPLEMENTED_FEATURES)
+    assert not any(item['available'] or item['enabled'] for item in by_id.values() if item['id'] not in main.IMPLEMENTED_FEATURES)
+    assert not any(by_id[item]['available'] for item in ('barcode','weighed_items','expiry_control','tables_tabs','delivery','kitchen','variants','returns','commissions','appointments','measurement_sales') if item in by_id)
+
+
 def test_segment_catalog_and_profile_configuration_are_tenant_scoped_and_audited(world):
     owner = company(world)
     other = company(world, "Outro Negócio", "outro-negocio", "other@example.test")
@@ -349,7 +360,7 @@ def test_segment_catalog_and_profile_configuration_are_tenant_scoped_and_audited
                "answers":{"tables":True,"delivery":True,"kitchen":False,"barcode":True,"weighed_items":True,"perishables":True}}
     saved = world.put("/v1/company/profile", headers=auth(owner), json=payload)
     assert saved.status_code == 200, saved.text
-    assert set(saved.json()["modules"]) == {"sales","inventory","tables_tabs","delivery","barcode","weighed_items","expiry_control"}
+    assert set(saved.json()["modules"]) == main.IMPLEMENTED_FEATURES
     profile = world.get("/v1/configuration/catalog", headers=auth(owner)).json()["profile"]
     assert profile["primary_segment"] == "restaurant"
     assert world.get("/v1/configuration/catalog", headers=auth(other)).json()["profile"] is None

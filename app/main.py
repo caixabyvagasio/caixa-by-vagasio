@@ -59,7 +59,7 @@ class PostgresConnection:
         if "INSERT OR REPLACE INTO SEGMENT_CATALOG" in raw_sql.upper():
             return "INSERT INTO segment_catalog(id,name,questions_json,active) VALUES(%s,%s,%s,1) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,questions_json=EXCLUDED.questions_json,active=1", None
         if "INSERT OR REPLACE INTO FEATURE_CATALOG" in raw_sql.upper():
-            return "INSERT INTO feature_catalog(id,name,description,category,recommended_segments_json,dependencies_json,available) VALUES(%s,%s,%s,%s,%s,%s,1) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,category=EXCLUDED.category,recommended_segments_json=EXCLUDED.recommended_segments_json,dependencies_json=EXCLUDED.dependencies_json,available=1", None
+            return "INSERT INTO feature_catalog(id,name,description,category,recommended_segments_json,dependencies_json,available) VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,category=EXCLUDED.category,recommended_segments_json=EXCLUDED.recommended_segments_json,dependencies_json=EXCLUDED.dependencies_json,available=EXCLUDED.available", None
         if "ON CONFLICT(COMPANY_ID) DO UPDATE" in raw_sql.upper():
             return re.sub(r"ON CONFLICT\(company_id\) DO UPDATE SET (.*)",lambda m:"ON CONFLICT(company_id) DO UPDATE SET "+re.sub(r"excluded\.([a-z_]+)",r"EXCLUDED.\1",m.group(1),flags=re.I),sql.replace("?","%s"),flags=re.I|re.S), None
         ignore_insert=bool(re.search(r"^\s*INSERT OR IGNORE INTO",sql,re.I))
@@ -219,8 +219,15 @@ FEATURES = [
     ("commissions", "Comissões de vendedores", "Apuração ainda depende do módulo de vendas", "sales", ["apparel","services"], ["sales"]),
     ("appointments", "Agendamentos", "Agenda especializada ainda não incluída", "services", ["services"], []),
     ("measurement_sales", "Vendas por medida", "Unidades comerciais especializadas ainda dependem de regras", "catalog", ["construction"], ["inventory"]),
-    ("purchasing", "Compras e fornecedores", "Módulo ainda não implementado", "management", ["*"], ["inventory"]),
+    ("purchasing", "Compras e fornecedores", "Fornecedores, pedidos e recebimentos vinculados ao estoque", "management", ["*"], ["inventory"]),
+    ("customers", "Clientes", "Cadastro e consulta de clientes", "management", ["*"], []),
+    ("finance", "Financeiro", "Despesas, contas a pagar e movimentações registradas", "management", ["*"], []),
+    ("reports", "Relatórios", "Relatórios de vendas e posição de estoque", "management", ["*"], []),
+    ("staff", "Equipe e acessos", "Contas e permissões da equipe", "security", ["*"], []),
+    ("profile_setup", "Perfil do negócio", "Atividades e configuração operacional", "configuration", ["*"], []),
 ]
+
+IMPLEMENTED_FEATURES = {"sales", "inventory", "purchasing", "customers", "finance", "reports", "staff", "profile_setup"}
 
 def now_iso() -> str:
     # Keep deterministic ordering for sequential audit/profile events created within one second.
@@ -497,8 +504,9 @@ def init_db() -> None:
             conn.execute("INSERT OR REPLACE INTO segment_catalog(id,name,questions_json,active) VALUES(?,?,?,1)",
                          (segment_id, segment["name"], json.dumps(segment["questions"], ensure_ascii=False)))
         for feature_id, name, description, category, recommended, dependencies in FEATURES:
-            conn.execute("INSERT OR REPLACE INTO feature_catalog(id,name,description,category,recommended_segments_json,dependencies_json,available) VALUES(?,?,?,?,?,?,1)",
-                         (feature_id, name, description, category, json.dumps(recommended), json.dumps(dependencies)))
+            conn.execute("INSERT OR REPLACE INTO feature_catalog(id,name,description,category,recommended_segments_json,dependencies_json,available) VALUES(?,?,?,?,?,?,?)",
+                         (feature_id, name, description, category, json.dumps(recommended), json.dumps(dependencies),
+                          int(feature_id in IMPLEMENTED_FEATURES)))
     finally:
         conn.close()
 
@@ -983,20 +991,8 @@ def demo_login(conn: DB):
 
 
 def resolve_profile_modules(answers: dict[str, bool]) -> list[str]:
-    # Persist recommendations/profile flags only. Feature availability is separate.
-    modules = {"sales", "inventory"}
-    if answers.get("barcode"): modules.add("barcode")
-    if answers.get("weighed_items"): modules.add("weighed_items")
-    if answers.get("perishables"): modules.add("expiry_control")
-    if any(answers.get(k, False) for k in ("tables", "tabs")): modules.add("tables_tabs")
-    if answers.get("delivery"): modules.add("delivery")
-    if answers.get("kitchen"): modules.add("kitchen")
-    if answers.get("sizes_colors"): modules.add("variants")
-    if answers.get("returns"): modules.add("returns")
-    if answers.get("commission"): modules.add("commissions")
-    if answers.get("appointments"): modules.add("appointments")
-    if answers.get("measurement"): modules.add("measurement_sales")
-    return sorted(modules)
+    """Return only implemented modules; preserve questionnaire requests separately."""
+    return sorted(IMPLEMENTED_FEATURES)
 
 
 def validate_initial_profile(data: BootstrapIn, *, required: bool = False):
@@ -1104,17 +1100,21 @@ def login(data: LoginIn, request: Request, conn: DB):
 @app.get("/v1/configuration/catalog")
 def configuration_catalog(conn: DB, user: USER):
     segments = conn.execute("SELECT * FROM segment_catalog WHERE active=1 ORDER BY name").fetchall()
-    features = conn.execute("SELECT * FROM feature_catalog WHERE available=1 ORDER BY category,name").fetchall()
+    all_features = conn.execute("SELECT * FROM feature_catalog ORDER BY category,name").fetchall()
     profile = conn.execute("SELECT * FROM company_profiles WHERE company_id=?", (user["company_id"],)).fetchone()
+    selected_segments = ([profile["primary_segment"], *json.loads(profile["secondary_segments_json"])] if profile else [])
+    feature_rows = [r for r in all_features if "*" in json.loads(r["recommended_segments_json"])
+                    or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected_segments)]
+    active_modules = set(json.loads(profile["modules_json"])) if profile else IMPLEMENTED_FEATURES
     return {"segments": [{"id":r["id"],"name":r["name"],"questions":json.loads(r["questions_json"])} for r in segments],
             "features": [{"id":r["id"],"name":r["name"],"description":r["description"],"category":r["category"],
                           "recommended_segments":json.loads(r["recommended_segments_json"]),"dependencies":json.loads(r["dependencies_json"]),
-                          "available":bool(r["available"])} for r in features],
+                          "available":bool(r["available"]),"enabled":bool(r["available"] and r["id"] in active_modules)} for r in feature_rows],
             "profile": ({"primary_segment":profile["primary_segment"],
                          "secondary_segments":json.loads(profile["secondary_segments_json"]),
                          "answers":json.loads(profile["answers_json"]),"modules":json.loads(profile["modules_json"]),
                          "updated_at":profile["updated_at"]} if profile else None),
-            "plan_entitlements": "not_configured", "activation_note": "Módulos sugeridos não significam contratação nem ativação de recursos ainda não implementados."}
+            "plan_entitlements": "not_configured", "activation_note": "Somente ferramentas disponíveis são ativadas; itens indisponíveis não aparecem no menu."}
 
 
 @app.get("/v1/company/profile/history")
