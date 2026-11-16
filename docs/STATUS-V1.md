@@ -18,4 +18,6 @@
 - Campos de produto: categoria, código de barras por empresa (único), estoque mínimo; pesquisa aceita código de barras e endpoint de estoque crítico usa mínimos configurados.
 - Migração SQLite idempotente adiciona os campos ao banco existente sem remover dados do catálogo. Estoque continua alterado somente por movimentos justificados/auditados.
 - Portal empresarial ganhou campos correspondentes e sinalização de saldo baixo. Leituras físicas de scanner dependem de modelo/protocolo; leitores que digitam teclado podem alimentar a pesquisa, sem integração de hardware homologada.
-- Testes: 20 aprovados localmente; CI remoto pendente. Nenhum deploy ao Render.
+- Testes: 22 aprovados localmente após a edição auditada; CI remoto pendente. Nenhum deploy ao Render. Nenhum deploy ao Render.
+
+- Edição de produto implementada: valores anteriores e novos são gravados em evento de auditoria; mudanças respeitam tenant, papéis, unicidade de SKU e código.

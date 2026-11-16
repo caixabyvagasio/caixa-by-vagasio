@@ -555,7 +555,7 @@ def product_json(row: sqlite3.Row) -> dict:
     return {"id": row["id"], "sku": row["sku"], "name": row["name"], "unit": row["unit"],
             "price": cents_to_money(row["price_cents"]), "cost": cents_to_money(row["cost_cents"]),
             "stock": milli_to_decimal(row["stock_milli"]), "category": row["category"], "barcode": row["barcode"],
-            "minimum_stock": milli_to_decimal(row["min_stock_milli"]), "low_stock": row["stock_milli"] <= row["min_stock_milli"],
+            "minimum_stock": milli_to_decimal(row["min_stock_milli"]), "low_stock": row["min_stock_milli"] > 0 and row["stock_milli"] <= row["min_stock_milli"],
             "active": bool(row["active"]), "created_at": row["created_at"]}
 
 
@@ -792,6 +792,26 @@ def create_product(data: ProductIn, conn: DB, user: USER):
     return product_json(row)
 
 
+@app.put("/v1/products/{product_id}")
+def update_product(product_id: str, data: ProductIn, conn: DB, user: USER):
+    require_role(user,"owner","admin","manager","stock")
+    try:
+        with transaction(conn):
+            old=conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND active=1",(product_id,user["company_id"])).fetchone()
+            if not old: raise HTTPException(404,"Produto não encontrado nesta empresa.")
+            conn.execute("""UPDATE products SET sku=?,name=?,unit=?,price_cents=?,cost_cents=?,category=?,barcode=?,min_stock_milli=?
+                WHERE id=? AND company_id=?""",(data.sku.strip(),data.name.strip(),data.unit.strip(),decimal_money_cents(data.price),
+                decimal_money_cents(data.cost),data.category.strip(),data.barcode.strip() if data.barcode else None,
+                decimal_milli(data.minimum_stock),product_id,user["company_id"]))
+            audit(conn,user["company_id"],user["id"],"product.updated","product",product_id,
+                  {"before":{"sku":old["sku"],"name":old["name"],"price":cents_to_money(old["price_cents"]),"category":old["category"],"barcode":old["barcode"],"minimum_stock":milli_to_decimal(old["min_stock_milli"])},
+                   "after":{"sku":data.sku.strip(),"name":data.name.strip(),"price":cents_to_money(decimal_money_cents(data.price)),"category":data.category.strip(),"barcode":data.barcode,"minimum_stock":milli_to_decimal(decimal_milli(data.minimum_stock))}})
+    except sqlite3.IntegrityError:
+        raise HTTPException(409,"Já existe um produto com esse SKU ou código de barras nesta empresa.")
+    row=conn.execute("SELECT * FROM products WHERE id=? AND company_id=?",(product_id,user["company_id"])).fetchone()
+    return product_json(row)
+
+
 @app.patch("/v1/users/{user_id}")
 def update_user(user_id: str, data: UserStatusIn, conn: DB, user: USER):
     require_role(user, "owner", "admin")
@@ -824,7 +844,8 @@ def list_products(conn: DB, user: USER, search: str = Query(default="", max_leng
 def low_stock_products(conn: DB, user: USER, limit: int = Query(default=100, ge=1, le=200)):
     rows=conn.execute("SELECT * FROM products WHERE company_id=? AND active=1 AND min_stock_milli>0 AND stock_milli<=min_stock_milli ORDER BY (min_stock_milli-stock_milli) DESC LIMIT ?",
                       (user["company_id"],limit)).fetchall()
-    return {"items":[product_json(row) for row in rows],"total":len(rows)}
+    count=conn.execute("SELECT count(*) FROM products WHERE company_id=? AND active=1 AND min_stock_milli>0 AND stock_milli<=min_stock_milli",(user["company_id"],)).fetchone()[0]
+    return {"items":[product_json(row) for row in rows],"total":count,"limit":limit}
 
 
 @app.post("/v1/products/{product_id}/stock-adjustments", status_code=201)

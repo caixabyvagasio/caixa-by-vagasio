@@ -298,3 +298,24 @@ def test_legacy_product_schema_migrates_without_losing_catalog(tmp_path, monkeyp
         assert "products_company_barcode" in indexes
     finally:
         conn.close()
+
+
+def test_product_edit_audits_previous_and_new_values(world):
+    token=company(world)
+    p=product(world,token,sku="OLD-SKU",name="Nome antigo",price="4.50")
+    response=world.put(f"/v1/products/{p['id']}",headers=auth(token),json={"sku":"NEW-SKU","name":"Nome novo","price":"6.25","cost":"2.10","category":"Mercearia","barcode":"4567890123456","minimum_stock":"3"})
+    assert response.status_code==200,response.text
+    assert response.json()["sku"]=="NEW-SKU" and response.json()["category"]=="Mercearia"
+    events=world.get("/v1/audit-events",headers=auth(token)).json()["items"]
+    update=next(e for e in events if e["action"]=="product.updated")
+    assert update["details"]["before"]["sku"]=="OLD-SKU"
+    assert update["details"]["after"]["sku"]=="NEW-SKU"
+
+
+def test_product_edit_rejects_cross_tenant_and_duplicate_barcode(world):
+    one=company(world)
+    two=company(world,"Loja Dois","loja-dois","two@example.test")
+    p=world.post("/v1/products",headers=auth(one),json={"sku":"P1","name":"Produto um","price":"1.00","barcode":"12345678"}).json()
+    assert world.put(f"/v1/products/{p['id']}",headers=auth(two),json={"sku":"P2","name":"Alheio","price":"2.00"}).status_code==404
+    own=world.post("/v1/products",headers=auth(one),json={"sku":"P2","name":"Produto dois","price":"2.00"}).json()
+    assert world.put(f"/v1/products/{own['id']}",headers=auth(one),json={"sku":"P2","name":"Produto dois","price":"2.00","barcode":"12345678"}).status_code==409
