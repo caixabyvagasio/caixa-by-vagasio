@@ -47,7 +47,7 @@ Stack: FastAPI/Python, SQLite, HTML/CSS/JavaScript sem framework, pytest/TestCli
 ## Progresso deste ciclo
 - [x] Próximo incremento financeiro desenvolvido no worktree: despesa com centro de custo, pagamentos parciais idempotentes append-only, total pago/saldo por obrigação, baixa completa compatível com ledger, summary e fluxo operacional por período distinguindo vendas em dinheiro de baixas declaradas. Tela financeira acrescenta cadastro de despesa, pagamentos e tabela por período.
 - [x] Testes de tenant, roles, baixa parcial/final, replay/conflict, excesso, anotação manual, imutabilidade do ledger, expense create idempotência, cashflow com venda+saída e segurança de interface; 48 passed, 1 warning no suite local.
-- [ ] Commit/CI deste bloco financeiro e documentação; sem deploy até autorização.
+- [x] Commit/CI bloco financeiro: `ef082c4a41156a37f07d33188a6e387befda52d4`, run `43950327110` success; não foi deployado.
 - [ ] O módulo continua parcial: sem contas a receber, conciliação, DRE e integração bancária. Centro de custo atualmente é rótulo, não cadastro analítico.
 
 ## Progresso deste ciclo
