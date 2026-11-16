@@ -534,3 +534,18 @@ def test_void_requires_open_cash_with_enough_balance_and_never_rewrites_closed_r
     old=world.get(f"/v1/registers/{oldreg['id']}",headers=auth(owner))
     assert old.status_code==404 or old.json()['difference']=='0.00'
     assert world.get('/v1/registers/current',headers=auth(owner)).json()['expected_amount']=='0.00'
+
+
+def test_sales_report_periods_totals_and_tenant_isolation(world):
+    owner=company(world)
+    p=product(world,owner,sku='REPORT-1',price='5.00')
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(owner),json={'direction':'in','quantity':'3','reason':'Entrada'})
+    world.post('/v1/registers/open',headers=auth(owner),json={'label':'Caixa','opening_amount':'20.00'})
+    sale=world.post('/v1/sales',headers={**auth(owner),'Idempotency-Key':'report-sale'},json={'items':[{'product_id':p['id'],'quantity':'1'}],'payment_method':'cash','received_amount':'5.00'}).json()
+    world.post(f"/v1/sales/{sale['id']}/void",headers=auth(owner),json={'reason':'Cancelamento relatório'})
+    report=world.get('/v1/reports/sales?start_date=2026-01-01&end_date=2026-12-31&group_by=day',headers=auth(owner)).json()
+    assert report['totals']=={'sale_count':1,'paid_count':0,'voided_count':1,'gross_paid':'0.00','voided_value':'5.00'}
+    assert world.get('/v1/reports/sales?start_date=2026-12-31&end_date=2026-01-01',headers=auth(owner)).status_code==422
+    assert world.get('/v1/reports/sales?start_date=2025-01-01&end_date=2026-12-31',headers=auth(owner)).status_code==422
+    two=company(world,'Outra','outra','outra@example.test')
+    assert world.get('/v1/reports/sales?start_date=2026-01-01&end_date=2026-12-31',headers=auth(two)).json()['totals']['sale_count']==0

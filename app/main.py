@@ -1389,6 +1389,26 @@ def list_audit_events(conn: DB, user: USER, limit: int = Query(default=100, ge=1
                        "details": json.loads(r["details_json"]), "created_at": r["created_at"]} for r in rows]}
 
 
+@app.get("/v1/reports/sales")
+def sales_report(conn: DB,user: USER,start_date: date,end_date: date,group_by: str="day"):
+    require_role(user,"owner","admin","manager")
+    if end_date < start_date: raise HTTPException(422,"A data final precisa ser igual ou posterior à inicial.")
+    if (end_date-start_date).days>366: raise HTTPException(422,"O período máximo deste relatório é 367 dias.")
+    if group_by not in {"day","month"}: raise HTTPException(422,"Agrupamento deve ser day ou month.")
+    expression="date(created_at)" if group_by=="day" else "strftime('%Y-%m',created_at)"
+    rows=conn.execute(f"""SELECT {expression} AS period,COUNT(*) AS sale_count,
+        SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) AS paid_count,
+        SUM(CASE WHEN status='voided' THEN 1 ELSE 0 END) AS voided_count,
+        COALESCE(SUM(CASE WHEN status='paid' THEN total_cents ELSE 0 END),0) AS gross_cents,
+        COALESCE(SUM(CASE WHEN status='voided' THEN total_cents ELSE 0 END),0) AS voided_cents
+        FROM sales WHERE company_id=? AND date(created_at)>=? AND date(created_at)<=? GROUP BY period ORDER BY period""",
+        (user["company_id"],start_date.isoformat(),end_date.isoformat())).fetchall()
+    return {"start_date":start_date.isoformat(),"end_date":end_date.isoformat(),"group_by":group_by,
+        "items":[{"period":r["period"],"sale_count":r["sale_count"],"paid_count":r["paid_count"],"voided_count":r["voided_count"],"gross_paid":cents_to_money(r["gross_cents"]),"voided_value":cents_to_money(r["voided_cents"])} for r in rows],
+        "totals":{"sale_count":sum(r["sale_count"] for r in rows),"paid_count":sum(r["paid_count"] for r in rows),"voided_count":sum(r["voided_count"] for r in rows),"gross_paid":cents_to_money(sum(r["gross_cents"] for r in rows)),"voided_value":cents_to_money(sum(r["voided_cents"] for r in rows))},
+        "note":"Relatório de vendas registradas localmente, somente dinheiro nesta versão; datas UTC. Não é demonstrativo fiscal/contábil."}
+
+
 @app.get("/v1/dashboard/summary")
 def dashboard_summary(conn: DB, user: USER):
     company_id = user["company_id"]

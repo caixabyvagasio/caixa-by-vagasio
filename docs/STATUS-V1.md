@@ -53,3 +53,7 @@
 ## Correção de segurança do cancelamento em dinheiro
 - Cancelamento agora exige caixa aberto e saldo esperado suficiente; lança estorno contra o caixa aberto corrente, sem reescrever caixa já fechado. Falta de caixa mantém a transação atômica: venda paga e estoque não muda. UI comunica baixa/devolução manual.
 - Validação ampliada: 36 testes locais passaram; CI aguarda commit.
+
+## Incremento de relatório de vendas
+- API e tela de relatório por intervalo, agrupamento diário/mensal, contagem e totais separados para vendas pagas e canceladas. Datas e limites validados; limites de função e tenant. É operacional/gerencial, usa somente valores locais em dinheiro e UTC; não é relatório fiscal ou contábil.
+- Testes locais: 37 aprovados. CI/deploy pendente.
