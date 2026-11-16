@@ -8,6 +8,117 @@ import os
 import re
 import secrets
 import sqlite3
+
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except ImportError:  # SQLite remains available for tests and local development.
+    psycopg2 = None
+    DictCursor = None
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+POSTGRES_BACKEND = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+REQUIRE_POSTGRES = os.environ.get("CAIXA_REQUIRE_POSTGRES", "false").strip().lower() == "true"
+
+
+class HybridRow(dict):
+    """PostgreSQL mapping rows that also support the existing [0] reads."""
+    def __init__(self, cursor, values):
+        super().__init__(zip((d[0] for d in cursor.description), values))
+        self._keys = tuple(self.keys())
+    def __getitem__(self, key):
+        return super().__getitem__(self._keys[key] if isinstance(key, int) else key)
+
+
+class HybridCursor:
+    def __init__(self, cursor): self._cursor=cursor
+    def fetchone(self):
+        values=self._cursor.fetchone()
+        return HybridRow(self._cursor, values) if values is not None and POSTGRES_BACKEND else values
+    def fetchall(self):
+        rows=self._cursor.fetchall()
+        return [HybridRow(self._cursor,row) for row in rows] if POSTGRES_BACKEND else rows
+    def __iter__(self):
+        for row in self._cursor:
+            yield HybridRow(self._cursor,row) if POSTGRES_BACKEND else row
+    @property
+    def rowcount(self): return self._cursor.rowcount
+
+
+class PostgresConnection:
+    def __init__(self, raw): self.raw=raw; self.row_factory=None; self._transaction_open=False
+    def _sql(self, sql):
+        raw_sql=sql.strip()
+        stripped=raw_sql
+        pragma=re.fullmatch(r"PRAGMA table_info\((\w+)\)",stripped,re.I)
+        if pragma:
+            table=pragma.group(1)
+            return "SELECT (ordinal_position-1) AS cid,column_name AS name,data_type AS type,(is_nullable='NO')::int AS notnull,NULL AS dflt_value,0 AS pk FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=%s ORDER BY ordinal_position", (table,)
+        if re.match(r"PRAGMA (foreign_keys|busy_timeout|journal_mode)",stripped,re.I):
+            return "SELECT 1", None
+        if "INSERT OR REPLACE INTO SEGMENT_CATALOG" in raw_sql.upper():
+            return "INSERT INTO segment_catalog(id,name,questions_json,active) VALUES(%s,%s,%s,1) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,questions_json=EXCLUDED.questions_json,active=1", None
+        if "INSERT OR REPLACE INTO FEATURE_CATALOG" in raw_sql.upper():
+            return "INSERT INTO feature_catalog(id,name,description,category,recommended_segments_json,dependencies_json,available) VALUES(%s,%s,%s,%s,%s,%s,1) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,description=EXCLUDED.description,category=EXCLUDED.category,recommended_segments_json=EXCLUDED.recommended_segments_json,dependencies_json=EXCLUDED.dependencies_json,available=1", None
+        ignore_insert=bool(re.search(r"^\s*INSERT OR IGNORE INTO",sql,re.I))
+        sql=re.sub(r"^\s*INSERT OR IGNORE INTO", "INSERT INTO",sql,flags=re.I)
+        sql=sql.replace("?", "%s")
+        sql=sql.replace("BEGIN IMMEDIATE", "BEGIN")
+        if ignore_insert and "ON CONFLICT" not in sql.upper():
+            sql=sql.rstrip().rstrip(';')+" ON CONFLICT DO NOTHING"
+        if re.match(r"^(CREATE TABLE|ALTER TABLE)",sql.strip(),re.I):
+            sql=re.sub(r"\bINTEGER\b","BIGINT",sql,flags=re.I)
+        sql=re.sub(r"date\('now'\)","CURRENT_DATE",sql,flags=re.I)
+        sql=re.sub(r"strftime\('%Y-%m',\s*([a-zA-Z0-9_.]+)\)",r"to_char(CAST(SUBSTRING(\1 FROM 1 FOR 10) AS date),'YYYY-MM')",sql,flags=re.I)
+        sql=re.sub(r"date\(([a-zA-Z0-9_.]+)\)",r"CAST(SUBSTRING(\1 FROM 1 FOR 10) AS date)",sql,flags=re.I)
+        sql=sql.replace("date(%s)","CAST(%s AS date)")
+        sql=re.sub(r"date\(([^)]+)\)\s*=\s*CURRENT_DATE",r"CAST(SUBSTRING(\1 FROM 1 FOR 10) AS date)=CURRENT_DATE",sql,flags=re.I)
+        sql=re.sub(r"SUM\(MAX\(0,", "SUM(GREATEST(0,",sql,flags=re.I)
+        sql=re.sub(r"\s+COLLATE\s+NOCASE\b", "", sql, flags=re.I)
+        return sql, None
+    def execute(self, sql, params=()):
+        rewritten, special_params=self._sql(sql)
+        if re.match(r"^\s*BEGIN\b",rewritten,re.I): self._transaction_open=True
+        cur=self.raw.cursor(cursor_factory=DictCursor)
+        try:
+            cur.execute(rewritten,special_params if special_params is not None else params)
+            if self._transaction_open and rewritten.lstrip().upper().startswith(("COMMIT","ROLLBACK")): self._transaction_open=False
+        except Exception as exc:
+            cur.close()
+            if psycopg2 and isinstance(exc,psycopg2.IntegrityError):
+                raise sqlite3.IntegrityError(str(exc)) from exc
+            raise
+        return HybridCursor(cur)
+    def executemany(self,sql,seq):
+        rewritten,_=self._sql(sql);cur=self.raw.cursor(cursor_factory=DictCursor);cur.executemany(rewritten,seq);return HybridCursor(cur)
+    def executescript(self,script):
+        cleaned=re.sub(r"CREATE TRIGGER IF NOT EXISTS .*?;\s*END;", "",script,flags=re.I|re.S)
+        for statement in cleaned.split(';'):
+            if statement.strip(): self.execute(statement)
+    def commit(self):
+        if self._transaction_open:
+            cur=self.raw.cursor();cur.execute("COMMIT");cur.close();self._transaction_open=False
+    def rollback(self):
+        if self._transaction_open:
+            cur=self.raw.cursor();cur.execute("ROLLBACK");cur.close();self._transaction_open=False
+    def close(self): self.raw.close()
+
+
+def install_postgres_immutability(conn):
+    if not is_postgres(conn): return
+    conn.execute("CREATE OR REPLACE FUNCTION caixa_reject_immutable_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'append-only record' USING ERRCODE='23000'; END; $$")
+    for table in ("audit_events","payable_payments","company_profile_versions"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {table}_immutable_write ON {table}")
+        conn.execute(f"CREATE TRIGGER {table}_immutable_write BEFORE UPDATE OR DELETE ON {table} FOR EACH ROW EXECUTE FUNCTION caixa_reject_immutable_change()")
+
+
+def is_postgres(conn=None):
+    return isinstance(conn,PostgresConnection) if conn is not None else POSTGRES_BACKEND
+
+
+def integrity_errors():
+    return (sqlite3.IntegrityError, psycopg2.IntegrityError) if psycopg2 else (sqlite3.IntegrityError,)
+
 import time
 import uuid
 import threading
@@ -123,7 +234,14 @@ def get_db_path() -> str:
     return DB_PATH
 
 
-def connect_db() -> sqlite3.Connection:
+def connect_db():
+    if POSTGRES_BACKEND:
+        if psycopg2 is None:
+            raise RuntimeError("DATABASE_URL PostgreSQL exige psycopg2-binary instalado.")
+        sslmode="require" if ".render.com" in DATABASE_URL else "prefer"
+        raw=psycopg2.connect(DATABASE_URL,connect_timeout=10,sslmode=sslmode)
+        raw.autocommit=True
+        return PostgresConnection(raw)
     conn = sqlite3.connect(get_db_path(), timeout=10, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -131,9 +249,31 @@ def connect_db() -> sqlite3.Connection:
     return conn
 
 
+def require_persistent_database():
+    if not POSTGRES_BACKEND:
+        raise RuntimeError("DATABASE_URL PostgreSQL não configurada: o serviço não pode iniciar com SQLite efêmero.")
+    if psycopg2 is None:
+        raise RuntimeError("DATABASE_URL existe, mas psycopg2-binary não está instalado.")
+
+
+def set_transaction_mode(conn, mode):
+    conn.execute("BEGIN" if is_postgres(conn) else ("BEGIN IMMEDIATE" if mode=="IMMEDIATE" else "BEGIN"))
+
+
+def db_timestamp(value):
+    return datetime.fromisoformat(value.replace("Z","+00:00")) if is_postgres() and isinstance(value,str) else value
+
+
+def constraint_errors():
+    if psycopg2:
+        return (sqlite3.IntegrityError,psycopg2.IntegrityError)
+    return (sqlite3.IntegrityError,)
+
+
 @contextmanager
-def transaction(conn: sqlite3.Connection):
-    conn.execute("BEGIN IMMEDIATE")
+def transaction(conn):
+    set_transaction_mode(conn,"IMMEDIATE")
+    if is_postgres(conn): conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
     try:
         yield
         conn.commit()
@@ -142,8 +282,11 @@ def transaction(conn: sqlite3.Connection):
         raise
 
 
-def apply_schema_migrations(conn: sqlite3.Connection) -> None:
+def apply_schema_migrations(conn) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS deployment_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+    if is_postgres(conn):
+        conn.execute("INSERT INTO deployment_metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",("storage_backend","postgresql"))
     def migration(version: int,name: str,apply):
         if conn.execute("SELECT 1 FROM schema_migrations WHERE version=?",(version,)).fetchone():
             return
@@ -180,7 +323,7 @@ def apply_schema_migrations(conn: sqlite3.Connection) -> None:
 def init_db() -> None:
     conn = connect_db()
     try:
-        conn.execute("PRAGMA journal_mode = WAL")
+        if not is_postgres(conn): conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS companies (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
@@ -345,6 +488,7 @@ def init_db() -> None:
             BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
         """)
         apply_schema_migrations(conn)
+        install_postgres_immutability(conn)
         for segment_id, segment in SEGMENT_CATALOG.items():
             conn.execute("INSERT OR REPLACE INTO segment_catalog(id,name,questions_json,active) VALUES(?,?,?,1)",
                          (segment_id, segment["name"], json.dumps(segment["questions"], ensure_ascii=False)))
@@ -706,6 +850,8 @@ async def lifespan(_app):
             raise RuntimeError(f"{name} precisa estar configurado no ambiente, nunca no código-fonte.")
         if len(secret.encode()) < 32:
             raise RuntimeError(f"{name} deve conter no mínimo 32 bytes. Use um segredo aleatório forte.")
+    if REQUIRE_POSTGRES:
+        require_persistent_database()
     init_db()
     if DEMO_MODE:
         seed_demo_data()
@@ -808,8 +954,10 @@ def frontend_index():
 
 @app.get("/health")
 def health():
+    backend="postgresql" if POSTGRES_BACKEND else "sqlite-ephemeral"
     return {"status": "ok", "service": "caixa-api", "version": APP_VERSION,
-            "mode": "development-foundation", "integrations": {"payments": False, "fiscal": False}}
+            "mode": "development-foundation", "storage": backend,
+            "integrations": {"payments": False, "fiscal": False}}
 
 
 @app.post("/v1/auth/demo")
@@ -827,8 +975,8 @@ def demo_login(conn: DB):
 
 @app.post("/v1/companies/register", status_code=201)
 def register_company(data: BootstrapIn, request: Request, conn: DB):
-    """Self-service tenant creation, disabled until the operator explicitly enables it."""
-    if DEMO_MODE or not PUBLIC_SIGNUP:
+    """Self-service tenant creation on the durable PostgreSQL backend only."""
+    if DEMO_MODE or not POSTGRES_BACKEND or not PUBLIC_SIGNUP:
         # Never create persistent customer tenants from the shared public demo.
         raise HTTPException(404, "Cadastro público temporariamente indisponível.")
     client_ip = request.client.host if request.client else "unknown"

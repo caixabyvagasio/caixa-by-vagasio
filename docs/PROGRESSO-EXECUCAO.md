@@ -23,8 +23,9 @@ Data: 2026-11-16. Branch alvo `development-v1`.
 - Não há node/deno/bun nem browser E2E disponível nesta sessão. Resultado não prova UX renderizada ou browser.
 - Código/refinamento de migrations commitado em `9f2608002a72099e167096d512204d806bb89fce`, CI `43952022632` success. Suíte local final: 50 passed, 1 warning. Não publicar o bloco financeiro sem autorização.
 
-## Pendências
-- Commit/CI do refinement de migrations e documentação atual.
-- Prosseguir com abstraction PostgreSQL/backup/restore sem contratar provider, Portal Master, filiais, entitlements e módulos operacionais.
-- Storage de produção e backups exigem provider/custo aprovado. Render Free usa SQLite `/tmp`, dados fictícios compartilhados e descartáveis; proibido usar comercialmente.
-- Recebíveis, conciliação, DRE, pagamento/fiscal, offline e segmentos especializados seguem incompletos; sem homologação externa.
+## PostgreSQL Render e pendências
+- PostgreSQL Free criado na conta Caixa: `dpg-dbtmtfqfngtc739jvhk0-a`, Ohio, PG18, vence em 16/12/2026. Base vazia. Dados anteriores do SQLite efêmero não são recuperáveis. Endpoint interno não é acessível a partir do sandbox; runtime de Render tem de confirmar conexão.
+- Adapter PostgreSQL e workflow CI real em implementação local. Suite SQLite 51 passed/1 skipped; não houve CI PostgreSQL testado ou deploy do código com adapter neste checkpoint.
+- Próximos passos: validar workflow PostgreSQL com cada suíte numa DB isolada por teste, corrigir erros SQL, executar CI, commitar e só então configurar conexão em Render e testar reinício/login antes de abrir signup.
+- PostgreSQL free expira 30 dias depois de criação e sem backups/PITR; usuário solicitou plano grátis e depois atualizar. Migração para plano/destino superior deverá ocorrer antes da data de expiração para manter acesso e continuidade.
+- Prosseguir com Portal Master, filiais, entitlements, backup/restore, recebíveis/parcelamentos, conciliação, DRE, integração fiscal/pagamentos, operação offline e módulos especializados; nenhuma homologação externa ainda.
