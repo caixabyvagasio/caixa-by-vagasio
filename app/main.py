@@ -1094,7 +1094,7 @@ def receive_purchase(order_id: str,data: PurchaseReceiveIn,request: Request,conn
 
 @app.post("/v1/products", status_code=201)
 def create_product(data: ProductIn, conn: DB, user: USER):
-    require_role(user, "owner", "admin", "manager", "stock")
+    require_role(user, "owner", "admin", "manager")
     product_id, created = new_id(), now_iso()
     try:
         with transaction(conn):
@@ -1113,7 +1113,7 @@ def create_product(data: ProductIn, conn: DB, user: USER):
 
 @app.put("/v1/products/{product_id}")
 def update_product(product_id: str, data: ProductIn, conn: DB, user: USER):
-    require_role(user,"owner","admin","manager","stock")
+    require_role(user,"owner","admin","manager")
     try:
         with transaction(conn):
             old=conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND active=1",(product_id,user["company_id"])).fetchone()

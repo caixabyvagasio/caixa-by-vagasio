@@ -47,8 +47,9 @@ Stack: FastAPI/Python, SQLite, HTML/CSS/JavaScript sem framework, pytest/TestCli
 ## Progresso deste ciclo
 - [x] Auditar commit atual, ambiente, endpoints, esquemas, papeis, dependências, testes e implantação.
 - [x] Reproduzir localmente os 39 testes do commit (`39 passed`, 1 warning conhecido de depreciação TestClient/httpx).
-- [ ] Corrigir signup público na demonstração e exposição de dados de clientes; adicionar testes.
-- [ ] Commitar correções e plano apenas na branch `development-v1`; CI.
+- [x] Corrigir signup público na demonstração e exposição de dados de clientes; adicionar testes (`cc92667`, CI success; sem deploy por ordem de não publicar).
+- [x] Commitar primeiras correções e plano apenas na branch `development-v1`; CI success `43913857996`.
+- [ ] Corrigir mais RBAC: role `stock` também podia criar/editar preço e custo do produto. Patch e teste no worktree, 42 testes passam; falta commit + CI.
 - [ ] Prosseguir para migrações/persistência, SaaS/Master, PDV e módulos conforme fases; registrar bloqueios de infraestrutura e homologação.
 
 ## Restrições / dependências

@@ -127,6 +127,17 @@ def test_cash_movement_and_close_reconciliation(world):
     assert world.get("/v1/registers/current", headers=auth(token)).json()["register"] is None
 
 
+def test_stock_role_cannot_change_catalog_price_or_unit_cost(world):
+    owner=company(world)
+    p=product(world,owner,sku="LOCK-PRICE",price="10.00")
+    staff=world.post("/v1/users",headers=auth(owner),json={"full_name":"Estoquista","email":"estoquista-preco@example.test","password":"strong-stock-password-901","role":"stock"}).json()
+    token=world.post("/v1/auth/login",json={"company_slug":"mercado-um","email":"estoquista-preco@example.test","password":"strong-stock-password-901"}).json()["access_token"]
+    payload={"sku":"LOCK-PRICE","name":"Cafe","unit":"un","price":"0.01","cost":"0.00"}
+    assert world.put(f"/v1/products/{p['id']}",headers=auth(token),json=payload).status_code==403
+    assert world.post("/v1/products",headers=auth(token),json={"sku":"NEW","name":"Novo","unit":"un","price":"0.01","cost":"0.00"}).status_code==403
+    assert world.get("/v1/products",headers=auth(owner)).json()["items"][0]["price"]=="10.00"
+
+
 def test_operator_cannot_adjust_stock_or_give_discount(world):
     token = company(world)
     conn = main.connect_db()
