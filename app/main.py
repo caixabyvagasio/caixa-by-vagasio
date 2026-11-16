@@ -1409,6 +1409,23 @@ def sales_report(conn: DB,user: USER,start_date: date,end_date: date,group_by: s
         "note":"Relatório de vendas registradas localmente, somente dinheiro nesta versão; datas UTC. Não é demonstrativo fiscal/contábil."}
 
 
+@app.get("/v1/reports/inventory")
+def inventory_report(conn: DB,user: USER,search: str=Query(default="",max_length=100),limit: int=Query(default=200,ge=1,le=500),offset: int=Query(default=0,ge=0)):
+    require_role(user,"owner","admin","manager","stock")
+    term="%"+search.strip().replace("%","\\%").replace("_","\\_")+"%"
+    rows=conn.execute("""SELECT * FROM products WHERE company_id=? AND active=1 AND (?='' OR name LIKE ? ESCAPE '\\' OR sku LIKE ? ESCAPE '\\')
+        ORDER BY name LIMIT ? OFFSET ?""",(user["company_id"],search.strip(),term,term,limit,offset)).fetchall()
+    total=conn.execute("SELECT COUNT(*) FROM products WHERE company_id=? AND active=1",(user["company_id"],)).fetchone()[0]
+    low=conn.execute("SELECT COUNT(*) FROM products WHERE company_id=? AND active=1 AND min_stock_milli>0 AND stock_milli<=min_stock_milli",(user["company_id"],)).fetchone()[0]
+    count=conn.execute("SELECT COALESCE(SUM(stock_milli*cost_cents),0),COALESCE(SUM(stock_milli*price_cents),0),COALESCE(SUM(stock_milli),0) FROM products WHERE company_id=? AND active=1",(user["company_id"],)).fetchone()
+    items=[]
+    for r in rows:
+        cost_total=(r["stock_milli"]*r["cost_cents"]+500)//1000
+        retail_total=(r["stock_milli"]*r["price_cents"]+500)//1000
+        items.append({"product_id":r["id"],"sku":r["sku"],"name":r["name"],"category":r["category"],"unit":r["unit"],"stock":milli_to_decimal(r["stock_milli"]),"minimum_stock":milli_to_decimal(r["min_stock_milli"]),"low_stock":r["min_stock_milli"]>0 and r["stock_milli"]<=r["min_stock_milli"],"unit_cost":cents_to_money(r["cost_cents"]),"unit_price":cents_to_money(r["price_cents"]),"cost_value":cents_to_money(cost_total),"retail_value":cents_to_money(retail_total)})
+    return {"items":items,"total":total,"limit":limit,"offset":offset,"summary":{"product_count":total,"low_stock_products":low,"stock_units":milli_to_decimal(count[2]),"estimated_cost_value":cents_to_money((count[0]+500)//1000),"estimated_retail_value":cents_to_money((count[1]+500)//1000)},"note":"Avaliação estimada pelo custo e preço atuais do cadastro, sem método contábil de custeio, impostos ou movimentação em trânsito."}
+
+
 @app.get("/v1/dashboard/summary")
 def dashboard_summary(conn: DB, user: USER):
     company_id = user["company_id"]

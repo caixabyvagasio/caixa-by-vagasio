@@ -74,3 +74,8 @@
 - Tela de relatório pode baixar CSV UTF-8 BOM, separado por ponto e vírgula, com linhas diárias/mensais e totais pagos/cancelados; exportação só fica habilitada depois de consulta bem-sucedida.
 - Pós-correção live: /health 200 repetido; acessos autenticados de demonstração a `/v1/products?limit=200` retornaram 200, sem novos traces de erro na janela consultada. A UI de relatório foi verificada por navegador.
 - Testes locais após CSV: 38 aprovados; CI/deploy desta pequena atualização pendentes.
+
+## Relatório de posição de estoque
+- API/tela por empresa: saldo, mínimo, custo e preço unitários, valores estimados por custo/preço atuais, busca, alertas de estoque baixo e exportação CSV.
+- Testes locais: 39 aprovados; CSV e tela devem ser commitados, passar CI e publicados antes de considerar encerrado.
+- Avaliação é apenas estimativa operacional (não método contábil, fiscal, margem ou custos de entrada em trânsito).

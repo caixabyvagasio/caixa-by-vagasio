@@ -560,3 +560,18 @@ def test_sqlite_request_connection_can_be_cleaned_up_from_worker_thread(monkeypa
     worker.start();worker.join()
     conn.close()
     assert outcomes==[1]
+
+
+def test_inventory_report_estimated_values_and_role_scope(world):
+    owner=company(world)
+    p=world.post('/v1/products',headers=auth(owner),json={'sku':'INV-A','name':'Item A','unit':'un','price':'10.00','cost':'4.50','minimum_stock':'2'}).json()
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(owner),json={'direction':'in','quantity':'3','reason':'Saldo de abertura'})
+    report=world.get('/v1/reports/inventory',headers=auth(owner)).json()
+    assert report['summary']['product_count']==1
+    assert report['summary']['low_stock_products']==0
+    assert report['summary']['estimated_cost_value']=='13.50'
+    assert report['summary']['estimated_retail_value']=='30.00'
+    assert report['items'][0]['cost_value']=='13.50'
+    assert world.get('/v1/reports/inventory?search=ausente',headers=auth(owner)).json()['items']==[]
+    other=company(world,'Outra','outra','outra@example.test')
+    assert world.get('/v1/reports/inventory',headers=auth(other)).json()['summary']['product_count']==0
