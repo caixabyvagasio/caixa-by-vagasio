@@ -167,6 +167,7 @@ def init_db() -> None:
             cost_cents INTEGER NOT NULL DEFAULT 0 CHECK(cost_cents >= 0),
             stock_milli INTEGER NOT NULL DEFAULT 0 CHECK(stock_milli >= 0),
             active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '', barcode TEXT, min_stock_milli INTEGER NOT NULL DEFAULT 0 CHECK(min_stock_milli >= 0),
             UNIQUE(company_id, sku)
         );
         CREATE TABLE IF NOT EXISTS cash_registers (
@@ -245,6 +246,13 @@ def init_db() -> None:
         CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_events
             BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
         """)
+        existing_columns = {r[1] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
+        for column, sql in (("category", "ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''"),
+                            ("barcode", "ALTER TABLE products ADD COLUMN barcode TEXT"),
+                            ("min_stock_milli", "ALTER TABLE products ADD COLUMN min_stock_milli INTEGER NOT NULL DEFAULT 0")):
+            if column not in existing_columns:
+                conn.execute(sql)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS products_company_barcode ON products(company_id, barcode) WHERE barcode IS NOT NULL AND barcode <> ''")
         for segment_id, segment in SEGMENT_CATALOG.items():
             conn.execute("INSERT OR REPLACE INTO segment_catalog(id,name,questions_json,active) VALUES(?,?,?,1)",
                          (segment_id, segment["name"], json.dumps(segment["questions"], ensure_ascii=False)))
@@ -430,8 +438,11 @@ class ProductIn(StrictModel):
     unit: str = Field(default="un", min_length=1, max_length=12)
     price: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
     cost: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
+    category: str = Field(default="", max_length=80)
+    barcode: str | None = Field(default=None, min_length=4, max_length=64)
+    minimum_stock: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=3)
 
-    @field_validator("sku", "name", "unit")
+    @field_validator("sku", "name", "unit", "category")
     @classmethod
     def trim_text(cls, value: str) -> str:
         return value.strip()
@@ -543,7 +554,9 @@ def company_product(conn: sqlite3.Connection, company_id: str, product_id: str) 
 def product_json(row: sqlite3.Row) -> dict:
     return {"id": row["id"], "sku": row["sku"], "name": row["name"], "unit": row["unit"],
             "price": cents_to_money(row["price_cents"]), "cost": cents_to_money(row["cost_cents"]),
-            "stock": milli_to_decimal(row["stock_milli"]), "active": bool(row["active"]), "created_at": row["created_at"]}
+            "stock": milli_to_decimal(row["stock_milli"]), "category": row["category"], "barcode": row["barcode"],
+            "minimum_stock": milli_to_decimal(row["min_stock_milli"]), "low_stock": row["stock_milli"] <= row["min_stock_milli"],
+            "active": bool(row["active"]), "created_at": row["created_at"]}
 
 
 def register_json(row: sqlite3.Row) -> dict:
@@ -766,13 +779,15 @@ def create_product(data: ProductIn, conn: DB, user: USER):
     product_id, created = new_id(), now_iso()
     try:
         with transaction(conn):
-            conn.execute("""INSERT INTO products(id,company_id,sku,name,unit,price_cents,cost_cents,created_at)
-                VALUES(?,?,?,?,?,?,?,?)""", (product_id, user["company_id"], data.sku.strip(), data.name.strip(), data.unit.strip(),
-                decimal_money_cents(data.price), decimal_money_cents(data.cost), created))
+            conn.execute("""INSERT INTO products(id,company_id,sku,name,unit,price_cents,cost_cents,created_at,category,barcode,min_stock_milli)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (product_id, user["company_id"], data.sku.strip(), data.name.strip(), data.unit.strip(),
+                decimal_money_cents(data.price), decimal_money_cents(data.cost), created, data.category.strip(),
+                data.barcode.strip() if data.barcode else None, decimal_milli(data.minimum_stock)))
             audit(conn, user["company_id"], user["id"], "product.created", "product", product_id,
-                  {"sku": data.sku.strip(), "name": data.name.strip()})
+                  {"sku": data.sku.strip(), "name": data.name.strip(), "category":data.category.strip(),"barcode":data.barcode,
+                   "minimum_stock":milli_to_decimal(decimal_milli(data.minimum_stock))})
     except sqlite3.IntegrityError:
-        raise HTTPException(409, "Já existe um produto com esse SKU nesta empresa.")
+        raise HTTPException(409, "Já existe um produto com esse SKU ou código de barras nesta empresa.")
     row = conn.execute("SELECT * FROM products WHERE id=? AND company_id=?", (product_id, user["company_id"])).fetchone()
     return product_json(row)
 
@@ -799,10 +814,17 @@ def update_user(user_id: str, data: UserStatusIn, conn: DB, user: USER):
 def list_products(conn: DB, user: USER, search: str = Query(default="", max_length=100),
                   limit: int = Query(default=100, ge=1, le=200), offset: int = Query(default=0, ge=0)):
     term = "%" + search.strip().replace("%", "\\%").replace("_", "\\_") + "%"
-    rows = conn.execute("""SELECT * FROM products WHERE company_id=? AND active=1 AND (?='' OR name LIKE ? ESCAPE '\\' OR sku LIKE ? ESCAPE '\\')
-        ORDER BY name LIMIT ? OFFSET ?""", (user["company_id"], search.strip(), term, term, limit, offset)).fetchall()
+    rows = conn.execute("""SELECT * FROM products WHERE company_id=? AND active=1 AND (?='' OR name LIKE ? ESCAPE '\\' OR sku LIKE ? ESCAPE '\\' OR COALESCE(barcode,'') LIKE ? ESCAPE '\\')
+        ORDER BY name LIMIT ? OFFSET ?""", (user["company_id"], search.strip(), term, term, term, limit, offset)).fetchall()
     count = conn.execute("SELECT count(*) FROM products WHERE company_id=? AND active=1", (user["company_id"],)).fetchone()[0]
     return {"items": [product_json(row) for row in rows], "total": count, "limit": limit, "offset": offset}
+
+
+@app.get("/v1/products/low-stock")
+def low_stock_products(conn: DB, user: USER, limit: int = Query(default=100, ge=1, le=200)):
+    rows=conn.execute("SELECT * FROM products WHERE company_id=? AND active=1 AND min_stock_milli>0 AND stock_milli<=min_stock_milli ORDER BY (min_stock_milli-stock_milli) DESC LIMIT ?",
+                      (user["company_id"],limit)).fetchall()
+    return {"items":[product_json(row) for row in rows],"total":len(rows)}
 
 
 @app.post("/v1/products/{product_id}/stock-adjustments", status_code=201)
@@ -1006,7 +1028,7 @@ def dashboard_summary(conn: DB, user: USER):
     company_id = user["company_id"]
     sales = conn.execute("SELECT COUNT(*) AS count,COALESCE(SUM(total_cents),0) AS total FROM sales WHERE company_id=? AND status='paid' AND date(created_at)=date('now')", (company_id,)).fetchone()
     product_count = conn.execute("SELECT count(*) FROM products WHERE company_id=? AND active=1", (company_id,)).fetchone()[0]
-    low_stock = conn.execute("SELECT count(*) FROM products WHERE company_id=? AND active=1 AND stock_milli <= 5000", (company_id,)).fetchone()[0]
+    low_stock = conn.execute("SELECT count(*) FROM products WHERE company_id=? AND active=1 AND min_stock_milli > 0 AND stock_milli <= min_stock_milli", (company_id,)).fetchone()[0]
     reg = conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1", (company_id,)).fetchone()
     return {"date_utc": datetime.now(timezone.utc).date().isoformat(), "sales_today": sales["count"],
             "revenue_today": cents_to_money(sales["total"]), "active_products": product_count,

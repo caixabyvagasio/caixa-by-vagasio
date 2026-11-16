@@ -254,3 +254,47 @@ def reset_rate_limiter():
     main._RATE_LIMITER = main.WindowRateLimiter()
     yield
     main._RATE_LIMITER = main.WindowRateLimiter()
+
+
+def test_product_barcode_category_and_minimum_stock(world):
+    token=company(world)
+    created=world.post("/v1/products",headers=auth(token),json={"sku":"DRINK-1","name":"Suco","price":"5.00","category":"Bebidas","barcode":"7891234567890","minimum_stock":"4"})
+    assert created.status_code==201,created.text
+    p=created.json()
+    assert p["barcode"]=="7891234567890" and p["category"]=="Bebidas" and p["minimum_stock"]=="4" and p["low_stock"]
+    assert world.get("/v1/products?search=7891234567890",headers=auth(token)).json()["items"][0]["id"]==p["id"]
+    assert world.get("/v1/products/low-stock",headers=auth(token)).json()["total"]==1
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(token),json={"direction":"in","quantity":"5","reason":"Entrada de estoque"})
+    updated=world.get("/v1/products",headers=auth(token)).json()["items"][0]
+    assert updated["low_stock"] is False
+
+
+def test_barcode_is_unique_per_company_but_not_cross_tenant(world):
+    one=company(world)
+    two=company(world,"Loja Dois","loja-dois","two@example.test")
+    payload={"sku":"A","name":"Item A","price":"1.00","barcode":"12345678"}
+    assert world.post("/v1/products",headers=auth(one),json=payload).status_code==201
+    assert world.post("/v1/products",headers=auth(one),json={**payload,"sku":"B"}).status_code==409
+    assert world.post("/v1/products",headers=auth(two),json=payload).status_code==201
+
+
+def test_legacy_product_schema_migrates_without_losing_catalog(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "legacy.sqlite3"))
+    main.init_db()
+    conn=main.connect_db()
+    try:
+        conn.execute("DROP INDEX IF EXISTS products_company_barcode")
+        conn.execute("ALTER TABLE products DROP COLUMN min_stock_milli")
+        conn.execute("ALTER TABLE products DROP COLUMN barcode")
+        conn.execute("ALTER TABLE products DROP COLUMN category")
+    finally:
+        conn.close()
+    main.init_db()
+    conn=main.connect_db()
+    try:
+        columns={r[1] for r in conn.execute("PRAGMA table_info(products)")}
+        assert {"category","barcode","min_stock_milli"} <= columns
+        indexes={r[1] for r in conn.execute("PRAGMA index_list(products)")}
+        assert "products_company_barcode" in indexes
+    finally:
+        conn.close()
