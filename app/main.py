@@ -170,6 +170,35 @@ def init_db() -> None:
             category TEXT NOT NULL DEFAULT '', barcode TEXT, min_stock_milli INTEGER NOT NULL DEFAULT 0 CHECK(min_stock_milli >= 0),
             UNIQUE(company_id, sku)
         );
+        CREATE TABLE IF NOT EXISTS suppliers (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
+            tax_id TEXT, email TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(company_id,name)
+        );
+        CREATE TABLE IF NOT EXISTS purchase_orders (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), supplier_id TEXT NOT NULL REFERENCES suppliers(id),
+            order_number TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('draft','ordered','partially_received','received','cancelled')),
+            notes TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(company_id,order_number)
+        );
+        CREATE TABLE IF NOT EXISTS purchase_order_items (
+            id TEXT PRIMARY KEY, purchase_order_id TEXT NOT NULL REFERENCES purchase_orders(id),
+            company_id TEXT NOT NULL REFERENCES companies(id), product_id TEXT NOT NULL REFERENCES products(id),
+            ordered_milli INTEGER NOT NULL CHECK(ordered_milli>0), received_milli INTEGER NOT NULL DEFAULT 0 CHECK(received_milli>=0 AND received_milli<=ordered_milli),
+            unit_cost_cents INTEGER NOT NULL CHECK(unit_cost_cents>=0)
+        );
+        CREATE TABLE IF NOT EXISTS purchase_receipts (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), purchase_order_id TEXT NOT NULL REFERENCES purchase_orders(id),
+            received_by TEXT NOT NULL REFERENCES users(id), received_at TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL, UNIQUE(company_id,idempotency_key)
+        );
+        CREATE TABLE IF NOT EXISTS purchase_receipt_items (
+            id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL REFERENCES purchase_receipts(id),
+            purchase_order_item_id TEXT NOT NULL REFERENCES purchase_order_items(id), product_id TEXT NOT NULL REFERENCES products(id),
+            quantity_milli INTEGER NOT NULL CHECK(quantity_milli>0), unit_cost_cents INTEGER NOT NULL CHECK(unit_cost_cents>=0)
+        );
+        CREATE INDEX IF NOT EXISTS purchase_orders_company_date ON purchase_orders(company_id,created_at);
         CREATE TABLE IF NOT EXISTS cash_registers (
             id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
             label TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','closed')),
@@ -360,7 +389,8 @@ def cents_to_money(cents: int) -> str:
 
 
 def milli_to_decimal(milli: int) -> str:
-    return str((Decimal(milli) / Decimal(1000)).normalize())
+    value = format(Decimal(milli) / Decimal(1000), "f")
+    return value.rstrip("0").rstrip(".") if "." in value else value
 
 
 class StrictModel(BaseModel):
@@ -446,6 +476,45 @@ class ProductIn(StrictModel):
     @classmethod
     def trim_text(cls, value: str) -> str:
         return value.strip()
+
+
+class SupplierIn(StrictModel):
+    name: str = Field(min_length=2,max_length=160)
+    tax_id: str | None = Field(default=None,max_length=32)
+    email: str = Field(default="",max_length=254)
+    phone: str = Field(default="",max_length=40)
+    notes: str = Field(default="",max_length=500)
+
+    @field_validator("name","tax_id","email","phone","notes")
+    @classmethod
+    def trim_supplier_fields(cls,value):
+        return value.strip() if isinstance(value,str) else value
+
+
+class PurchaseLineIn(StrictModel):
+    product_id: str
+    quantity: Decimal = Field(gt=0,max_digits=12,decimal_places=3)
+    unit_cost: Decimal = Field(ge=0,max_digits=12,decimal_places=2)
+
+
+class PurchaseCreateIn(StrictModel):
+    supplier_id: str
+    order_number: str = Field(min_length=1,max_length=60)
+    notes: str = Field(default="",max_length=500)
+    items: list[PurchaseLineIn] = Field(min_length=1,max_length=100)
+
+
+class PurchaseStatusIn(StrictModel):
+    status: Literal["ordered","cancelled"]
+
+
+class ReceiveLineIn(StrictModel):
+    order_item_id: str
+    quantity: Decimal = Field(gt=0,max_digits=12,decimal_places=3)
+
+
+class PurchaseReceiveIn(StrictModel):
+    items: list[ReceiveLineIn] = Field(min_length=1,max_length=100)
 
 
 class StockAdjustmentIn(StrictModel):
@@ -771,6 +840,112 @@ def create_user(data: UserCreateIn, conn: DB, user: USER):
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Já existe um usuário com esse e-mail nesta empresa.")
     return {"id": user_id, "company_id": user["company_id"], "email": data.email, "name": data.full_name.strip(), "role": data.role, "active": True}
+
+
+@app.get("/v1/suppliers")
+def list_suppliers(conn: DB,user: USER,active: bool=True):
+    require_role(user,"owner","admin","manager","stock")
+    rows=conn.execute("SELECT * FROM suppliers WHERE company_id=? AND active=? ORDER BY name",(user["company_id"],int(active))).fetchall()
+    return {"items":[{"id":r["id"],"name":r["name"],"tax_id":r["tax_id"],"email":r["email"],"phone":r["phone"],"notes":r["notes"],"active":bool(r["active"]),"created_at":r["created_at"]} for r in rows]}
+
+
+@app.post("/v1/suppliers",status_code=201)
+def create_supplier(data: SupplierIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","stock")
+    supplier_id,created=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO suppliers VALUES(?,?,?,?,?,?,?,1,?,?)",(supplier_id,user["company_id"],data.name,data.tax_id,data.email,data.phone,data.notes,created,created))
+            audit(conn,user["company_id"],user["id"],"supplier.created","supplier",supplier_id,{"name":data.name})
+    except sqlite3.IntegrityError:
+        raise HTTPException(409,"Já existe um fornecedor com esse nome nesta empresa.")
+    return {"id":supplier_id,"name":data.name,"active":True,"created_at":created}
+
+
+@app.post("/v1/purchase-orders",status_code=201)
+def create_purchase_order(data: PurchaseCreateIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","stock")
+    order_id,created=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            supplier=conn.execute("SELECT id FROM suppliers WHERE id=? AND company_id=? AND active=1",(data.supplier_id,user["company_id"])).fetchone()
+            if not supplier: raise HTTPException(404,"Fornecedor não encontrado nesta empresa.")
+            conn.execute("INSERT INTO purchase_orders VALUES(?,?,?,?,'draft',?,?,?,?)",(order_id,user["company_id"],data.supplier_id,data.order_number.strip(),data.notes.strip(),user["id"],created,created))
+            for line in data.items:
+                product=company_product(conn,user["company_id"],line.product_id)
+                conn.execute("INSERT INTO purchase_order_items VALUES(?,?,?,?,?,0,?)",(new_id(),order_id,user["company_id"],product["id"],decimal_milli(line.quantity),decimal_money_cents(line.unit_cost)))
+            audit(conn,user["company_id"],user["id"],"purchase_order.created","purchase_order",order_id,{"supplier_id":data.supplier_id,"order_number":data.order_number,"line_count":len(data.items)})
+    except sqlite3.IntegrityError:
+        raise HTTPException(409,"Número de pedido já cadastrado ou item inválido.")
+    return {"id":order_id,"order_number":data.order_number.strip(),"status":"draft","created_at":created}
+
+
+@app.get("/v1/purchase-orders")
+def list_purchase_orders(conn: DB,user: USER,limit: int=Query(default=100,ge=1,le=200)):
+    require_role(user,"owner","admin","manager","stock")
+    rows=conn.execute("""SELECT po.*,s.name AS supplier_name FROM purchase_orders po JOIN suppliers s ON s.id=po.supplier_id
+        WHERE po.company_id=? ORDER BY po.created_at DESC LIMIT ?""",(user["company_id"],limit)).fetchall()
+    result=[]
+    for row in rows:
+        items=conn.execute("""SELECT poi.id,poi.product_id,p.name,p.sku,poi.ordered_milli,poi.received_milli,poi.unit_cost_cents
+            FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id WHERE poi.purchase_order_id=? ORDER BY p.name""",(row["id"],)).fetchall()
+        result.append({"id":row["id"],"supplier_id":row["supplier_id"],"supplier":row["supplier_name"],"order_number":row["order_number"],"status":row["status"],"notes":row["notes"],"created_at":row["created_at"],"items":[{"id":i["id"],"product_id":i["product_id"],"name":i["name"],"sku":i["sku"],"ordered":milli_to_decimal(i["ordered_milli"]),"received":milli_to_decimal(i["received_milli"]),"unit_cost":cents_to_money(i["unit_cost_cents"])} for i in items]})
+    return {"items":result}
+
+
+@app.patch("/v1/purchase-orders/{order_id}")
+def update_purchase_status(order_id: str,data: PurchaseStatusIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager")
+    with transaction(conn):
+        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=?",(order_id,user["company_id"])).fetchone()
+        if not order: raise HTTPException(404,"Pedido não encontrado nesta empresa.")
+        if order["status"] not in {"draft","ordered"}: raise HTTPException(409,"Este pedido não pode mudar de estado.")
+        if data.status=="cancelled":
+            received=conn.execute("SELECT COALESCE(SUM(received_milli),0) FROM purchase_order_items WHERE purchase_order_id=?",(order_id,)).fetchone()[0]
+            if received: raise HTTPException(409,"Pedido com recebimento parcial não pode ser cancelado; finalize recebimento primeiro.")
+        conn.execute("UPDATE purchase_orders SET status=?,updated_at=? WHERE id=? AND company_id=?",(data.status,now_iso(),order_id,user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"purchase_order.status_changed","purchase_order",order_id,{"before":order["status"],"after":data.status})
+    return {"id":order_id,"status":data.status}
+
+
+@app.post("/v1/purchase-orders/{order_id}/receipts",status_code=201)
+def receive_purchase(order_id: str,data: PurchaseReceiveIn,request: Request,conn: DB,user: USER,
+                     idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
+    require_role(user,"owner","admin","manager","stock")
+    if not idempotency_key or len(idempotency_key)>128: raise HTTPException(400,"Envie Idempotency-Key para evitar recebimento duplicado.")
+    normalized=sorted([{"item":x.order_item_id,"quantity":str(x.quantity)} for x in data.items],key=lambda x:x["item"])
+    request_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    receipt_id,received_at=new_id(),now_iso()
+    with transaction(conn):
+        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=?",(order_id,user["company_id"])).fetchone()
+        if not order: raise HTTPException(404,"Pedido não encontrado nesta empresa.")
+        prior=conn.execute("SELECT * FROM purchase_receipts WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
+        if prior:
+            if prior["request_hash"]!=request_hash or prior["purchase_order_id"]!=order_id: raise HTTPException(409,"Chave de idempotência reutilizada com dados diferentes.")
+            if response is not None: response.status_code=200
+            return {"receipt_id":prior["id"],"status":"already_received"}
+        if order["status"] not in {"ordered","partially_received"}: raise HTTPException(409,"Pedido precisa estar enviado e aberto para recebimento.")
+        if len({x.order_item_id for x in data.items})!=len(data.items): raise HTTPException(422,"Não repita a mesma linha de pedido no recebimento.")
+        receipt_rows=[]
+        for line in data.items:
+            qty=decimal_milli(line.quantity)
+            item=conn.execute("""SELECT poi.*,p.stock_milli,p.name FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id
+                WHERE poi.id=? AND poi.purchase_order_id=? AND poi.company_id=?""",(line.order_item_id,order_id,user["company_id"])).fetchone()
+            if not item: raise HTTPException(404,"Linha do pedido não encontrada.")
+            if item["received_milli"]+qty>item["ordered_milli"]: raise HTTPException(409,"Quantidade recebida supera o saldo do pedido.")
+            receipt_rows.append((line,item,qty))
+        conn.execute("INSERT INTO purchase_receipts VALUES(?,?,?,?,?,?,?)",(receipt_id,user["company_id"],order_id,user["id"],received_at,idempotency_key,request_hash))
+        for line,item,qty in receipt_rows:
+            before=item["stock_milli"];after=before+qty
+            conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,item["product_id"],user["company_id"]))
+            conn.execute("UPDATE purchase_order_items SET received_milli=received_milli+? WHERE id=? AND company_id=?",(qty,line.order_item_id,user["company_id"]))
+            conn.execute("INSERT INTO purchase_receipt_items VALUES(?,?,?,?,?,?)",(new_id(),receipt_id,line.order_item_id,item["product_id"],qty,item["unit_cost_cents"]))
+            conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],item["product_id"],user["id"],"adjustment_in",qty,before,after,"Recebimento de pedido "+order["order_number"],None,received_at))
+        remaining=conn.execute("SELECT COUNT(*) FROM purchase_order_items WHERE purchase_order_id=? AND received_milli<ordered_milli",(order_id,)).fetchone()[0]
+        new_status="received" if remaining==0 else "partially_received"
+        conn.execute("UPDATE purchase_orders SET status=?,updated_at=? WHERE id=? AND company_id=?",(new_status,received_at,order_id,user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"purchase.received","purchase_order",order_id,{"receipt_id":receipt_id,"items":[{"item_id":x.order_item_id,"quantity":milli_to_decimal(q)} for x,_,q in receipt_rows],"status":new_status})
+    return {"receipt_id":receipt_id,"status":new_status,"received_at":received_at}
 
 
 @app.post("/v1/products", status_code=201)

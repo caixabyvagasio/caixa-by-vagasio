@@ -319,3 +319,72 @@ def test_product_edit_rejects_cross_tenant_and_duplicate_barcode(world):
     assert world.put(f"/v1/products/{p['id']}",headers=auth(two),json={"sku":"P2","name":"Alheio","price":"2.00"}).status_code==404
     own=world.post("/v1/products",headers=auth(one),json={"sku":"P2","name":"Produto dois","price":"2.00"}).json()
     assert world.put(f"/v1/products/{own['id']}",headers=auth(one),json={"sku":"P2","name":"Produto dois","price":"2.00","barcode":"12345678"}).status_code==409
+
+
+def test_supplier_purchase_receipt_updates_inventory_once_and_audits(world):
+    owner=company(world)
+    supplier=world.post("/v1/suppliers",headers=auth(owner),json={"name":"Fornecedor Local","email":"vendas@example.test"})
+    assert supplier.status_code==201,supplier.text
+    p=product(world,owner,sku="FAR-1",name="Farinha",price="8.00")
+    order=world.post("/v1/purchase-orders",headers=auth(owner),json={"supplier_id":supplier.json()["id"],"order_number":"OC-001","notes":"Compra de teste","items":[{"product_id":p["id"],"quantity":"10","unit_cost":"4.00"}]})
+    assert order.status_code==201,order.text
+    item=world.get("/v1/purchase-orders",headers=auth(owner)).json()["items"][0]["items"][0]
+    assert world.patch(f"/v1/purchase-orders/{order.json()['id']}",headers=auth(owner),json={"status":"ordered"}).status_code==200
+    payload={"items":[{"order_item_id":item["id"],"quantity":"4"}]}
+    headers={**auth(owner),"Idempotency-Key":"receipt-001"}
+    received=world.post(f"/v1/purchase-orders/{order.json()['id']}/receipts",headers=headers,json=payload)
+    assert received.status_code==201,received.text
+    assert received.json()["status"]=="partially_received"
+    replay=world.post(f"/v1/purchase-orders/{order.json()['id']}/receipts",headers=headers,json=payload)
+    assert replay.status_code==200
+    assert world.get("/v1/products",headers=auth(owner)).json()["items"][0]["stock"]=="4"
+    assert any(e["action"]=="purchase.received" for e in world.get("/v1/audit-events",headers=auth(owner)).json()["items"])
+    done=world.post(f"/v1/purchase-orders/{order.json()['id']}/receipts",headers={**auth(owner),"Idempotency-Key":"receipt-002"},json={"items":[{"order_item_id":item["id"],"quantity":"6"}]})
+    assert done.status_code==201 and done.json()["status"]=="received"
+    assert world.get("/v1/products",headers=auth(owner)).json()["items"][0]["stock"]=="10"
+
+
+def test_purchase_order_rejects_cross_tenant_product_and_overreceipt(world):
+    one=company(world)
+    two=company(world,"Loja Dois","loja-dois","two@example.test")
+    supplier=world.post("/v1/suppliers",headers=auth(one),json={"name":"F Um"})
+    p=product(world,two)
+    bad=world.post("/v1/purchase-orders",headers=auth(one),json={"supplier_id":supplier.json()["id"],"order_number":"OC-X","items":[{"product_id":p["id"],"quantity":"1","unit_cost":"1.00"}]})
+    assert bad.status_code==404
+    p1=product(world,one,sku="A1")
+    order=world.post("/v1/purchase-orders",headers=auth(one),json={"supplier_id":supplier.json()["id"],"order_number":"OC-Y","items":[{"product_id":p1["id"],"quantity":"2","unit_cost":"1.00"}]}).json()
+    item=world.get("/v1/purchase-orders",headers=auth(one)).json()["items"][0]["items"][0]
+    world.patch(f"/v1/purchase-orders/{order['id']}",headers=auth(one),json={"status":"ordered"})
+    over=world.post(f"/v1/purchase-orders/{order['id']}/receipts",headers={**auth(one),"Idempotency-Key":"over-1"},json={"items":[{"order_item_id":item["id"],"quantity":"2.001"}]})
+    assert over.status_code==409
+    assert world.get("/v1/products",headers=auth(one)).json()["items"][0]["stock"]=="0"
+
+
+def test_stock_operator_cannot_mark_purchase_order_ordered(world):
+    owner=company(world)
+    world.post("/v1/users",headers=auth(owner),json={"full_name":"Estoque","email":"stock@example.test","password":"secure-password-123","role":"stock"})
+    tok=world.post("/v1/auth/login",json={"company_slug":"mercado-um","email":"stock@example.test","password":"secure-password-123"}).json()["access_token"]
+    assert world.post("/v1/suppliers",headers=auth(tok),json={"name":"Permitido estoque"}).status_code==201
+
+
+def test_purchase_cancellation_is_audited_and_blocks_later_receiving(world):
+    owner=company(world)
+    supplier=world.post("/v1/suppliers",headers=auth(owner),json={"name":"Fornecedor Cancelamento"}).json()
+    p=product(world,owner,sku="CANCEL-1")
+    order=world.post("/v1/purchase-orders",headers=auth(owner),json={"supplier_id":supplier["id"],"order_number":"CANCEL-001","items":[{"product_id":p["id"],"quantity":"3","unit_cost":"2.00"}]}).json()
+    result=world.patch(f"/v1/purchase-orders/{order['id']}",headers=auth(owner),json={"status":"cancelled"})
+    assert result.status_code==200 and result.json()["status"]=="cancelled"
+    item=world.get("/v1/purchase-orders",headers=auth(owner)).json()["items"][0]["items"][0]
+    denied=world.post(f"/v1/purchase-orders/{order['id']}/receipts",headers={**auth(owner),"Idempotency-Key":"cancelled-receipt"},json={"items":[{"order_item_id":item["id"],"quantity":"1"}]})
+    assert denied.status_code==409
+    assert world.get("/v1/products",headers=auth(owner)).json()["items"][0]["stock"]=="0"
+    assert any(e["action"]=="purchase_order.status_changed" for e in world.get("/v1/audit-events",headers=auth(owner)).json()["items"])
+
+
+def test_supplier_and_purchase_order_are_company_isolated(world):
+    one=company(world)
+    two=company(world,"Loja Dois","loja-dois","two@example.test")
+    supplier=world.post("/v1/suppliers",headers=auth(one),json={"name":"Fornecedor Privado"}).json()
+    denied=world.post("/v1/purchase-orders",headers=auth(two),json={"supplier_id":supplier["id"],"order_number":"NOPE","items":[{"product_id":product(world,two)["id"],"quantity":"1","unit_cost":"1.00"}]})
+    assert denied.status_code==404
+    assert world.get("/v1/suppliers",headers=auth(two)).json()["items"]==[]

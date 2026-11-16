@@ -21,3 +21,11 @@
 - Testes: 22 aprovados localmente após a edição auditada; CI remoto pendente. Nenhum deploy ao Render. Nenhum deploy ao Render.
 
 - Edição de produto implementada: valores anteriores e novos são gravados em evento de auditoria; mudanças respeitam tenant, papéis, unicidade de SKU e código.
+
+
+## Incremento de compras e fornecedores
+- Cadastro e listagem de fornecedores por empresa.
+- Pedidos de compra com várias linhas, estados rascunho/enviado/recebimento parcial/recebido/cancelado.
+- Recebimentos parciais ou integrais transacionais, idempotentes, com validação de excesso, entrada de estoque e auditoria. Pedido não altera saldo antes de recebimento. Nenhuma conta a pagar é criada: a obrigação financeira permanece fora do módulo até implementar termos/vencimentos e validação.
+- Interface empresarial: cadastro, criação de pedido, marcar enviado, cancelamento, recebimento de quantidades e leitura do status.
+- 27 testes locais passaram; CI remoto pendente. Sem deploy nem dados reais.

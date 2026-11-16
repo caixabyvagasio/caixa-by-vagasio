@@ -12,7 +12,7 @@ Atualizado em 2026-11-16. Escopo deste ciclo: máximo funcional em homologação
 ## Fases, dependências e aceitação
 1. Fundação: organização/tenant, autenticação, papéis, dados isolados, auditoria. Aceite: testes de autenticação, criação, permissões e isolamento por tenant.
 2. Personalização: catálogo versionado de segmentos, questionários, regras determinísticas, módulos e resumo auditável. Aceite: configuração repetível, dependências e plano respeitados, histórico não apagado.
-3. Portal Empresarial: produtos (categoria/código/estoque mínimo), estoque auditável, fornecedores/compras, clientes, vendas, caixa, financeiro gerencial, usuários/filiais e relatórios. Aceite: persistência transacional, trilha de auditoria e limites bem expostos.
+3. Portal Empresarial: produtos (categoria/código/estoque mínimo), estoque auditável, fornecedores/compras (ordens e recebimento parcial), clientes, vendas, caixa, financeiro gerencial, usuários/filiais e relatórios. Aceite: persistência transacional, trilha de auditoria e limites bem expostos.
 4. Terminal PDV: busca/carrinho/atalhos, sessão de caixa, dinheiro, estados de pagamento, idempotência e comprovante. Aceite: venda dupla bloqueada, saldo consistente, nenhuma aprovação de pagamento inventada.
 5. Portal Master: catálogo global, organizações/filiais, planos, módulos, dispositivos, suporte, indicadores e auditoria. Aceite: rotas protegidas por perfil Master; sem receita/indicadores fictícios mostrados como reais.
 6. Segmentos: implementar primeiro varejo geral; preparar restaurante, supermercado, vestuário, serviços e construção por regras, sem ativar telas não existentes.
