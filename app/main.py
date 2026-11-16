@@ -13,7 +13,7 @@ import uuid
 import threading
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Annotated, Literal
@@ -170,6 +170,14 @@ def init_db() -> None:
             category TEXT NOT NULL DEFAULT '', barcode TEXT, min_stock_milli INTEGER NOT NULL DEFAULT 0 CHECK(min_stock_milli >= 0),
             UNIQUE(company_id, sku)
         );
+        CREATE TABLE IF NOT EXISTS customers (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', tax_id TEXT,
+            notes TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS customers_company_name ON customers(company_id,active,name);
+        CREATE UNIQUE INDEX IF NOT EXISTS customers_company_email ON customers(company_id,email) WHERE email <> '';
         CREATE TABLE IF NOT EXISTS suppliers (
             id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
             tax_id TEXT, email TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
@@ -193,6 +201,14 @@ def init_db() -> None:
             received_by TEXT NOT NULL REFERENCES users(id), received_at TEXT NOT NULL, idempotency_key TEXT NOT NULL,
             request_hash TEXT NOT NULL, UNIQUE(company_id,idempotency_key)
         );
+        CREATE TABLE IF NOT EXISTS accounts_payable (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), supplier_id TEXT REFERENCES suppliers(id),
+            source_receipt_id TEXT REFERENCES purchase_receipts(id), description TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL CHECK(amount_cents>=0), due_date TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('open','paid','cancelled')), created_by TEXT NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL, paid_at TEXT, payment_note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS payable_company_due ON accounts_payable(company_id,status,due_date);
         CREATE TABLE IF NOT EXISTS purchase_receipt_items (
             id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL REFERENCES purchase_receipts(id),
             purchase_order_item_id TEXT NOT NULL REFERENCES purchase_order_items(id), product_id TEXT NOT NULL REFERENCES products(id),
@@ -217,7 +233,7 @@ def init_db() -> None:
             subtotal_cents INTEGER NOT NULL, total_cents INTEGER NOT NULL,
             payment_method TEXT NOT NULL CHECK(payment_method = 'cash'),
             received_cents INTEGER NOT NULL, change_cents INTEGER NOT NULL,
-            created_at TEXT NOT NULL, UNIQUE(company_id, idempotency_key)
+            created_at TEXT NOT NULL, customer_id TEXT REFERENCES customers(id), UNIQUE(company_id, idempotency_key)
         );
         CREATE TABLE IF NOT EXISTS sale_items (
             id TEXT PRIMARY KEY, sale_id TEXT NOT NULL REFERENCES sales(id),
@@ -275,6 +291,9 @@ def init_db() -> None:
         CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_events
             BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
         """)
+        sales_columns={r[1] for r in conn.execute("PRAGMA table_info(sales)").fetchall()}
+        if "customer_id" not in sales_columns:
+            conn.execute("ALTER TABLE sales ADD COLUMN customer_id TEXT REFERENCES customers(id)")
         existing_columns = {r[1] for r in conn.execute("PRAGMA table_info(products)").fetchall()}
         for column, sql in (("category", "ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''"),
                             ("barcode", "ALTER TABLE products ADD COLUMN barcode TEXT"),
@@ -478,6 +497,25 @@ class ProductIn(StrictModel):
         return value.strip()
 
 
+class CustomerIn(StrictModel):
+    name: str = Field(min_length=2,max_length=160)
+    email: str = Field(default="",max_length=254)
+    phone: str = Field(default="",max_length=40)
+    tax_id: str | None = Field(default=None,max_length=32)
+    notes: str = Field(default="",max_length=500)
+
+    @field_validator("name","email","phone","tax_id","notes")
+    @classmethod
+    def trim_customer_fields(cls,value):
+        return value.strip().lower() if isinstance(value,str) and value and "@" in value else value.strip() if isinstance(value,str) else value
+
+    @field_validator("email")
+    @classmethod
+    def validate_customer_email(cls,value):
+        if value and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",value): raise ValueError("Informe um e-mail válido")
+        return value
+
+
 class SupplierIn(StrictModel):
     name: str = Field(min_length=2,max_length=160)
     tax_id: str | None = Field(default=None,max_length=32)
@@ -515,6 +553,18 @@ class ReceiveLineIn(StrictModel):
 
 class PurchaseReceiveIn(StrictModel):
     items: list[ReceiveLineIn] = Field(min_length=1,max_length=100)
+    due_date: date | None = None
+
+
+class PayablePaidIn(StrictModel):
+    payment_note: str = Field(min_length=3,max_length=240)
+
+    @field_validator("payment_note")
+    @classmethod
+    def trim_payment_note(cls,value):
+        value=value.strip()
+        if len(value)<3: raise ValueError("Informe uma referência ou justificativa")
+        return value
 
 
 class StockAdjustmentIn(StrictModel):
@@ -556,6 +606,7 @@ class SaleIn(StrictModel):
     items: list[SaleLineIn] = Field(min_length=1, max_length=100)
     payment_method: Literal["cash"]
     received_amount: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+    customer_id: str | None = None
 
 
 bearer = HTTPBearer(auto_error=False)
@@ -640,6 +691,7 @@ def register_json(row: sqlite3.Row) -> dict:
 def sale_json(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     items = conn.execute("SELECT sku,name,quantity_milli,unit_price_cents,discount_cents,line_total_cents FROM sale_items WHERE sale_id=?", (row["id"],)).fetchall()
     return {"id": row["id"], "status": row["status"], "register_id": row["register_id"],
+            "customer_id": row["customer_id"],
             "subtotal": cents_to_money(row["subtotal_cents"]), "total": cents_to_money(row["total_cents"]),
             "payment_method": row["payment_method"], "received_amount": cents_to_money(row["received_cents"]),
             "change": cents_to_money(row["change_cents"]), "created_at": row["created_at"],
@@ -842,6 +894,36 @@ def create_user(data: UserCreateIn, conn: DB, user: USER):
     return {"id": user_id, "company_id": user["company_id"], "email": data.email, "name": data.full_name.strip(), "role": data.role, "active": True}
 
 
+@app.get("/v1/customers")
+def list_customers(conn: DB,user: USER,search: str=Query(default="",max_length=100),limit: int=Query(default=100,ge=1,le=200)):
+    rows=conn.execute("""SELECT * FROM customers WHERE company_id=? AND active=1 AND (?='' OR name LIKE ? OR email LIKE ? OR phone LIKE ? OR COALESCE(tax_id,'') LIKE ?) ORDER BY name LIMIT ?""",
+        (user["company_id"],search.strip(),f"%{search.strip()}%",f"%{search.strip()}%",f"%{search.strip()}%",f"%{search.strip()}%",limit)).fetchall()
+    return {"items":[{"id":r["id"],"name":r["name"],"email":r["email"],"phone":r["phone"],"tax_id":r["tax_id"],"notes":r["notes"],"created_at":r["created_at"]} for r in rows]}
+
+
+@app.get("/v1/customers/{customer_id}")
+def customer_detail(customer_id: str,conn: DB,user: USER):
+    customer=conn.execute("SELECT * FROM customers WHERE id=? AND company_id=? AND active=1",(customer_id,user["company_id"])).fetchone()
+    if not customer: raise HTTPException(404,"Cliente não encontrado nesta empresa.")
+    rows=conn.execute("SELECT id,status,total_cents,payment_method,created_at FROM sales WHERE company_id=? AND customer_id=? ORDER BY created_at DESC LIMIT 100",(user["company_id"],customer_id)).fetchall()
+    return {"customer":{"id":customer["id"],"name":customer["name"],"email":customer["email"],"phone":customer["phone"],"tax_id":customer["tax_id"],"notes":customer["notes"],"created_at":customer["created_at"]},
+            "sales":{"items":[{"id":r["id"],"status":r["status"],"total":cents_to_money(r["total_cents"]),"payment_method":r["payment_method"],"created_at":r["created_at"]} for r in rows],"count":len(rows),"total_paid":cents_to_money(sum(r["total_cents"] for r in rows if r["status"]=="paid"))}}
+
+
+@app.post("/v1/customers",status_code=201)
+def create_customer(data: CustomerIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator")
+    customer_id,created=new_id(),now_iso()
+    email=data.email.strip().lower()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO customers VALUES(?,?,?,?,?,?,?,1,?,?)",(customer_id,user["company_id"],data.name.strip(),email,data.phone.strip(),data.tax_id,data.notes.strip(),created,created))
+            audit(conn,user["company_id"],user["id"],"customer.created","customer",customer_id,{"name":data.name.strip(),"email":email,"phone":data.phone.strip()})
+    except sqlite3.IntegrityError:
+        raise HTTPException(409,"Já existe cliente com esse e-mail nesta empresa.")
+    return {"id":customer_id,"name":data.name.strip(),"email":email,"phone":data.phone.strip(),"created_at":created}
+
+
 @app.get("/v1/suppliers")
 def list_suppliers(conn: DB,user: USER,active: bool=True):
     require_role(user,"owner","admin","manager","stock")
@@ -880,6 +962,38 @@ def create_purchase_order(data: PurchaseCreateIn,conn: DB,user: USER):
     return {"id":order_id,"order_number":data.order_number.strip(),"status":"draft","created_at":created}
 
 
+@app.get("/v1/finance/payables")
+def list_payables(conn: DB,user: USER,status_filter: str=Query(default="all",alias="status"),limit: int=Query(default=100,ge=1,le=200)):
+    require_role(user,"owner","admin","manager")
+    if status_filter not in {"all","open","paid","cancelled"}: raise HTTPException(422,"Filtro de situação inválido.")
+    rows=conn.execute("""SELECT ap.*,s.name AS supplier_name FROM accounts_payable ap LEFT JOIN suppliers s ON s.id=ap.supplier_id
+        WHERE ap.company_id=? AND (?='all' OR ap.status=?) ORDER BY ap.due_date,ap.created_at DESC LIMIT ?""",
+        (user["company_id"],status_filter,status_filter,limit)).fetchall()
+    return {"items":[{"id":r["id"],"supplier_id":r["supplier_id"],"supplier":r["supplier_name"],"source_receipt_id":r["source_receipt_id"],"description":r["description"],"amount":cents_to_money(r["amount_cents"]),"due_date":r["due_date"],"status":r["status"],"created_at":r["created_at"],"paid_at":r["paid_at"],"payment_note":r["payment_note"]} for r in rows]}
+
+
+@app.post("/v1/finance/payables/{payable_id}/mark-paid")
+def mark_payable_paid(payable_id: str,data: PayablePaidIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager")
+    paid_at=now_iso()
+    with transaction(conn):
+        row=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=?",(payable_id,user["company_id"])).fetchone()
+        if not row: raise HTTPException(404,"Conta a pagar não encontrada nesta empresa.")
+        if row["status"]!="open": raise HTTPException(409,"A conta não está em aberto.")
+        conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=?",(paid_at,data.payment_note,payable_id,user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"payable.manually_marked_paid","accounts_payable",payable_id,{"amount":cents_to_money(row["amount_cents"]),"payment_note":data.payment_note,"warning":"Baixa declarada pelo operador; não confirmada por integração bancária."})
+    return {"id":payable_id,"status":"paid","paid_at":paid_at,"note":"Baixa manual registrada; não representa confirmação bancária."}
+
+
+@app.get("/v1/finance/summary")
+def finance_summary(conn: DB,user: USER):
+    require_role(user,"owner","admin","manager")
+    sales=conn.execute("SELECT COALESCE(SUM(total_cents),0) FROM sales WHERE company_id=? AND status='paid'",(user["company_id"],)).fetchone()[0]
+    open_amount=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM accounts_payable WHERE company_id=? AND status='open'",(user["company_id"],)).fetchone()[0]
+    overdue=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM accounts_payable WHERE company_id=? AND status='open' AND due_date<date('now')",(user["company_id"],)).fetchone()[0]
+    return {"cash_sales_total":cents_to_money(sales),"open_payables":cents_to_money(open_amount),"overdue_payables":cents_to_money(overdue),"note":"Vendas em dinheiro não incluem outras formas; baixa é manual e sem conciliação bancária."}
+
+
 @app.get("/v1/purchase-orders")
 def list_purchase_orders(conn: DB,user: USER,limit: int=Query(default=100,ge=1,le=200)):
     require_role(user,"owner","admin","manager","stock")
@@ -913,7 +1027,7 @@ def receive_purchase(order_id: str,data: PurchaseReceiveIn,request: Request,conn
                      idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
     require_role(user,"owner","admin","manager","stock")
     if not idempotency_key or len(idempotency_key)>128: raise HTTPException(400,"Envie Idempotency-Key para evitar recebimento duplicado.")
-    normalized=sorted([{"item":x.order_item_id,"quantity":str(x.quantity)} for x in data.items],key=lambda x:x["item"])
+    normalized={"items":sorted([{"item":x.order_item_id,"quantity":str(x.quantity)} for x in data.items],key=lambda x:x["item"]),"due_date":data.due_date.isoformat() if data.due_date else None}
     request_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":")).encode()).hexdigest()
     receipt_id,received_at=new_id(),now_iso()
     with transaction(conn):
@@ -943,9 +1057,17 @@ def receive_purchase(order_id: str,data: PurchaseReceiveIn,request: Request,conn
             conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],item["product_id"],user["id"],"adjustment_in",qty,before,after,"Recebimento de pedido "+order["order_number"],None,received_at))
         remaining=conn.execute("SELECT COUNT(*) FROM purchase_order_items WHERE purchase_order_id=? AND received_milli<ordered_milli",(order_id,)).fetchone()[0]
         new_status="received" if remaining==0 else "partially_received"
+        payable_id=None
+        payable_amount=sum((qty*item["unit_cost_cents"]+500)//1000 for _,item,qty in receipt_rows)
+        if data.due_date is not None:
+            if data.due_date < date.today(): raise HTTPException(422,"Vencimento não pode ser anterior à data de hoje.")
+            payable_id=new_id()
+            conn.execute("INSERT INTO accounts_payable(id,company_id,supplier_id,source_receipt_id,description,amount_cents,due_date,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,'open',?,?)",
+                         (payable_id,user["company_id"],order["supplier_id"],receipt_id,"Recebimento pedido "+order["order_number"],payable_amount,data.due_date.isoformat(),user["id"],received_at))
+            audit(conn,user["company_id"],user["id"],"payable.created_from_receipt","accounts_payable",payable_id,{"receipt_id":receipt_id,"amount":cents_to_money(payable_amount),"due_date":data.due_date.isoformat()})
         conn.execute("UPDATE purchase_orders SET status=?,updated_at=? WHERE id=? AND company_id=?",(new_status,received_at,order_id,user["company_id"]))
-        audit(conn,user["company_id"],user["id"],"purchase.received","purchase_order",order_id,{"receipt_id":receipt_id,"items":[{"item_id":x.order_item_id,"quantity":milli_to_decimal(q)} for x,_,q in receipt_rows],"status":new_status})
-    return {"receipt_id":receipt_id,"status":new_status,"received_at":received_at}
+        audit(conn,user["company_id"],user["id"],"purchase.received","purchase_order",order_id,{"receipt_id":receipt_id,"payable_id":payable_id,"items":[{"item_id":x.order_item_id,"quantity":milli_to_decimal(q)} for x,_,q in receipt_rows],"status":new_status})
+    return {"receipt_id":receipt_id,"payable_id":payable_id,"payable_amount":cents_to_money(payable_amount) if payable_id else None,"due_date":data.due_date.isoformat() if payable_id else None,"status":new_status,"received_at":received_at}
 
 
 @app.post("/v1/products", status_code=201)
@@ -1134,7 +1256,7 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
     if any(line.discount > 0 for line in data.items) and user["role"] not in {"owner", "admin", "manager"}:
         raise HTTPException(403, "Descontos nesta versão exigem gerente ou administrador.")
     normalized = {"items": sorted([{"product_id": x.product_id, "quantity": str(x.quantity), "discount": str(x.discount)} for x in data.items], key=lambda x: x["product_id"]),
-                  "payment_method": data.payment_method, "received_amount": str(data.received_amount)}
+                  "payment_method": data.payment_method, "received_amount": str(data.received_amount), "customer_id":data.customer_id}
     request_hash = hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     sale_id, created = new_id(), now_iso()
     with transaction(conn):
@@ -1145,6 +1267,9 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
             if response is not None:
                 response.status_code = 200
             return sale_json(conn, prior)
+        if data.customer_id:
+            customer=conn.execute("SELECT id FROM customers WHERE id=? AND company_id=? AND active=1",(data.customer_id,user["company_id"])).fetchone()
+            if not customer: raise HTTPException(404,"Cliente não encontrado nesta empresa.")
         register = conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1", (user["company_id"],)).fetchone()
         if not register:
             raise HTTPException(409, "Abra um caixa antes de finalizar uma venda.")
@@ -1173,10 +1298,10 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
             raise HTTPException(422, "O valor recebido em dinheiro não cobre o total da venda.")
         change = received - subtotal
         conn.execute("""INSERT INTO sales(id,company_id,register_id,created_by,idempotency_key,request_hash,status,
-            subtotal_cents,total_cents,payment_method,received_cents,change_cents,created_at)
-            VALUES(?,?,?,?,?,?,'paid',?,?,'cash',?,?,?)""",
+            subtotal_cents,total_cents,payment_method,received_cents,change_cents,created_at,customer_id)
+            VALUES(?,?,?,?,?,?,'paid',?,?,'cash',?,?,?,?)""",
             (sale_id, user["company_id"], register["id"], user["id"], idempotency_key, request_hash,
-             subtotal, subtotal, received, change, created))
+             subtotal, subtotal, received, change, created, data.customer_id))
         for line in data.items:
             product = aggregates[line.product_id]["product"]
             quantity = decimal_milli(line.quantity)

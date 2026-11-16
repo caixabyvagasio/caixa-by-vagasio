@@ -29,3 +29,11 @@
 - Recebimentos parciais ou integrais transacionais, idempotentes, com validação de excesso, entrada de estoque e auditoria. Pedido não altera saldo antes de recebimento. Nenhuma conta a pagar é criada: a obrigação financeira permanece fora do módulo até implementar termos/vencimentos e validação.
 - Interface empresarial: cadastro, criação de pedido, marcar enviado, cancelamento, recebimento de quantidades e leitura do status.
 - 27 testes locais passaram; CI remoto pendente. Sem deploy nem dados reais.
+
+## Incremento de clientes e financeiro gerencial
+- Cadastro e pesquisa de clientes por empresa, e-mail único opcional, campos de contato e observação; cliente pode ser associado a venda em dinheiro.
+- API de detalhe do cliente exibe histórico de vendas confirmadas da própria empresa e total agregado; acesso cruzado é 404.
+- Recebimento de compra pode incluir vencimento acordado. Quando informado, gera conta a pagar pelo custo das quantidades recebidas; sem vencimento, não inventa obrigação/parcelamento. Vencimento passado é rejeitado atomicamente.
+- Tela financeira mostra vendas em dinheiro, contas a pagar abertas/vencidas e baixa manual auditada, identificada explicitamente como não confirmada pelo banco.
+- Não há conciliação bancária, contas a receber a prazo, fluxo de caixa completo, DRE nem provedor financeiro. Valores do resumo são parciais, não faturamento contábil.
+- Testes: 32 aprovados localmente; alerta conhecido de depreciação da dependência Starlette TestClient/httpx. Sem deploy.

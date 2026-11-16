@@ -388,3 +388,81 @@ def test_supplier_and_purchase_order_are_company_isolated(world):
     denied=world.post("/v1/purchase-orders",headers=auth(two),json={"supplier_id":supplier["id"],"order_number":"NOPE","items":[{"product_id":product(world,two)["id"],"quantity":"1","unit_cost":"1.00"}]})
     assert denied.status_code==404
     assert world.get("/v1/suppliers",headers=auth(two)).json()["items"]==[]
+
+
+def test_customer_profile_isolated_and_attached_to_sale(world):
+    owner=company(world)
+    customer=world.post("/v1/customers",headers=auth(owner),json={"name":"Cliente Exemplo","email":"CLIENTE@EXAMPLE.TEST","phone":"11999990000"})
+    assert customer.status_code==201,customer.text
+    assert customer.json()["email"]=="cliente@example.test"
+    duplicate=world.post("/v1/customers",headers=auth(owner),json={"name":"Outro nome","email":"cliente@example.test"})
+    assert duplicate.status_code==409
+    assert world.post("/v1/customers",headers=auth(owner),json={"name":"Cliente sem e-mail"}).status_code==201
+    p=product(world,owner)
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(owner),json={"direction":"in","quantity":"2","reason":"Entrada inicial"})
+    world.post("/v1/registers/open",headers=auth(owner),json={"label":"Caixa 1","opening_amount":"0"})
+    sale=world.post("/v1/sales",headers={**auth(owner),"Idempotency-Key":"customer-sale-1"},json={"items":[{"product_id":p["id"],"quantity":"1"}],"payment_method":"cash","received_amount":"10.50","customer_id":customer.json()["id"]})
+    assert sale.status_code==201,sale.text
+    assert sale.json()["customer_id"]==customer.json()["id"]
+    other=company(world,"Loja cliente","loja-cliente","loja@example.test")
+    assert world.get("/v1/customers",headers=auth(other)).json()["items"]==[]
+    assert world.post("/v1/sales",headers={**auth(other),"Idempotency-Key":"foreign-customer"},json={"items":[{"product_id":product(world,other)["id"],"quantity":"1"}],"payment_method":"cash","received_amount":"10.50","customer_id":customer.json()["id"]}).status_code==404
+
+
+def test_sale_customer_id_is_part_of_idempotency_hash(world):
+    owner=company(world)
+    p=product(world,owner)
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(owner),json={"direction":"in","quantity":"2","reason":"Entrada inicial"})
+    world.post("/v1/registers/open",headers=auth(owner),json={"label":"Caixa 1","opening_amount":"0"})
+    one=world.post("/v1/customers",headers=auth(owner),json={"name":"Cliente A","email":"a@example.test"}).json()
+    two=world.post("/v1/customers",headers=auth(owner),json={"name":"Cliente B","email":"b@example.test"}).json()
+    headers={**auth(owner),"Idempotency-Key":"customer-idem"}
+    body={"items":[{"product_id":p["id"],"quantity":"1"}],"payment_method":"cash","received_amount":"10.50","customer_id":one["id"]}
+    assert world.post("/v1/sales",headers=headers,json=body).status_code==201
+    assert world.post("/v1/sales",headers=headers,json={**body,"customer_id":two["id"]}).status_code==409
+
+
+def test_customer_history_returns_only_own_company_sales(world):
+    one=company(world)
+    c=world.post("/v1/customers",headers=auth(one),json={"name":"Histórico","email":"hist@example.test"}).json()
+    p=product(world,one)
+    world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=auth(one),json={"direction":"in","quantity":"2","reason":"Entrada"})
+    world.post("/v1/registers/open",headers=auth(one),json={"label":"Caixa","opening_amount":"0"})
+    sale=world.post("/v1/sales",headers={**auth(one),"Idempotency-Key":"hist-sale"},json={"items":[{"product_id":p["id"],"quantity":"1"}],"payment_method":"cash","received_amount":"10.50","customer_id":c["id"]})
+    assert sale.status_code==201
+    detail=world.get(f"/v1/customers/{c['id']}",headers=auth(one)).json()
+    assert detail["sales"]["count"]==1 and detail["sales"]["total_paid"]=="10.50"
+    two=company(world,"Outra","outra","outra@example.test")
+    assert world.get(f"/v1/customers/{c['id']}",headers=auth(two)).status_code==404
+
+
+def test_purchase_receipt_optional_due_date_creates_payable_and_manual_paid_state(world):
+    owner=company(world)
+    supplier=world.post('/v1/suppliers',headers=auth(owner),json={'name':'Fornecedor Financeiro'}).json()
+    p=product(world,owner,sku='PAY-1')
+    order=world.post('/v1/purchase-orders',headers=auth(owner),json={'supplier_id':supplier['id'],'order_number':'PAY-001','items':[{'product_id':p['id'],'quantity':'2','unit_cost':'3.25'}]}).json()
+    item=world.get('/v1/purchase-orders',headers=auth(owner)).json()['items'][0]['items'][0]
+    world.patch(f"/v1/purchase-orders/{order['id']}",headers=auth(owner),json={'status':'ordered'})
+    receipt=world.post(f"/v1/purchase-orders/{order['id']}/receipts",headers={**auth(owner),'Idempotency-Key':'pay-receipt'},json={'items':[{'order_item_id':item['id'],'quantity':'2'}],'due_date':'2026-12-15'})
+    assert receipt.status_code==201,receipt.text
+    assert receipt.json()['payable_amount']=='6.50'
+    summary=world.get('/v1/finance/summary',headers=auth(owner)).json()
+    assert summary['open_payables']=='6.50'
+    payable=world.get('/v1/finance/payables',headers=auth(owner)).json()['items'][0]
+    assert payable['status']=='open' and payable['due_date']=='2026-12-15'
+    mark=world.post(f"/v1/finance/payables/{payable['id']}/mark-paid",headers=auth(owner),json={'payment_note':'Pago manual via banco ref 123'})
+    assert mark.status_code==200 and 'não representa confirmação bancária' in mark.json()['note']
+    assert world.get('/v1/finance/summary',headers=auth(owner)).json()['open_payables']=='0.00'
+
+
+def test_purchase_receipt_without_due_date_does_not_create_payable_and_past_date_rejected(world):
+    owner=company(world)
+    supplier=world.post('/v1/suppliers',headers=auth(owner),json={'name':'Fornecedor sem prazo'}).json()
+    p=product(world,owner,sku='NO-DUE')
+    order=world.post('/v1/purchase-orders',headers=auth(owner),json={'supplier_id':supplier['id'],'order_number':'NO-DUE-1','items':[{'product_id':p['id'],'quantity':'1','unit_cost':'1.00'}]}).json()
+    item=world.get('/v1/purchase-orders',headers=auth(owner)).json()['items'][0]['items'][0]
+    world.patch(f"/v1/purchase-orders/{order['id']}",headers=auth(owner),json={'status':'ordered'})
+    response=world.post(f"/v1/purchase-orders/{order['id']}/receipts",headers={**auth(owner),'Idempotency-Key':'past-due'},json={'items':[{'order_item_id':item['id'],'quantity':'1'}],'due_date':'2020-01-01'})
+    assert response.status_code==422
+    assert world.get('/v1/products',headers=auth(owner)).json()['items'][0]['stock']=='0'
+    assert world.get('/v1/finance/payables',headers=auth(owner)).json()['items']==[]

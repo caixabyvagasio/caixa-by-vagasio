@@ -39,3 +39,8 @@ Inspeção -> segurança/isolamento -> modelagem e migrações -> catálogo de s
 
 ## Checkpoint
 Continuar na branch de desenvolvimento a partir do commit que corrige onboarding e formulários. Próxima tarefa: versionar modelo de segmento/feature catalog determinístico com endpoints, interface de onboarding e testes isolados; não expor cadastro público na produção sem termos e infraestrutura de persistência adequados.
+
+## Checkpoint — compras, clientes e financeiro
+- API/UI de fornecedores e ordens de compra, recebimentos parciais idempotentes e estoque auditado; cliente associado à venda, histórico por cliente; contas a pagar condicionais a vencimento explicitamente informado e resumo financeiro limitado às vendas em dinheiro.
+- Testes: 32 aprovados localmente; CI para esse último checkpoint ainda será consultado após commit.
+- O recebimento não integra pagamento ao fornecedor, e baixa manual não atesta liquidação bancária. Nenhum fluxo de Pix/cartão, crédito, conciliação, contas a receber ou DRE está completo.
