@@ -549,3 +549,14 @@ def test_sales_report_periods_totals_and_tenant_isolation(world):
     assert world.get('/v1/reports/sales?start_date=2025-01-01&end_date=2026-12-31',headers=auth(owner)).status_code==422
     two=company(world,'Outra','outra','outra@example.test')
     assert world.get('/v1/reports/sales?start_date=2026-01-01&end_date=2026-12-31',headers=auth(two)).json()['totals']['sale_count']==0
+
+
+def test_sqlite_request_connection_can_be_cleaned_up_from_worker_thread(monkeypatch,tmp_path):
+    import threading
+    monkeypatch.setattr(main,"DB_PATH",str(tmp_path/"threaded.sqlite3"))
+    conn=main.connect_db()
+    outcomes=[]
+    worker=threading.Thread(target=lambda: outcomes.append(conn.execute("SELECT 1").fetchone()[0]))
+    worker.start();worker.join()
+    conn.close()
+    assert outcomes==[1]

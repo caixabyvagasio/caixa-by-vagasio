@@ -57,3 +57,15 @@
 ## Incremento de relatório de vendas
 - API e tela de relatório por intervalo, agrupamento diário/mensal, contagem e totais separados para vendas pagas e canceladas. Datas e limites validados; limites de função e tenant. É operacional/gerencial, usa somente valores locais em dinheiro e UTC; não é relatório fiscal ou contábil.
 - Testes locais: 37 aprovados. CI/deploy pendente.
+
+
+## Publicação autorizada 2026-11-16
+- O commit `9a407d6` (fornecedores/compras, clientes, financeiro inicial, cancelamento, histórico de estoque) foi publicado no serviço Render Free `caixa-by-vagasio-dev`; deploy `dep-dbtiossipgvc73a1npr0` ficou live.
+- Correção que exige caixa aberto com saldo suficiente para cancelamento foi publicada no commit `be0694c`, deploy `dep-dbtiqtdbedkc73fvrac0` live.
+- Relatório de vendas por dia/mês foi publicado no commit `276f22a`, deploy `dep-dbtit2etlv9c73acocl0` live, com CI success e 37 testes locais.
+- Serviço está apontado para `development-v1`, autodeploy continua off, plano Free. Health respondeu 200; interface pública abriu e telas Compras e Movimentos de estoque foram carregadas na sessão de demonstração fictícia.
+- Dados compartilhados/descartáveis com SQLite em `/tmp`; não usar para operação comercial nem dados reais. Pagamentos e emissão fiscal desligados.
+
+## Correção após validação live
+- A validação com requests concorrentes detectou `sqlite3.ProgrammingError` na liberação de conexão entre threads FastAPI; configurada conexão por request para permitir uso sequencial pela thread de cleanup e adicionado teste. 38 testes locais passaram.
+- Corrigido também o título no topo para todas as telas incluídas. Esta correção está em preparação para publicação urgente no mesmo serviço.
