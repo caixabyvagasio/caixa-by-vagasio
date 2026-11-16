@@ -1,17 +1,25 @@
 # Persistência PostgreSQL do Caixa
 
 ## Infraestrutura
-Render Postgres gratuito `caixa-by-vagasio-db`, Ohio, PostgreSQL 18, database `caixa_vagasio`, ativo. O Render informou vencimento em 16/12/2026. Free tem 1 GB, expira em 30 dias e não inclui backups/PITR. Antes do vencimento precisa atualizar o plano ou migrar/exportar. Sem usar dados críticos até estratégia de recuperação ser configurada.
+Render PostgreSQL gratuito `caixa-by-vagasio-db`, Ohio, PostgreSQL 18, database `caixa_vagasio`, ativo. O Render informou expiração em 16/12/2026. O plano Free tem 1 GB, expira em 30 dias e não oferece backups/PITR; atualizar o plano ou migrar/exportar antes do vencimento. O usuário instruiu usar Free agora e atualizar depois.
 
-## Aplicação e migração
-- Aplicação usa psycopg2-binary quando `DATABASE_URL` tem prefixo PostgreSQL, exige TLS para destinos `*.render.com`; sem URL pode continuar SQLite apenas para testes locais.
-- `CAIXA_REQUIRE_POSTGRES=true` faz o serviço falhar ao iniciar sem DATABASE_URL válida/driver, para não cair silenciosamente para SQLite.
-- Signup público exige backend PostgreSQL, `CAIXA_DEMO_MODE=false` e `CAIXA_PUBLIC_SIGNUP=true`. Bootstrap continua provisionamento administrativo separado protegido por segredo.
-- O ambiente publicado ainda não recebeu a connection string nem deploy deste adapter neste estado. O banco criado permanece vazio; cadastros do SQLite temporário não são recuperáveis.
-- Após adaptar integração: conectar com Internal URL (mesma região), ativar require postgres e demo false, deploy; confirmar `/health` mostra `storage=postgresql`, registro fictício, login, `/v1/me`, confirmar após restart do serviço; só então cadastro de empresa será disponibilizado.
-- Não imprimir/gravar connection string ou senha em log, repo ou resposta.
+## Aplicação
+- Backend usa psycopg2-binary com `DATABASE_URL`; exige TLS em destino Render.
+- `CAIXA_REQUIRE_POSTGRES=true` impede fallback silencioso para SQLite.
+- Signup exige PostgreSQL ativo, `CAIXA_DEMO_MODE=false` e `CAIXA_PUBLIC_SIGNUP=true`; bootstrap continua protegido por segredo.
+- Serviço `srv-dbtgqk95efls73cleqig`, Free e branch `development-v1`, conectado à URL interna do banco Ohio. Segredo de conexão nunca entra no repo/log/resposta.
+- PostgreSQL é base de desenvolvimento compartilhada. Não há backup/PITR no plano Free; usuário deverá atualizar antes da expiração. Não inserir dados críticos até backup/recuperação serem configurados.
 
-## Validação
-O adapter mantém testes SQLite e soma workflow `postgres.yml` com PostgreSQL real no GitHub CI, isolando cada teste em database temporário. Primeira execução `43960213644` encontrou 3 classes de divergência (date/text, UPSERT de catálogo/perfil, expectativa equivocada no teste signup); corrigidas localmente. Suite SQLite local atual: 51 passed, 1 skipped (o teste de signup require PG), 1 warning deprecado de Starlette TestClient. CI PostgreSQL precisa novo commit/execução e aprovação antes de ligar Render.
+## Testes e operação confirmada
+- Primeira CI PG `43960213644` identificou SQL date/text, upsert e expectativa desatualizada de cadastro; correções commitadas em `b0459941fe9b00124c6edb653ece012130346114`.
+- CI PostgreSQL `43961405960` passou; CI geral `43961406033` passou.
+- Deploy de integração live `dep-dbtngvt6e07s73akjpfg`, commit `b0459941...`. `/health` reporta `storage=postgresql`.
+- Cadastro de conta fictícia testado HTTP 201; login HTTP 200; `/v1/me` devolveu titular e tenant esperados. Depois de outro redeploy, login continuou funcionando. Nenhuma conta real de terceiros usada.
+- Cadastro público habilitado só após guard PostgreSQL verdadeiro e modo demo desligado. Endpoint de demo retorna 404 agora.
+- Suite SQLite local do próximo ajuste UI: 51 passed, 1 skipped (teste exige CI PostgreSQL), 1 aviso Starlette/httpx. O próximo ajuste de UI ainda não está commitado nem publicado.
 
-Migradores numerados 1–4 continuam traduzidos no adapter para SQLite e Postgres. Não declarar migração Render, smoke ou cadastro confirmado antes da execução do CI e deploy controlado subsequente.
+## Próximos itens
+- Publicar o rótulo dinâmico do ambiente para a interface deixar de chamar o serviço de demonstração.
+- Validar visual da tela de login/cadastro após atualizar.
+- Criar alerta/calendário de vencimento antes de 16/12/2026 e plano aprovado para migração/backup. Banco Free não equivale a armazenamento definitivo de produção com recuperação.
+- Payments e fiscal seguem desativados. Render web service é Free e pode dormir por inatividade; não é produção comercial homologada.

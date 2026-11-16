@@ -961,6 +961,8 @@ def health():
     backend="postgresql" if POSTGRES_BACKEND else "sqlite-ephemeral"
     return {"status": "ok", "service": "caixa-api", "version": APP_VERSION,
             "mode": "development-foundation", "storage": backend,
+            "demo_enabled": DEMO_MODE,
+            "signup_enabled": bool(POSTGRES_BACKEND and PUBLIC_SIGNUP and not DEMO_MODE),
             "integrations": {"payments": False, "fiscal": False}}
 
 

@@ -85,6 +85,8 @@ def test_frontend_is_served_from_same_app(world):
 
 def test_health_and_provisioning_gate(world):
     assert world.get("/health").json()["integrations"] == {"payments": False, "fiscal": False}
+    assert world.get('/health').json()['demo_enabled'] is main.DEMO_MODE
+    assert world.get('/health').json()['signup_enabled'] is (main.POSTGRES_BACKEND and main.PUBLIC_SIGNUP and not main.DEMO_MODE)
     denied = world.post("/v1/bootstrap", json={"company_name":"Xx","company_slug":"xx","owner_name":"AA","email":"a@b.co","password":"strong-test-password-123"})
     assert denied.status_code == 403
     assert world.get("/v1/products").status_code == 401
