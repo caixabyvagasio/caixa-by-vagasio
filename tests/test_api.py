@@ -154,6 +154,13 @@ def test_demo_mode_is_opt_in_and_seeds_only_fictional_tenant(world):
     assert world.post("/v1/auth/demo").status_code == 404
 
 
+def test_public_signup_is_blocked_even_when_enabled_in_demo(world, monkeypatch):
+    monkeypatch.setattr(main,"DEMO_MODE",True)
+    monkeypatch.setattr(main,"PUBLIC_SIGNUP",True)
+    payload={"company_name":"Tenant público","company_slug":"tenant-publico","owner_name":"Teste","email":"teste@example.test","password":"strong-test-password-123"}
+    assert world.post("/v1/companies/register",json=payload).status_code==404
+
+
 def test_demo_login_and_sample_catalog_are_available_only_when_enabled(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "demo.sqlite3"))
     monkeypatch.setattr(main, "TOKEN_SECRET", "test-only-token-secret-with-entropy-123456789")
@@ -388,6 +395,23 @@ def test_supplier_and_purchase_order_are_company_isolated(world):
     denied=world.post("/v1/purchase-orders",headers=auth(two),json={"supplier_id":supplier["id"],"order_number":"NOPE","items":[{"product_id":product(world,two)["id"],"quantity":"1","unit_cost":"1.00"}]})
     assert denied.status_code==404
     assert world.get("/v1/suppliers",headers=auth(two)).json()["items"]==[]
+
+
+def test_customer_pii_access_is_restricted_by_role(world):
+    owner=company(world)
+    c=world.post("/v1/customers",headers=auth(owner),json={"name":"Cliente Pessoal","email":"pessoal@example.test","phone":"11999998888","tax_id":"12345678900","notes":"Observação privada"}).json()
+    op=world.post("/v1/users",headers=auth(owner),json={"full_name":"Operadora","email":"op-pii@example.test","password":"strong-operator-password-789","role":"operator"}).json()
+    operator=world.post("/v1/auth/login",json={"company_slug":"mercado-um","email":"op-pii@example.test","password":"strong-operator-password-789"}).json()["access_token"]
+    lookup=world.get("/v1/customers",headers=auth(operator)).json()["items"]
+    assert lookup==[{"id":c["id"],"name":"Cliente Pessoal"}]
+    assert world.get("/v1/customers?search=pessoal@example.test",headers=auth(operator)).json()["items"]==[]
+    assert world.get(f"/v1/customers/{c['id']}",headers=auth(operator)).status_code==403
+    assert world.post("/v1/customers",headers=auth(operator),json={"name":"Só nome"}).status_code==201
+    assert world.post("/v1/customers",headers=auth(operator),json={"name":"Com dado","phone":"11999998888"}).status_code==403
+    stock=world.post("/v1/users",headers=auth(owner),json={"full_name":"Estoque","email":"stock-pii@example.test","password":"strong-stock-password-789","role":"stock"}).json()
+    stock_token=world.post("/v1/auth/login",json={"company_slug":"mercado-um","email":"stock-pii@example.test","password":"strong-stock-password-789"}).json()["access_token"]
+    assert world.get("/v1/customers",headers=auth(stock_token)).status_code==403
+    assert world.get(f"/v1/customers/{c['id']}",headers=auth(owner)).json()["customer"]["tax_id"]=="12345678900"
 
 
 def test_customer_profile_isolated_and_attached_to_sale(world):

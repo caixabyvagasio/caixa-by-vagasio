@@ -750,7 +750,8 @@ def demo_login(conn: DB):
 @app.post("/v1/companies/register", status_code=201)
 def register_company(data: BootstrapIn, request: Request, conn: DB):
     """Self-service tenant creation, disabled until the operator explicitly enables it."""
-    if not PUBLIC_SIGNUP:
+    if DEMO_MODE or not PUBLIC_SIGNUP:
+        # Never create persistent customer tenants from the shared public demo.
         raise HTTPException(404, "Cadastro público temporariamente indisponível.")
     client_ip = request.client.host if request.client else "unknown"
     enforce_rate_limit(f"signup:{client_ip}", 3, 3600)
@@ -907,13 +908,21 @@ def create_user(data: UserCreateIn, conn: DB, user: USER):
 
 @app.get("/v1/customers")
 def list_customers(conn: DB,user: USER,search: str=Query(default="",max_length=100),limit: int=Query(default=100,ge=1,le=200)):
+    require_role(user,"owner","admin","manager","operator")
+    query=f"%{search.strip()}%"
+    if user["role"]=="operator":
+        # PDV lookup is name-only and returns no contact, tax or notes data.
+        rows=conn.execute("SELECT id,name FROM customers WHERE company_id=? AND active=1 AND (?='' OR name LIKE ?) ORDER BY name LIMIT ?",
+            (user["company_id"],search.strip(),query,limit)).fetchall()
+        return {"items":[{"id":r["id"],"name":r["name"]} for r in rows]}
     rows=conn.execute("""SELECT * FROM customers WHERE company_id=? AND active=1 AND (?='' OR name LIKE ? OR email LIKE ? OR phone LIKE ? OR COALESCE(tax_id,'') LIKE ?) ORDER BY name LIMIT ?""",
-        (user["company_id"],search.strip(),f"%{search.strip()}%",f"%{search.strip()}%",f"%{search.strip()}%",f"%{search.strip()}%",limit)).fetchall()
+        (user["company_id"],search.strip(),query,query,query,query,limit)).fetchall()
     return {"items":[{"id":r["id"],"name":r["name"],"email":r["email"],"phone":r["phone"],"tax_id":r["tax_id"],"notes":r["notes"],"created_at":r["created_at"]} for r in rows]}
 
 
 @app.get("/v1/customers/{customer_id}")
 def customer_detail(customer_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager")
     customer=conn.execute("SELECT * FROM customers WHERE id=? AND company_id=? AND active=1",(customer_id,user["company_id"])).fetchone()
     if not customer: raise HTTPException(404,"Cliente não encontrado nesta empresa.")
     rows=conn.execute("SELECT id,status,total_cents,payment_method,created_at FROM sales WHERE company_id=? AND customer_id=? ORDER BY created_at DESC LIMIT 100",(user["company_id"],customer_id)).fetchall()
@@ -924,6 +933,8 @@ def customer_detail(customer_id: str,conn: DB,user: USER):
 @app.post("/v1/customers",status_code=201)
 def create_customer(data: CustomerIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator")
+    if user["role"]=="operator" and any((data.email.strip(),data.phone.strip(),(data.tax_id or "").strip(),data.notes.strip())):
+        raise HTTPException(403,"Operador pode cadastrar apenas o nome do cliente nesta versão.")
     customer_id,created=new_id(),now_iso()
     email=data.email.strip().lower()
     try:
