@@ -1,25 +1,22 @@
-# Persistência PostgreSQL do Caixa
+# PostgreSQL do Caixa by VagasIO
 
-## Infraestrutura
-Render PostgreSQL gratuito `caixa-by-vagasio-db`, Ohio, PostgreSQL 18, database `caixa_vagasio`, ativo. O Render informou expiração em 16/12/2026. O plano Free tem 1 GB, expira em 30 dias e não oferece backups/PITR; atualizar o plano ou migrar/exportar antes do vencimento. O usuário instruiu usar Free agora e atualizar depois.
+## Infraestrutura atual
+- Render PostgreSQL `caixa-by-vagasio-db`, Ohio, PG18, plano Free, database `caixa_vagasio`; criado em 2026-11-16, expiração reportada pelo Render em 2026-12-16 20:59 UTC.
+- Serviço web `caixa-by-vagasio-dev` permanece em Free; recebe tráfego público, pode suspender após inatividade.
+- `DATABASE_URL` interna está configurada via variável protegida do Render e não foi exposta em logs/código. `CAIXA_REQUIRE_POSTGRES=true` faz falhar o startup em vez de voltar silenciosamente ao SQLite. `CAIXA_DEMO_MODE=false`; `CAIXA_PUBLIC_SIGNUP=true`. Signup endpoint aplica guard PostgreSQL e modo demo.
+- Deploy live `dep-dbtnkpm7bikc73f690m0`, commit `ac5248ee7cf212a62b5f086c5069c7a82e62da26` (rótulos UI adaptativos). Deploy inicial com PostgreSQL `dep-dbtngvt6e07s73akjpfg`, commit `b0459941fe9b00124c6edb653ece012130346114`.
+- `/health` verificado `storage=postgresql`, `demo_enabled=false`, `signup_enabled=true`; pagamentos e fiscal permanecem desativados.
 
-## Aplicação
-- Backend usa psycopg2-binary com `DATABASE_URL`; exige TLS em destino Render.
-- `CAIXA_REQUIRE_POSTGRES=true` impede fallback silencioso para SQLite.
-- Signup exige PostgreSQL ativo, `CAIXA_DEMO_MODE=false` e `CAIXA_PUBLIC_SIGNUP=true`; bootstrap continua protegido por segredo.
-- Serviço `srv-dbtgqk95efls73cleqig`, Free e branch `development-v1`, conectado à URL interna do banco Ohio. Segredo de conexão nunca entra no repo/log/resposta.
-- PostgreSQL é base de desenvolvimento compartilhada. Não há backup/PITR no plano Free; usuário deverá atualizar antes da expiração. Não inserir dados críticos até backup/recuperação serem configurados.
+## Validação que foi executada
+- Primeira CI real Postgres `43960213644` falhou com divergências SQL específicas (date/text, upsert perfil e expectativa incorreta de signup). Corrigidas no commit `b0459941fe9b00124c6edb653ece012130346114`.
+- CI PostgreSQL `43961405960` success e CI normal `43961406033` success no mesmo commit.
+- Signup de empresas fictícias foi exercitado: HTTP 201; login HTTP 200; `/v1/me` identificou titular correto. Uma empresa de smoke autenticou novamente após redeploy do serviço, mostrando persistência no PostgreSQL.
+- Smoke visual/browser: a navegação carregou conta autenticada de teste; lista “Equipe e acessos” mostrou só o titular daquele tenant. Teste independente API criou outro tenant fictício e conferiu que GET users contém só o próprio e-mail, sem vazamento cross-tenant.
+- Depois, commit de textos/indicador de ambiente `ac5248ee7cf212a62b5f086c5069c7a82e62da26`: CI geral `43963765448` success, CI PostgreSQL `43963765433` success. Deploy live verificado.
+- Suite local desse ajuste: 51 passed, 1 skipped por fixture exclusiva de Postgres CI, 1 aviso de depreciação Starlette/httpx. Referências estáticas DOM completas e formulários balanceados; validação browser autenticada confirmou a tela de equipe.
 
-## Testes e operação confirmada
-- Primeira CI PG `43960213644` identificou SQL date/text, upsert e expectativa desatualizada de cadastro; correções commitadas em `b0459941fe9b00124c6edb653ece012130346114`.
-- CI PostgreSQL `43961405960` passou; CI geral `43961406033` passou.
-- Deploy de integração live `dep-dbtngvt6e07s73akjpfg`, commit `b0459941...`. `/health` reporta `storage=postgresql`.
-- Cadastro de conta fictícia testado HTTP 201; login HTTP 200; `/v1/me` devolveu titular e tenant esperados. Depois de outro redeploy, login continuou funcionando. Nenhuma conta real de terceiros usada.
-- Cadastro público habilitado só após guard PostgreSQL verdadeiro e modo demo desligado. Endpoint de demo retorna 404 agora.
-- Suite SQLite local do próximo ajuste UI: 51 passed, 1 skipped (teste exige CI PostgreSQL), 1 aviso Starlette/httpx. O próximo ajuste de UI ainda não está commitado nem publicado.
+## Limite essencial do plano Free
+O Free Postgres Render expira após 30 dias, tem 1 GB e não oferece backups/PITR. O usuário instruiu usar esse plano como base agora e atualizar depois. Para manter acesso/continuidade, será necessário atualizar/migrar antes de 16/12/2026 e executar/exportar backup; não usar Free como garantia de armazenamento permanente ou dado crítico sem backup recuperável. Conta e senhas de smoke foram somente sintéticas; não foram incluídas aqui.
 
-## Próximos itens
-- Publicar o rótulo dinâmico do ambiente para a interface deixar de chamar o serviço de demonstração.
-- Validar visual da tela de login/cadastro após atualizar.
-- Criar alerta/calendário de vencimento antes de 16/12/2026 e plano aprovado para migração/backup. Banco Free não equivale a armazenamento definitivo de produção com recuperação.
-- Payments e fiscal seguem desativados. Render web service é Free e pode dormir por inatividade; não é produção comercial homologada.
+## Produto e segurança
+Pagamentos eletrônicos, fiscal e homologação continuam desligados. Signup público está ativo para criar empresas isoladas neste ambiente de desenvolvimento e fica tenant-scoped. A demonstração da interface é escondida quando `/health` reporta demo desligada; aviso agora mostra PostgreSQL e a necessidade de atualização do plano. Em produção comercial ainda faltam revisão de segurança, backup/restore validado, recuperação de conta, LGPD operacional, rate limit externo, fiscal/pagamentos e outros módulos.
