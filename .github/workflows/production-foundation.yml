@@ -1,7 +1,7 @@
 name: Caixa production foundation CI
 on:
   push:
-    branches: [production-foundation]
+    branches: [production-foundation, development-v1]
   pull_request:
     branches: [main, v1-foundation]
 permissions:

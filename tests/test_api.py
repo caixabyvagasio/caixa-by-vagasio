@@ -206,3 +206,44 @@ def test_login_rate_limits_repeated_wrong_passwords(world, monkeypatch):
     statuses=[world.post("/v1/auth/login", json=payload).status_code for _ in range(9)]
     assert statuses[:8] == [401] * 8
     assert statuses[8] == 429
+
+
+def test_segment_catalog_and_profile_configuration_are_tenant_scoped_and_audited(world):
+    owner = company(world)
+    other = company(world, "Outro Negócio", "outro-negocio", "other@example.test")
+    catalog = world.get("/v1/configuration/catalog", headers=auth(owner))
+    assert catalog.status_code == 200
+    assert {x["id"] for x in catalog.json()["segments"]} >= {"retail", "grocery", "restaurant", "apparel", "services", "construction"}
+    payload = {"primary_segment":"restaurant", "secondary_segments":["grocery"],
+               "answers":{"tables":True,"delivery":True,"kitchen":False,"weighed_items":True,"perishables":True}}
+    saved = world.put("/v1/company/profile", headers=auth(owner), json=payload)
+    assert saved.status_code == 200, saved.text
+    assert set(saved.json()["modules"]) == {"sales","inventory","tables_tabs","delivery","weighed_items","expiry_control"}
+    profile = world.get("/v1/configuration/catalog", headers=auth(owner)).json()["profile"]
+    assert profile["primary_segment"] == "restaurant"
+    assert world.get("/v1/configuration/catalog", headers=auth(other)).json()["profile"] is None
+    events=world.get("/v1/audit-events", headers=auth(owner)).json()["items"]
+    assert any(e["action"]=="company.profile_configured" for e in events)
+
+
+def test_profile_configuration_rejects_unknown_segment_or_answer(world):
+    owner=company(world)
+    bad_segment=world.put("/v1/company/profile",headers=auth(owner),json={"primary_segment":"casino"})
+    assert bad_segment.status_code==422
+    bad_answer=world.put("/v1/company/profile",headers=auth(owner),json={"primary_segment":"retail","answers":{"tables":True}})
+    assert bad_answer.status_code==422
+
+
+def test_operator_cannot_change_company_profile(world):
+    owner=company(world)
+    world.post("/v1/users",headers=auth(owner),json={"full_name":"Operador","email":"operator@demo.test","password":"secure-password-123","role":"operator"})
+    result=world.post("/v1/auth/login",json={"company_slug":"mercado-um","email":"operator@demo.test","password":"secure-password-123"})
+    assert result.status_code==200
+    denied=world.put("/v1/company/profile",headers=auth(result.json()["access_token"]),json={"primary_segment":"restaurant"})
+    assert denied.status_code==403
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    main._RATE_LIMITER = main.WindowRateLimiter()
+    yield
+    main._RATE_LIMITER = main.WindowRateLimiter()

@@ -67,6 +67,47 @@ def enforce_rate_limit(key: str, limit: int, seconds: int) -> None:
                             headers={"Retry-After": str(seconds)})
 
 
+SEGMENT_CATALOG = {
+    "retail": {"name": "Varejo geral", "questions": [
+        {"id":"barcode","label":"Utiliza leitura de código de barras?","type":"boolean"},
+        {"id":"multiple_branches","label":"Possui ou pretende operar várias filiais?","type":"boolean"}]},
+    "grocery": {"name": "Supermercados e mercearias", "questions": [
+        {"id":"barcode","label":"Utiliza leitores de código de barras?","type":"boolean"},
+        {"id":"weighed_items","label":"Vende produtos pesáveis?","type":"boolean"},
+        {"id":"perishables","label":"Controla validade ou produtos perecíveis?","type":"boolean"}]},
+    "restaurant": {"name": "Restaurantes e lanchonetes", "questions": [
+        {"id":"tables","label":"Trabalha com mesas?","type":"boolean"},
+        {"id":"tabs","label":"Utiliza comandas?","type":"boolean"},
+        {"id":"delivery","label":"Oferece delivery?","type":"boolean"},
+        {"id":"kitchen","label":"Possui cozinha ou área de preparo?","type":"boolean"}]},
+    "apparel": {"name": "Lojas de roupas e calçados", "questions": [
+        {"id":"sizes_colors","label":"Trabalha com tamanhos e cores?","type":"boolean"},
+        {"id":"returns","label":"Realiza trocas e devoluções?","type":"boolean"},
+        {"id":"commission","label":"Utiliza vendedores comissionados?","type":"boolean"}]},
+    "services": {"name": "Prestadores de serviços", "questions": [
+        {"id":"appointments","label":"Trabalha com agendamentos?","type":"boolean"},
+        {"id":"professionals","label":"Possui profissionais com agenda própria?","type":"boolean"}]},
+    "construction": {"name": "Materiais de construção", "questions": [
+        {"id":"measurement","label":"Vende por unidade, metragem ou medida?","type":"boolean"},
+        {"id":"delivery","label":"Organiza entregas de materiais?","type":"boolean"}]},
+}
+FEATURES = [
+    ("sales", "Vendas e PDV", "Operação universal de vendas e caixa", "core", ["*"], []),
+    ("inventory", "Estoque e movimentações", "Saldo com histórico auditável", "core", ["*"], []),
+    ("barcode", "Leitura de código de barras", "Busca de produtos por código; hardware requer validação", "operations", ["grocery","retail"], []),
+    ("weighed_items", "Produtos pesáveis", "Cadastro e venda por quantidade fracionada; balança não integrada", "operations", ["grocery"], []),
+    ("expiry_control", "Validade e perecíveis", "Estrutura inicial para controle de validade", "inventory", ["grocery"], ["inventory"]),
+    ("tables_tabs", "Mesas e comandas", "Organização de atendimento; fluxo operacional ainda não incluído", "restaurant", ["restaurant"], ["sales"]),
+    ("delivery", "Delivery e retirada", "Opção de atendimento; integração externa não configurada", "restaurant", ["restaurant"], ["sales"]),
+    ("kitchen", "Pedidos de preparo", "Preparação e cozinha; integração com impressoras pendente", "restaurant", ["restaurant"], ["sales"]),
+    ("variants", "Tamanhos e cores", "Variações de produto; cadastro especializado ainda não incluído", "catalog", ["apparel"], ["inventory"]),
+    ("returns", "Trocas e devoluções", "Regras de troca ainda dependem de implementação", "sales", ["apparel","retail"], ["sales"]),
+    ("commissions", "Comissões de vendedores", "Apuração ainda depende do módulo de vendas", "sales", ["apparel","services"], ["sales"]),
+    ("appointments", "Agendamentos", "Agenda especializada ainda não incluída", "services", ["services"], []),
+    ("measurement_sales", "Vendas por medida", "Unidades comerciais especializadas ainda dependem de regras", "catalog", ["construction"], ["inventory"]),
+    ("purchasing", "Compras e fornecedores", "Módulo ainda não implementado", "management", ["*"], ["inventory"]),
+]
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -174,6 +215,18 @@ def init_db() -> None:
             actor_id TEXT REFERENCES users(id), action TEXT NOT NULL, entity_type TEXT NOT NULL,
             entity_id TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS segment_catalog (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, questions_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS feature_catalog (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL,
+            recommended_segments_json TEXT NOT NULL, dependencies_json TEXT NOT NULL, available INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS company_profiles (
+            company_id TEXT PRIMARY KEY REFERENCES companies(id), primary_segment TEXT NOT NULL,
+            secondary_segments_json TEXT NOT NULL, answers_json TEXT NOT NULL, modules_json TEXT NOT NULL,
+            updated_by TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS products_company_active ON products(company_id, active, name);
         CREATE INDEX IF NOT EXISTS sales_company_created ON sales(company_id, created_at);
         CREATE INDEX IF NOT EXISTS audit_company_created ON audit_events(company_id, created_at);
@@ -182,6 +235,12 @@ def init_db() -> None:
         CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_events
             BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
         """)
+        for segment_id, segment in SEGMENT_CATALOG.items():
+            conn.execute("INSERT OR REPLACE INTO segment_catalog(id,name,questions_json,active) VALUES(?,?,?,1)",
+                         (segment_id, segment["name"], json.dumps(segment["questions"], ensure_ascii=False)))
+        for feature_id, name, description, category, recommended, dependencies in FEATURES:
+            conn.execute("INSERT OR REPLACE INTO feature_catalog(id,name,description,category,recommended_segments_json,dependencies_json,available) VALUES(?,?,?,?,?,?,1)",
+                         (feature_id, name, description, category, json.dumps(recommended), json.dumps(dependencies)))
     finally:
         conn.close()
 
@@ -312,6 +371,12 @@ class BootstrapIn(StrictModel):
         if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", value):
             raise ValueError("Use letras minúsculas, números e hífens no identificador")
         return value
+
+
+class CompanyProfileIn(StrictModel):
+    primary_segment: str = Field(min_length=2, max_length=40)
+    secondary_segments: list[str] = Field(default_factory=list, max_length=5)
+    answers: dict[str, bool] = Field(default_factory=dict)
 
 
 class LoginIn(StrictModel):
@@ -588,6 +653,58 @@ def login(data: LoginIn, request: Request, conn: DB):
     return {"access_token": create_token(row), "token_type": "bearer", "expires_in": TOKEN_TTL_SECONDS,
             "user": {"id": row["id"], "company_id": row["company_id"], "email": row["email"],
                      "name": row["full_name"], "role": row["role"]}}
+
+
+@app.get("/v1/configuration/catalog")
+def configuration_catalog(conn: DB, user: USER):
+    segments = conn.execute("SELECT * FROM segment_catalog WHERE active=1 ORDER BY name").fetchall()
+    features = conn.execute("SELECT * FROM feature_catalog WHERE available=1 ORDER BY category,name").fetchall()
+    profile = conn.execute("SELECT * FROM company_profiles WHERE company_id=?", (user["company_id"],)).fetchone()
+    return {"segments": [{"id":r["id"],"name":r["name"],"questions":json.loads(r["questions_json"])} for r in segments],
+            "features": [{"id":r["id"],"name":r["name"],"description":r["description"],"category":r["category"],
+                          "recommended_segments":json.loads(r["recommended_segments_json"]),"dependencies":json.loads(r["dependencies_json"]),
+                          "available":bool(r["available"])} for r in features],
+            "profile": ({"primary_segment":profile["primary_segment"],
+                         "secondary_segments":json.loads(profile["secondary_segments_json"]),
+                         "answers":json.loads(profile["answers_json"]),"modules":json.loads(profile["modules_json"]),
+                         "updated_at":profile["updated_at"]} if profile else None),
+            "plan_entitlements": "not_configured", "activation_note": "Módulos sugeridos não significam contratação nem ativação de recursos ainda não implementados."}
+
+
+@app.put("/v1/company/profile")
+def update_company_profile(data: CompanyProfileIn, conn: DB, user: USER):
+    require_role(user, "owner", "admin")
+    if data.primary_segment not in SEGMENT_CATALOG or any(x not in SEGMENT_CATALOG for x in data.secondary_segments):
+        raise HTTPException(422, "Selecione segmentos disponíveis no catálogo.")
+    segments = list(dict.fromkeys([data.primary_segment, *data.secondary_segments]))
+    question_ids = {q["id"] for seg in segments for q in SEGMENT_CATALOG[seg]["questions"]}
+    if set(data.answers) - question_ids:
+        raise HTTPException(422, "As respostas incluem campos que não pertencem aos segmentos selecionados.")
+    modules = {"sales", "inventory"}
+    if any(data.answers.get(k,False) for k in ("barcode","weighed_items")): modules.add("barcode" if data.answers.get("barcode") else "weighed_items")
+    if data.answers.get("perishables"): modules.add("expiry_control")
+    if any(data.answers.get(k,False) for k in ("tables","tabs")): modules.add("tables_tabs")
+    if data.answers.get("delivery"): modules.add("delivery")
+    if data.answers.get("kitchen"): modules.add("kitchen")
+    if data.answers.get("sizes_colors"): modules.add("variants")
+    if data.answers.get("returns"): modules.add("returns")
+    if data.answers.get("commission"): modules.add("commissions")
+    if data.answers.get("appointments"): modules.add("appointments")
+    if data.answers.get("measurement"): modules.add("measurement_sales")
+    modules = sorted(modules)
+    updated = now_iso()
+    with transaction(conn):
+        conn.execute("""INSERT INTO company_profiles(company_id,primary_segment,secondary_segments_json,answers_json,modules_json,updated_by,updated_at)
+            VALUES(?,?,?,?,?,?,?) ON CONFLICT(company_id) DO UPDATE SET primary_segment=excluded.primary_segment,
+            secondary_segments_json=excluded.secondary_segments_json,answers_json=excluded.answers_json,
+            modules_json=excluded.modules_json,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
+            (user["company_id"],data.primary_segment,json.dumps(list(dict.fromkeys(data.secondary_segments))),
+             json.dumps(data.answers,sort_keys=True),json.dumps(modules),user["id"],updated))
+        audit(conn,user["company_id"],user["id"],"company.profile_configured","company_profile",user["company_id"],
+              {"primary_segment":data.primary_segment,"secondary_segments":list(dict.fromkeys(data.secondary_segments)),"modules":modules})
+    return {"primary_segment":data.primary_segment,"secondary_segments":list(dict.fromkeys(data.secondary_segments)),
+            "answers":data.answers,"modules":modules,"updated_at":updated,
+            "status":"suggested","notice":"Esta configuração é auditável, mas não habilita funções ainda não implementadas nem comprova contratação de plano."}
 
 
 @app.get("/v1/me")

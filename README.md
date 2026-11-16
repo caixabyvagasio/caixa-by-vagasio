@@ -17,3 +17,6 @@ Consulte a [concepção funcional](docs/concepcao-funcional.md) e o [guia da V1]
 ## Antes de uso real
 
 Ainda é necessário escolher e aprovar infraestrutura com armazenamento durável e backups, endurecer rate limits fora do processo, executar análise independente de segurança, validar recuperação de acesso e LGPD, e homologar fiscal/pagamentos antes de anunciar esses meios. A publicação de demonstração não é autorização de cobrança nem homologação comercial.
+
+## Desenvolvimento da personalização
+A branch `development-v1` adiciona catálogo inicial de segmentos, questionários auditáveis e sugestões de módulos por empresa. O catálogo não representa ativação de capacidades ausentes. Consulte `docs/PLANO-EXECUCAO-V1.md` e `docs/STATUS-V1.md` para arquitetura, estado real e bloqueios. Não implantar em produção/homologação sem revisão; não inserir dados reais no Render Free.
