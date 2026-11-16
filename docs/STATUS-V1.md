@@ -69,3 +69,8 @@
 ## Correção após validação live
 - A validação com requests concorrentes detectou `sqlite3.ProgrammingError` na liberação de conexão entre threads FastAPI; configurada conexão por request para permitir uso sequencial pela thread de cleanup e adicionado teste. 38 testes locais passaram.
 - Corrigido também o título no topo para todas as telas incluídas. A correção está publicada no commit `9c85e7e`; health 200, interface `/` e relatório de vendas foram verificados após o deploy. O catálogo respondeu 500 de forma intermitente durante a validação; logs apontaram conexão SQLite encerrada de thread diferente. A revisão na correção live segue em andamento.
+
+## Exportação de relatório
+- Tela de relatório pode baixar CSV UTF-8 BOM, separado por ponto e vírgula, com linhas diárias/mensais e totais pagos/cancelados; exportação só fica habilitada depois de consulta bem-sucedida.
+- Pós-correção live: /health 200 repetido; acessos autenticados de demonstração a `/v1/products?limit=200` retornaram 200, sem novos traces de erro na janela consultada. A UI de relatório foi verificada por navegador.
+- Testes locais após CSV: 38 aprovados; CI/deploy desta pequena atualização pendentes.
