@@ -614,6 +614,9 @@ class BootstrapIn(StrictModel):
     owner_name: str = Field(min_length=2, max_length=120)
     email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=12, max_length=200)
+    primary_segment: str | None = Field(default=None, min_length=2, max_length=40)
+    secondary_segments: list[str] = Field(default_factory=list, max_length=5)
+    answers: dict[str, bool] = Field(default_factory=dict)
 
     @field_validator("email")
     @classmethod
@@ -979,12 +982,56 @@ def demo_login(conn: DB):
                      "name": row["full_name"], "role": row["role"]}, "demo": True}
 
 
+def resolve_profile_modules(answers: dict[str, bool]) -> list[str]:
+    # Persist recommendations/profile flags only. Feature availability is separate.
+    modules = {"sales", "inventory"}
+    if answers.get("barcode"): modules.add("barcode")
+    if answers.get("weighed_items"): modules.add("weighed_items")
+    if answers.get("perishables"): modules.add("expiry_control")
+    if any(answers.get(k, False) for k in ("tables", "tabs")): modules.add("tables_tabs")
+    if answers.get("delivery"): modules.add("delivery")
+    if answers.get("kitchen"): modules.add("kitchen")
+    if answers.get("sizes_colors"): modules.add("variants")
+    if answers.get("returns"): modules.add("returns")
+    if answers.get("commission"): modules.add("commissions")
+    if answers.get("appointments"): modules.add("appointments")
+    if answers.get("measurement"): modules.add("measurement_sales")
+    return sorted(modules)
+
+
+def validate_initial_profile(data: BootstrapIn, *, required: bool = False):
+    if data.primary_segment is None:
+        if required or data.secondary_segments or data.answers:
+            raise HTTPException(422, "Selecione a atividade principal antes de responder às perguntas.")
+        return None  # Existing administrative/bootstrap clients remain compatible.
+    if data.primary_segment not in SEGMENT_CATALOG or any(x not in SEGMENT_CATALOG for x in data.secondary_segments):
+        raise HTTPException(422, "Selecione atividades disponíveis.")
+    secondary = list(dict.fromkeys(data.secondary_segments))
+    if data.primary_segment in secondary:
+        raise HTTPException(422, "A atividade principal não precisa ser repetida nas atividades secundárias.")
+    allowed = {q["id"] for segment_id in [data.primary_segment, *secondary]
+               for q in SEGMENT_CATALOG[segment_id]["questions"]}
+    if set(data.answers) - allowed:
+        raise HTTPException(422, "Revise as respostas para as atividades selecionadas.")
+    return {"primary_segment": data.primary_segment, "secondary_segments": secondary,
+            "answers": data.answers, "modules": resolve_profile_modules(data.answers)}
+
+
+@app.get("/v1/segments")
+def public_segments():
+    return {"items": [{"id": sid, "name": item["name"], "questions": item["questions"]}
+                      for sid, item in SEGMENT_CATALOG.items()]}
+
+
 @app.post("/v1/companies/register", status_code=201)
 def register_company(data: BootstrapIn, request: Request, conn: DB):
     """Self-service tenant creation on the durable PostgreSQL backend only."""
     if DEMO_MODE or not POSTGRES_BACKEND or not PUBLIC_SIGNUP:
         # Never create persistent customer tenants from the shared public demo.
         raise HTTPException(404, "Cadastro público temporariamente indisponível.")
+    if data.primary_segment is None:
+        raise HTTPException(422, "Selecione a atividade principal da empresa.")
+    profile = validate_initial_profile(data, required=True)
     client_ip = request.client.host if request.client else "unknown"
     enforce_rate_limit(f"signup:{client_ip}", 3, 3600)
     company_id, user_id, created = new_id(), new_id(), now_iso()
@@ -996,6 +1043,17 @@ def register_company(data: BootstrapIn, request: Request, conn: DB):
                          (user_id, company_id, data.email, data.owner_name.strip(), password_hash(data.password), created))
             audit(conn, company_id, user_id, "company.self_registered", "company", company_id,
                   {"company_slug": data.company_slug, "actor_email": data.email})
+            if profile:
+                snapshot = {**profile}
+                conn.execute("INSERT INTO company_profile_versions VALUES(?,?,?,?,?)",
+                             (new_id(), company_id, json.dumps(snapshot, ensure_ascii=False, sort_keys=True), user_id, created))
+                conn.execute("""INSERT INTO company_profiles(company_id,primary_segment,secondary_segments_json,answers_json,modules_json,updated_by,updated_at)
+                    VALUES(?,?,?,?,?,?,?)""",
+                    (company_id, profile["primary_segment"], json.dumps(profile["secondary_segments"], ensure_ascii=False),
+                     json.dumps(profile["answers"], sort_keys=True), json.dumps(profile["modules"]), user_id, created))
+                audit(conn, company_id, user_id, "company.profile_configured", "company_profile", company_id,
+                      {"primary_segment": profile["primary_segment"], "secondary_segments": profile["secondary_segments"],
+                       "answers": profile["answers"], "modules": profile["modules"], "source": "signup"})
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Este identificador de empresa ou e-mail já está em uso.")
     return {"company_id": company_id, "status": "created",
@@ -1076,19 +1134,7 @@ def update_company_profile(data: CompanyProfileIn, conn: DB, user: USER):
     question_ids = {q["id"] for seg in segments for q in SEGMENT_CATALOG[seg]["questions"]}
     if set(data.answers) - question_ids:
         raise HTTPException(422, "As respostas incluem campos que não pertencem aos segmentos selecionados.")
-    modules = {"sales", "inventory"}
-    if data.answers.get("barcode"): modules.add("barcode")
-    if data.answers.get("weighed_items"): modules.add("weighed_items")
-    if data.answers.get("perishables"): modules.add("expiry_control")
-    if any(data.answers.get(k,False) for k in ("tables","tabs")): modules.add("tables_tabs")
-    if data.answers.get("delivery"): modules.add("delivery")
-    if data.answers.get("kitchen"): modules.add("kitchen")
-    if data.answers.get("sizes_colors"): modules.add("variants")
-    if data.answers.get("returns"): modules.add("returns")
-    if data.answers.get("commission"): modules.add("commissions")
-    if data.answers.get("appointments"): modules.add("appointments")
-    if data.answers.get("measurement"): modules.add("measurement_sales")
-    modules = sorted(modules)
+    modules = resolve_profile_modules(data.answers)
     updated = now_iso()
     with transaction(conn):
         snapshot = {"primary_segment":data.primary_segment,

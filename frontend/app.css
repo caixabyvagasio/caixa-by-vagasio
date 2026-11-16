@@ -46,3 +46,15 @@ input,select{transition:border-color .15s,box-shadow .15s}
 @media(max-width:620px){.content{padding-top:21px}.heading-row{align-items:flex-start}.heading-row h1{font-size:21px}.panel{padding:15px 13px}.steps{gap:6px}.step-link{font-size:10px}}
 
 @media(min-width:621px) and (max-width:980px){.app-shell{grid-template-columns:205px minmax(0,1fr)}.sidebar{align-items:stretch;padding:20px 12px}.sidebar .brand{padding:0 5px}.sidebar .brand-name{display:block}.company-badge{display:block;margin:-12px 2px 0}.nav-button{justify-content:flex-start;padding:10px 8px;font-size:11px}.nav-button span{font-size:15px}.sidebar-bottom{font-size:10px;text-align:left;padding:15px 7px}.logout{float:right;display:inline;margin:0;font-size:10px}.content{padding-left:20px;padding-right:20px}}
+.signup-step{display:flex;align-items:center;gap:11px;margin:12px 0 3px;padding:10px 0;border-top:1px solid var(--line)}
+.signup-step .step-number{width:27px;height:27px;border-radius:50%;display:grid;place-items:center;background:#f7e9ee;color:var(--wine);font-size:12px;font-weight:800;flex:none}
+.signup-step b,.signup-step small{display:block}.signup-step b{font-size:12px;color:var(--ink)}.signup-step small{font-size:10px;color:var(--muted);margin-top:2px}
+.signup-panel{max-height:min(82vh,850px);overflow:auto;padding-right:3px;scrollbar-width:thin}
+.signup-secondary{border:0;padding:0;margin:5px 0 0;min-width:0}.signup-secondary legend{font-size:11px;font-weight:650;color:#55484e;margin-bottom:8px}
+.signup-segment-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}
+.signup-secondary-item,.signup-question{display:flex!important;align-items:center;gap:8px!important;min-height:38px;margin:0!important;padding:8px 10px;border:1px solid var(--line);border-radius:9px;background:#fff;color:#51434a!important;font-size:10px!important;line-height:1.35;cursor:pointer}
+.signup-secondary-item input,.signup-question input{width:15px;height:15px;margin:0;accent-color:var(--wine);flex:none}
+.signup-secondary-item:has(input:checked),.signup-question:has(input:checked){background:#fcf5f8;border-color:#d9a9b8;color:var(--wine)!important}
+.signup-questions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px}
+.signup-form select{width:100%;height:41px;border:1px solid #e5dce0;border-radius:8px;padding:0 11px;color:var(--ink);background:#fff}
+@media(max-width:500px){.signup-segment-grid,.signup-questions{grid-template-columns:1fr}.signup-panel{max-height:80vh}}

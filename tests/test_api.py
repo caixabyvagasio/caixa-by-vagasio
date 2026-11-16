@@ -1,3 +1,4 @@
+from pathlib import Path
 import os
 import uuid
 import pytest
@@ -257,6 +258,39 @@ def test_demo_login_and_sample_catalog_are_available_only_when_enabled(tmp_path,
         assert result.json()["user"]["company_id"] == main.DEMO_COMPANY_ID
 
 
+def test_public_segments_catalog_is_available_without_tenant(world):
+    result=world.get('/v1/segments')
+    assert result.status_code==200
+    items=result.json()['items']
+    assert {x['id'] for x in items} >= {'retail','grocery','restaurant','apparel','services','construction'}
+    assert all('questions' in x and 'name' in x for x in items)
+
+
+def test_signup_requires_a_primary_segment():
+    from fastapi import HTTPException
+    payload=main.BootstrapIn(company_name='Empresa',company_slug='sem-segmento',owner_name='Teste',
+        email='sem-segmento@example.test',password='strong-test-password-123')
+    with pytest.raises(HTTPException) as result: main.validate_initial_profile(payload,required=True)
+    assert result.value.status_code==422
+
+
+def test_signup_rejects_answers_outside_selected_segments():
+    from fastapi import HTTPException
+    payload=main.BootstrapIn(company_name='Inválida',company_slug='signup-invalido',owner_name='Teste',
+        email='invalid@example.test',password='strong-test-password-123',primary_segment='restaurant',
+        answers={'sizes_colors':True})
+    with pytest.raises(HTTPException) as result: main.validate_initial_profile(payload)
+    assert result.value.status_code==422
+
+
+def test_signup_requires_primary_segment_in_ui_contract():
+    # API remains backward-compatible with administrative clients, while the public form marks it required.
+    html=(Path(main._FRONTEND)/'index.html').read_text()
+    assert 'name="primary_segment" id="signupPrimarySegment" required' in html
+    assert 'id="signupSecondarySegments"' in html
+    assert 'id="signupSegmentQuestions"' in html
+
+
 def test_public_company_signup_is_opt_in(world):
     payload = {"company_name":"Nova Empresa","company_slug":"nova-empresa","owner_name":"Pessoa Teste",
                "email":"novo@example.test","password":"strong-test-password-123"}
@@ -274,7 +308,9 @@ def test_public_signup_creates_isolated_owner_when_enabled(tmp_path, monkeypatch
     monkeypatch.setattr(main, "PUBLIC_SIGNUP", True)
     with TestClient(main.app) as client:
         payload = {"company_name":"Nova Empresa","company_slug":"Nova-Empresa","owner_name":"Pessoa Teste",
-                   "email":"NOVO@EXAMPLE.TEST","password":"strong-test-password-123"}
+                   "email":"NOVO@EXAMPLE.TEST","password":"strong-test-password-123",
+                   "primary_segment":"restaurant","secondary_segments":["grocery"],
+                   "answers":{"tables":True,"delivery":True,"barcode":True,"weighed_items":True}}
         result = client.post("/v1/companies/register", json=payload)
         assert result.status_code == 201, result.text
         assert client.post("/v1/companies/register", json=payload).status_code == 409
@@ -284,6 +320,13 @@ def test_public_signup_creates_isolated_owner_when_enabled(tmp_path, monkeypatch
         token = login.json()["access_token"]
         assert client.get("/v1/me", headers=auth(token)).json()["name"] == "Pessoa Teste"
         assert client.get("/v1/products", headers=auth(token)).json()["items"] == []
+        profile=client.get('/v1/configuration/catalog',headers=auth(token)).json()['profile']
+        assert profile['primary_segment']=='restaurant'
+        assert profile['secondary_segments']==['grocery']
+        assert profile['answers']==payload['answers']
+        assert set(profile['modules'])=={'sales','inventory','tables_tabs','delivery','barcode','weighed_items'}
+        history=client.get('/v1/company/profile/history',headers=auth(token)).json()['items']
+        assert len(history)==1 and history[0]['profile']['primary_segment']=='restaurant'
 
 
 def test_login_rate_limits_repeated_wrong_passwords(world, monkeypatch):
