@@ -8,11 +8,11 @@ Data: 2026-11-16. Branch `development-v1`; base do ciclo `ff72d7a2a3606eec2cdcd1
 - Commit de hardening `cc9266726412e5db42b14347d33c5a7c569b64c6` na branch de desenvolvimento; CI run `43913857996` success. Cadastro público de empresa é bloqueado durante modo demo mesmo se signup estiver configurado como true. Os endpoints de clientes agora têm RBAC e minimizam o retorno do operador; somente owner/admin/manager veem PII/histórico; operador vê nomes para lookup PDV e só pode cadastrar nome; estoque sem leitura de clientes.
 - Suíte sobre esse estado: 41 passed, 1 warning depreciação TestClient/httpx.
 - Na revisão aprofundada foi visto que papel `stock` podia editar preço e custo via PUT/POST de produtos. Corrigido no worktree seguinte: somente owner/admin/manager podem criar/editar produto; adicionado teste negativo.
-- Suíte do worktree após esse ajuste adicional: 42 passed, 1 warning.
+- Suíte do worktree após esse ajuste adicional: 42 passed, 1 warning. Commit `292e336139e358b9b9e7c3652293a7a63a1bdcdd` pushed à branch dev; CI run `43914431760` success.
 
 ## Estado Git/deploy
 - O commit `cc92667` já foi pushed para `development-v1`, CI success; **não foi deployed**. O serviço público permanece com HEAD `ff72d7a` e autodeploy off, em respeito à instrução de não publicar sem autorização.
-- O bloqueio do signup durante demo e PII endpoints estão no commit acima. Restrição de editar preço/custo para estoque é alteração local ainda sem commit; precisa commit + CI. Não publicar sem autorização.
+- O bloqueio do signup durante demo e PII endpoints estão no commit acima. Restrição de editar preço/custo para estoque foi commitada em `292e336`; CI `43914431760` passou. Nenhuma das duas correções foi publicada no serviço. Não publicar sem autorização.
 - O sistema segue Render Free + SQLite `/tmp`, demo pública compartilhada, sem backup durável; não é para dados reais.
 
 ## Próximas tarefas
