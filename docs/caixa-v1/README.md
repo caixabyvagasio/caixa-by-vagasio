@@ -1,26 +1,27 @@
-# Caixa by VagasIO — base funcional V1
+# Caixa by VagasIO — V1 de varejo geral
 
-Esta versão concentra a primeira etapa de varejo geral em ambiente de desenvolvimento e demonstração.
+## Funcionalidades
 
-## Implementado
+- API FastAPI e interface web adaptável.
+- Provisionamento protegido; senhas com PBKDF2 e sessões assinadas.
+- Isolamento por empresa, perfis e autorização server-side.
+- Produtos, estoque e movimentos com justificativa e trilha de auditoria.
+- Abertura/suprimento/sangria/fechamento de caixa; venda em dinheiro, cálculo de troco e idempotência.
+- Demonstração pública explicitamente fictícia e compartilhada.
+- Branch `production-foundation` contém formulário de criação de empresa self-service (desligado por padrão) e limite inicial de tentativas de login/bootstrap/cadastro.
 
-- API FastAPI e interface web responsiva.
-- Provisionamento inicial protegido por chave bootstrap; credenciais com PBKDF2 e sessão Bearer assinada.
-- Isolamento por empresa, gerenciamento de usuários e autorização server-side.
-- Produtos, saldo e movimentos de estoque justificados e auditáveis.
-- Abertura, suprimento, sangria, venda em dinheiro, fechamento e conciliação do caixa.
-- Idempotência na venda para evitar duplicidade.
-- Demonstração opt-in com tenant e catálogo inteiramente fictícios. O login demo é compartilhado e não deve conter informação real.
-- Testes automatizados para fluxos principais e fronteiras multiempresa.
+## Situação de publicação
 
-## Limitações
+O serviço público de avaliação funciona em Render Free com SQLite no filesystem efêmero. Não é produção, não garante persistência, backup, disponibilidade ou sigilo dos registros de demonstração. Não cadastrar dados pessoais, preços, estoque, clientes ou dinheiro reais. Não existe integração Pix/cartão, fiscal, periféricos, multifilial ou modo offline.
 
-O serviço hospedado é uma demonstração pública no plano gratuito, com SQLite em filesystem efêmero. Pode adormecer, reiniciar ou perder dados a qualquer momento. Não há persistência, backup, recuperação, suporte de produção ou garantia de disponibilidade. Não usar para atividade comercial nem inserir dados pessoais/reais.
+A branch `production-foundation` é trabalho não implantado. Cadastro está desligado (`CAIXA_PUBLIC_SIGNUP=false`). O limitador atual é por processo e apenas defesa adicional; não substitui rate limiting de borda.
 
-Ainda não existem pagamentos eletrônicos/Pix, emissão fiscal, periféricos, multifilial, cadastro empresarial/CNPJ, assistente de implantação, planos/módulos comerciais, devolução, compras/fornecedores ou operação offline. A demonstração é compartilhada; qualquer visitante pode alterar os dados fictícios e esses dados podem sumir.
+## Preparar para produção
 
-## Rodar localmente
+1. Aprovar orçamento de serviço e banco persistente, com preço confirmado no painel antes de criar.
+2. Migrar e testar PostgreSQL com transações, migrações e restauração de backup; desativar demo pública.
+3. Configurar limite de requisições compartilhado e monitoramento, rotinas de backup/restore, política de sessão e recuperação do titular.
+4. Revisar LGPD, segurança, suporte e regras comerciais; testar isolamento e concorrência.
+5. Só então criar novo ambiente de produção com segredos novos e domínio escolhido.
 
-Python 3.11+, `pip install -r requirements.txt`, variáveis locais fortes `CAIXA_TOKEN_SECRET`, `CAIXA_BOOTSTRAP_SECRET`; execute `uvicorn app.main:app --host 127.0.0.1 --port 8000`. Para os testes: `PYTHONPATH=. pytest -q`.
-
-`CAIXA_DEMO_MODE=true` habilita a conta fictícia; mantenha-o desligado em qualquer ambiente que use dados de clientes.
+Não use este release para operação comercial real.

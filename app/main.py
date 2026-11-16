@@ -10,6 +10,8 @@ import secrets
 import sqlite3
 import time
 import uuid
+import threading
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -31,7 +33,38 @@ DEMO_MODE = os.environ.get("CAIXA_DEMO_MODE", "").strip().lower() == "true"
 DEMO_COMPANY_ID = "00000000-0000-4000-8000-000000000001"
 DEMO_OWNER_ID = "00000000-0000-4000-8000-000000000002"
 TOKEN_TTL_SECONDS = int(os.environ.get("CAIXA_TOKEN_TTL_SECONDS", "28800"))
+PUBLIC_SIGNUP = os.environ.get("CAIXA_PUBLIC_SIGNUP", "false").strip().lower() == "true"
 ROLES = {"owner", "admin", "manager", "operator", "stock"}
+
+
+class WindowRateLimiter:
+    """Small process-local abuse guard; production must also rate-limit at the edge."""
+    def __init__(self):
+        self._events = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, limit: int, seconds: int) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            events = self._events[key]
+            while events and events[0] <= now - seconds:
+                events.popleft()
+            if len(events) >= limit:
+                return False
+            events.append(now)
+            if len(self._events) > 20_000:
+                for k in [k for k,v in self._events.items() if not v or v[-1] <= now - 3600][:5000]:
+                    self._events.pop(k, None)
+            return True
+
+
+_RATE_LIMITER = WindowRateLimiter()
+
+
+def enforce_rate_limit(key: str, limit: int, seconds: int) -> None:
+    if not _RATE_LIMITER.allow(key, limit, seconds):
+        raise HTTPException(429, "Muitas tentativas. Aguarde um pouco e tente novamente.",
+                            headers={"Retry-After": str(seconds)})
 
 
 def now_iso() -> str:
@@ -494,9 +527,33 @@ def demo_login(conn: DB):
                      "name": row["full_name"], "role": row["role"]}, "demo": True}
 
 
+@app.post("/v1/companies/register", status_code=201)
+def register_company(data: BootstrapIn, request: Request, conn: DB):
+    """Self-service tenant creation, disabled until the operator explicitly enables it."""
+    if not PUBLIC_SIGNUP:
+        raise HTTPException(404, "Cadastro público temporariamente indisponível.")
+    client_ip = request.client.host if request.client else "unknown"
+    enforce_rate_limit(f"signup:{client_ip}", 3, 3600)
+    company_id, user_id, created = new_id(), new_id(), now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO companies VALUES(?,?,?,'active',?)",
+                         (company_id, data.company_name.strip(), data.company_slug, created))
+            conn.execute("INSERT INTO users VALUES(?,?,?,?,?,'owner',1,?)",
+                         (user_id, company_id, data.email, data.owner_name.strip(), password_hash(data.password), created))
+            audit(conn, company_id, user_id, "company.self_registered", "company", company_id,
+                  {"company_slug": data.company_slug, "actor_email": data.email})
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Este identificador de empresa ou e-mail já está em uso.")
+    return {"company_id": company_id, "status": "created",
+            "message": "Empresa criada. Entre com o identificador, e-mail e senha cadastrados."}
+
+
 @app.post("/v1/bootstrap", status_code=201)
 def bootstrap(data: BootstrapIn, request: Request, conn: DB,
               bootstrap_key: Annotated[str | None, Header(alias="X-Bootstrap-Key")] = None):
+    client_ip = request.client.host if request.client else "unknown"
+    enforce_rate_limit(f"bootstrap:{client_ip}", 10, 3600)
     if not BOOTSTRAP_SECRET:
         raise HTTPException(503, "Provisionamento desabilitado: configure a chave de bootstrap fora do código.")
     if not bootstrap_key or not hmac.compare_digest(bootstrap_key, BOOTSTRAP_SECRET):
@@ -516,9 +573,16 @@ def bootstrap(data: BootstrapIn, request: Request, conn: DB,
 
 
 @app.post("/v1/auth/login")
-def login(data: LoginIn, conn: DB):
+def login(data: LoginIn, request: Request, conn: DB):
+    email = data.email.strip().lower()
+    client_ip = request.client.host if request.client else "unknown"
+    enforce_rate_limit(f"login-ip:{client_ip}", 30, 900)
+    enforce_rate_limit(f"login-account:{data.company_slug}:{email}", 8, 900)
     row = conn.execute("""SELECT u.*,c.status AS company_status FROM users u JOIN companies c ON c.id=u.company_id
-        WHERE c.slug=? AND u.email=?""", (data.company_slug, data.email.strip().lower())).fetchone()
+        WHERE c.slug=? AND u.email=?""", (data.company_slug, email)).fetchone()
+    if not row:
+        # Reduce timing differences that could reveal whether a tenant/account exists.
+        password_matches(data.password, "pbkdf2_sha256$310000$Zml4ZWQtc2FsdA$ZJrv7qPNcYq3Ng8VDJXh8f7JXlHQE0jQhF6Y7joZaZg")
     if not row or not password_matches(data.password, row["password_hash"]) or not row["active"] or row["company_status"] != "active":
         raise HTTPException(401, "Empresa, e-mail ou senha inválidos.")
     return {"access_token": create_token(row), "token_type": "bearer", "expires_in": TOKEN_TTL_SECONDS,

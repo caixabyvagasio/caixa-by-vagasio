@@ -2,24 +2,18 @@
 
 Repositório do Caixa by VagasIO, plataforma multissegmento de gestão comercial e PDV. A primeira versão prioriza varejo geral.
 
-## Ambiente publicado
+## Versão publicada para avaliação
 
-A demonstração está em https://caixa-by-vagasio-dev.onrender.com/. Entre pelo botão **Acessar demonstração fictícia**. É uma conta compartilhada com catálogo demonstrativo; os dados podem ser apagados ou modificados por outros visitantes.
+A demonstração está em https://caixa-by-vagasio-dev.onrender.com/. Use **Acessar demonstração fictícia**. A conta de demonstração é compartilhada; dados são inventados, podem ser alterados por visitantes e desaparecer.
 
-**Não use dados reais nem para operação comercial.** É uma versão inicial de avaliação: usa SQLite em armazenamento efêmero, sem garantia de persistência, backups ou suporte de produção; não há Pix/cartão, integração fiscal, recuperação de acesso, multifilial nem operação offline. O serviço gratuito pode adormecer ou reiniciar.
+**Não use dados reais nem para operação comercial.** O serviço público de avaliação usa plano gratuito e SQLite em armazenamento efêmero: cadastros podem se perder quando o serviço reiniciar, dormir ou for implantado. Sem backups, alta disponibilidade, pagamentos eletrônicos, emissão fiscal ou operação offline.
 
-## V1 implementada
+## V1 funcional desenvolvida
 
-API FastAPI e interface web; login/isolamento de empresa, perfis e permissões server-side, produtos, movimentos de estoque auditáveis, caixa e venda em dinheiro com troco e idempotência. A demonstração usa empresa e catálogo fictícios e não cria contas de clientes.
+API FastAPI e interface web; usuários e permissões por empresa, produtos, estoque com auditoria, caixa e venda em dinheiro com troco/idempotência. Cadastro self-service e proteção inicial contra tentativas repetidas estão em `production-foundation`, mas o cadastro fica desabilitado por padrão e essa branch não foi implantada.
 
-Consulte a [concepção funcional](docs/concepcao-funcional.md) e [detalhes e próximos marcos](docs/caixa-v1/README.md).
+Consulte a [concepção funcional](docs/concepcao-funcional.md) e o [guia da V1](docs/caixa-v1/README.md).
 
-## Desenvolvimento e testes
+## Antes de uso real
 
-Requer Python 3.11+. Instale `requirements.txt`, configure `CAIXA_TOKEN_SECRET` e `CAIXA_BOOTSTRAP_SECRET` fortes (cada um com pelo menos 32 bytes) e execute `uvicorn app.main:app --host 127.0.0.1 --port 8000`. Testes: `PYTHONPATH=. pytest -q`.
-
-`CAIXA_DEMO_MODE` é opt-in e deve ser habilitado apenas em ambiente isolado de demonstração. Nunca grave segredos no repositório.
-
-## Antes de uma versão comercial
-
-Substituir SQLite por PostgreSQL e confirmar custos/consentimento; backups e restauração; rate limits e revisão de segurança; migrações; monitoramento; recuperação de acesso; política de privacidade e fluxos de consentimento; testes de carga, autorização e isolamento; homologação de pagamentos e fiscal antes de anunciar essas integrações. Nenhum dado comercial deve ser inserido na demonstração pública.
+Ainda é necessário escolher e aprovar infraestrutura com armazenamento durável e backups, endurecer rate limits fora do processo, executar análise independente de segurança, validar recuperação de acesso e LGPD, e homologar fiscal/pagamentos antes de anunciar esses meios. A publicação de demonstração não é autorização de cobrança nem homologação comercial.

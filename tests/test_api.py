@@ -171,3 +171,38 @@ def test_demo_login_and_sample_catalog_are_available_only_when_enabled(tmp_path,
             "Água mineral 500 ml", "Café torrado 250 g", "Detergente neutro 500 ml"
         }
         assert result.json()["user"]["company_id"] == main.DEMO_COMPANY_ID
+
+
+def test_public_company_signup_is_opt_in(world):
+    payload = {"company_name":"Nova Empresa","company_slug":"nova-empresa","owner_name":"Pessoa Teste",
+               "email":"novo@example.test","password":"strong-test-password-123"}
+    assert world.post("/v1/companies/register", json=payload).status_code == 404
+
+
+def test_public_signup_creates_isolated_owner_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "signup.sqlite3"))
+    monkeypatch.setattr(main, "TOKEN_SECRET", "test-only-token-secret-with-entropy-123456789")
+    monkeypatch.setattr(main, "BOOTSTRAP_SECRET", "test-only-provisioning-secret-123456")
+    monkeypatch.setattr(main, "PUBLIC_SIGNUP", True)
+    with TestClient(main.app) as client:
+        payload = {"company_name":"Nova Empresa","company_slug":"Nova-Empresa","owner_name":"Pessoa Teste",
+                   "email":"NOVO@EXAMPLE.TEST","password":"strong-test-password-123"}
+        result = client.post("/v1/companies/register", json=payload)
+        assert result.status_code == 201, result.text
+        assert client.post("/v1/companies/register", json=payload).status_code == 409
+        login = client.post("/v1/auth/login", json={"company_slug":"nova-empresa","email":"novo@example.test",
+                                                       "password":"strong-test-password-123"})
+        assert login.status_code == 200
+        token = login.json()["access_token"]
+        assert client.get("/v1/me", headers=auth(token)).json()["name"] == "Pessoa Teste"
+        assert client.get("/v1/products", headers=auth(token)).json()["items"] == []
+
+
+def test_login_rate_limits_repeated_wrong_passwords(world, monkeypatch):
+    company(world, "Rate Test", "rate-test", "rate@example.test")
+    # Isolate this test from earlier requests made from the same test-client IP.
+    monkeypatch.setattr(main, "_RATE_LIMITER", main.WindowRateLimiter())
+    payload={"company_slug":"rate-test","email":"rate@example.test","password":"wrong"}
+    statuses=[world.post("/v1/auth/login", json=payload).status_code for _ in range(9)]
+    assert statuses[:8] == [401] * 8
+    assert statuses[8] == 429
