@@ -159,3 +159,8 @@
 ## Logos oficiais enviados pelo titular — 17/11/2026
 - Recebidas quatro variações da marca Caixa by VAGASIO em transparência/escuro/claro. Foram preservados os desenhos originais: logo branco/rosa em landing e sidebar escuros, logo vinho/rosa em cartão claro de login e símbolo recortado do original no preview; favicon PNG é recorte do símbolo, não redesenho. Arquivos em `frontend/assets/caixa-logo-branca-rosa.png`, `caixa-logo-vinho-rosa.png`, `caixa-simbolo-branco-rosa.png` e `frontend/favicon.png`.
 - CSS e cache-busting foram atualizados; teste exige arquivos, referências e alt acessível. Validações locais: 6 testes de segurança visual passam, IDs únicos, 24 formulários balanceados, refs existentes e parser JavaScript sem erro. Aguardando CI e deploy para verificar as logos servidas no site.
+
+
+## Ajuste de navegação após retorno visual — 17/11/2026
+- Seguindo a captura enviada pelo titular, removidos os pictogramas ambíguos de todos os 13 itens do menu lateral da aplicação; mantidos os rótulos textuais e os mesmos botões/atributos de navegação. Removidos também os pictogramas inventados da prévia ilustrativa da landing.
+- CSS elimina o espaço reservado ao ícone e testes verificam os 13 nomes e a ausência dos spans pictográficos no menu. Nada foi alterado nos fluxos ou ações das páginas.
