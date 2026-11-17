@@ -399,6 +399,33 @@ def apply_schema_migrations(conn) -> None:
             register_id TEXT NOT NULL REFERENCES branch_cash_registers(id),actor_id TEXT NOT NULL REFERENCES users(id),
             kind TEXT NOT NULL CHECK(kind IN ('supply','withdrawal')),amount_cents INTEGER NOT NULL,reason TEXT NOT NULL,created_at TEXT NOT NULL)""")
     migration(9,"branch_scoped_cash_registers",create_branch_cash_ledger)
+    def index_branch_purchases():
+        conn.execute("CREATE INDEX IF NOT EXISTS purchase_orders_branch_company_date ON purchase_orders(company_id,branch_id,created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS purchase_receipts_branch_company_date ON purchase_receipts(company_id,branch_id,received_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS payables_branch_company_due ON accounts_payable(company_id,branch_id,status,due_date)")
+    migration(10,"branch_purchase_scope_indexes",index_branch_purchases)
+    def allow_branch_sale_reversals():
+        if is_postgres(conn):
+            constraints=conn.execute("SELECT conname FROM pg_constraint WHERE conrelid='branch_stock_events'::regclass AND contype='c' AND pg_get_constraintdef(oid) ILIKE '%kind%'").fetchall()
+            for row in constraints:
+                name=row[0]
+                conn.execute(f'ALTER TABLE branch_stock_events DROP CONSTRAINT "{name.replace(chr(34),chr(34)*2)}"')
+            conn.execute("ALTER TABLE branch_stock_events ADD CONSTRAINT branch_stock_events_kind_allowed CHECK(kind IN ('adjustment_in','adjustment_out','transfer_in','transfer_out','sale','reversal'))")
+        else:
+            # SQLite cannot alter CHECK; replace the append-only event table without
+            # changing any historical rows and restore its lookup index.
+            conn.execute("DROP INDEX IF EXISTS branch_stock_events_lookup")
+            conn.execute("ALTER TABLE branch_stock_events RENAME TO branch_stock_events_old")
+            conn.execute("""CREATE TABLE branch_stock_events(
+                id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
+                product_id TEXT NOT NULL REFERENCES products(id),actor_id TEXT NOT NULL REFERENCES users(id),
+                kind TEXT NOT NULL CHECK(kind IN ('adjustment_in','adjustment_out','transfer_in','transfer_out','sale','reversal')),
+                quantity_milli INTEGER NOT NULL,before_milli INTEGER NOT NULL,after_milli INTEGER NOT NULL,
+                reason TEXT NOT NULL,transfer_id TEXT,created_at TEXT NOT NULL)""")
+            conn.execute("INSERT INTO branch_stock_events SELECT * FROM branch_stock_events_old")
+            conn.execute("DROP TABLE branch_stock_events_old")
+            conn.execute("CREATE INDEX branch_stock_events_lookup ON branch_stock_events(company_id,branch_id,product_id,created_at)")
+    migration(11,"branch_stock_sale_reversal_event_kinds",allow_branch_sale_reversals)
 
 
 def init_db() -> None:
@@ -1260,6 +1287,10 @@ def permission_for_endpoint(method: str, path: str):
         return "branches.manage" if "/users" in path or method!="GET" else "branch.read"
     if path=="/v1/branches/stock-transfers": return "stock.adjust"
     if path.startswith("/v1/branches/") and "/registers" in path: return "cash.manage"
+    if path.startswith("/v1/branches/") and "/purchase-orders" in path: return "purchases.manage"
+    if path.startswith("/v1/branches/") and "/payables" in path: return "finance.write" if method not in {"GET","HEAD"} else "finance.read"
+    if path.startswith("/v1/branches/") and "/finance" in path: return "finance.write" if method not in {"GET","HEAD"} else "finance.read"
+    if path.startswith("/v1/branches/") and ("/dashboard/" in path or "/reports/" in path): return "reports.read"
     if path.startswith("/v1/branches/") and "/sales" in path: return "sales.void" if path.endswith("/void") else "sales.read" if method=="GET" else "sales.create"
     if path.startswith("/v1/branches/"):
         return "stock.adjust" if method!="GET" else "inventory.read"
@@ -1321,10 +1352,12 @@ async def granular_permission_guard(request: Request, call_next):
                         if requested_branch:
                             authorized=conn.execute("SELECT 1 FROM branch_users bu JOIN branches b ON b.id=bu.branch_id AND b.company_id=bu.company_id WHERE bu.company_id=? AND bu.user_id=? AND bu.branch_id=? AND b.status='active'",(company_user["company_id"],company_user["id"],requested_branch)).fetchone()
                             if not authorized: raise HTTPException(403,"Filial inexistente ou não autorizada para este usuário.")
-                            if len(active_branches)>1 and not request.url.path.startswith("/v1/branches/"):
+                            catalog_write=(request.url.path=="/v1/products" and request.method=="POST") or (request.url.path.startswith("/v1/products/") and request.method=="PUT" and "stock-adjustments" not in request.url.path) or (request.url.path in {"/v1/suppliers","/v1/customers"} and request.method=="POST")
+                            shared_read=request.method=="GET" and request.url.path in {"/v1/suppliers","/v1/customers"}
+                            if len(active_branches)>1 and not request.url.path.startswith("/v1/branches/") and not shared_read and not catalog_write:
                                 raise HTTPException(409,"Particionamento operacional por filial ainda não foi ativado; esta operação não altera nem filtra dados até os fluxos serem migrados.")
                             request.state.branch_id=requested_branch
-                        elif len(active_branches)>1 and not request.url.path.startswith("/v1/branches/") and request.url.path!="/v1/branches/stock-transfers":
+                        elif len(active_branches)>1 and not request.url.path.startswith("/v1/branches/") and not (request.method=="GET" and request.url.path in {"/v1/suppliers","/v1/customers"}) and not ((request.url.path in {"/v1/products","/v1/suppliers","/v1/customers"} and request.method=="POST") or (request.url.path.startswith("/v1/products/") and request.method=="PUT" and "stock-adjustments" not in request.url.path)):
                             raise HTTPException(409,"Operações multi-filial ainda não estão particionadas. Os dados históricos permanecem sem atribuição e nenhuma filial foi selecionada automaticamente.")
                         elif request.url.path.startswith("/v1/branches/"):
                             match=re.match(r"^/v1/branches/([^/]+)(?:/|$)",request.url.path)
@@ -1582,8 +1615,9 @@ def me(user: USER):
 
 @app.get("/v1/company/branches")
 def list_branches(conn: DB,user: USER):
-    rows=conn.execute("SELECT b.id,b.code,b.name,b.status FROM branches b JOIN branch_users bu ON bu.branch_id=b.id AND bu.company_id=b.company_id WHERE b.company_id=? AND bu.user_id=? ORDER BY b.created_at",(user["company_id"],user["id"])).fetchall()
-    return {"items":[dict(r) for r in rows],"operational_data_partitioning":"not_implemented"}
+    rows=conn.execute("SELECT b.id,b.code,b.name,b.status FROM branches b JOIN branch_users bu ON bu.branch_id=b.id AND bu.company_id=b.company_id WHERE b.company_id=? AND bu.user_id=? AND b.status='active' ORDER BY b.created_at",(user["company_id"],user["id"])).fetchall()
+    count=conn.execute("SELECT COUNT(*) FROM branches WHERE company_id=? AND status='active'",(user["company_id"],)).fetchone()[0]
+    return {"items":[dict(r) for r in rows],"multi_branch":count>1,"branch_count":count,"operational_data_partitioning":"partial"}
 
 @app.post("/v1/company/branches",status_code=201)
 def create_branch(data: BranchCreateIn,conn: DB,user: USER):
@@ -1666,7 +1700,8 @@ def close_branch_register(branch_id: str,register_id: str,data: BranchRegisterCl
         r=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(register_id,user["company_id"],branch_id)).fetchone()
         if not r:raise HTTPException(404,"Caixa aberto não encontrado nesta filial.")
         ev=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register_id)).fetchall()
-        expected=r["opening_cents"]+sum(x[0] for x in ev);counted=decimal_money_cents(data.counted_amount);now=now_iso()
+        sales_and_returns=conn.execute("SELECT amount_cents FROM branch_cash_movements WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register_id)).fetchall()
+        expected=r["opening_cents"]+sum(x[0] for x in ev)+sum(x[0] for x in sales_and_returns);counted=decimal_money_cents(data.counted_amount);now=now_iso()
         conn.execute("UPDATE branch_cash_registers SET status='closed',closed_by=?,closed_at=?,counted_cents=?,expected_cents=?,difference_cents=? WHERE id=? AND company_id=? AND branch_id=?",(user["id"],now,counted,expected,counted-expected,register_id,user["company_id"],branch_id))
         audit(conn,user["company_id"],user["id"],"branch_register.closed","branch_cash_register",register_id,{"branch_id":branch_id,"expected":cents_to_money(expected),"counted":cents_to_money(counted)})
     return {"id":register_id,"branch_id":branch_id,"status":"closed","expected_amount":cents_to_money(expected),"counted_amount":cents_to_money(counted),"difference":cents_to_money(counted-expected),"closed_at":now}
@@ -1722,6 +1757,61 @@ def require_branch_membership(conn,user,branch_id):
     if not member: raise HTTPException(403,"Usuário sem acesso a esta filial.")
     return branch
 
+@app.get("/v1/branches/{branch_id}/dashboard/summary")
+def branch_dashboard_summary(branch_id: str,conn: DB,user: USER):
+    require_permission(conn,user,"reports.read");require_branch_membership(conn,user,branch_id)
+    today=date.today().isoformat();row=conn.execute("SELECT COUNT(*) AS n,COALESCE(SUM(total_cents),0) AS cents FROM branch_sales WHERE company_id=? AND branch_id=? AND status='paid' AND substr(created_at,1,10)=?",(user["company_id"],branch_id,today)).fetchone()
+    count=conn.execute("SELECT COUNT(*) FROM products WHERE company_id=? AND active=1",(user["company_id"],)).fetchone()[0]
+    low=conn.execute("SELECT COUNT(*) FROM products p LEFT JOIN branch_product_stock b ON b.product_id=p.id AND b.company_id=p.company_id AND b.branch_id=? WHERE p.company_id=? AND p.active=1 AND COALESCE(b.quantity_milli,0)<=p.min_stock_milli",(branch_id,user["company_id"])).fetchone()[0]
+    register=conn.execute("SELECT id,label,opening_cents,opened_at FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1",(user["company_id"],branch_id)).fetchone()
+    expected=None
+    if register:
+        ev=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register["id"])).fetchall();sales=conn.execute("SELECT amount_cents FROM branch_cash_movements WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register["id"])).fetchall();expected=register["opening_cents"]+sum(x[0] for x in ev)+sum(x[0] for x in sales)
+    return {"branch_id":branch_id,"sales_today":row["n"],"revenue_today":cents_to_money(row["cents"]),"active_products":count,"low_stock_products":low,"register":{"id":register["id"],"label":register["label"],"opening_amount":cents_to_money(register["opening_cents"]),"expected_amount":cents_to_money(expected)} if register else None}
+
+@app.get("/v1/branches/{branch_id}/reports/inventory")
+def branch_inventory_report(branch_id: str,conn: DB,user: USER,limit: int=Query(default=500,ge=1,le=500),search: str=Query(default="",max_length=100)):
+    require_permission(conn,user,"reports.read");require_branch_membership(conn,user,branch_id)
+    term="%"+search.strip().replace("%","\%").replace("_","\_")+"%"
+    rows=conn.execute("SELECT p.sku,p.name,p.category,p.unit,p.cost_cents,p.price_cents,p.min_stock_milli,COALESCE(b.quantity_milli,0) AS q FROM products p LEFT JOIN branch_product_stock b ON b.company_id=p.company_id AND b.product_id=p.id AND b.branch_id=? WHERE p.company_id=? AND p.active=1 AND (p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\') ORDER BY p.name LIMIT ?",(branch_id,user["company_id"],term,term,limit)).fetchall()
+    items=[]
+    for r in rows:
+        q=int(r["q"]);cost=(q*r["cost_cents"]+500)//1000;retail=(q*r["price_cents"]+500)//1000
+        items.append({"sku":r["sku"],"name":r["name"],"category":r["category"],"unit":r["unit"],"stock":milli_to_decimal(q),"minimum_stock":milli_to_decimal(r["min_stock_milli"]),"unit_cost":cents_to_money(r["cost_cents"]),"cost_value":cents_to_money(cost),"unit_price":cents_to_money(r["price_cents"]),"retail_value":cents_to_money(retail),"low_stock":q<=r["min_stock_milli"]})
+    return {"branch_id":branch_id,"items":items,"total":len(items),"summary":{"product_count":len(items),"estimated_cost_value":cents_to_money(sum((int(r['q'])*int(r['cost_cents'])+500)//1000 for r in rows)),"estimated_retail_value":cents_to_money(sum((int(r['q'])*int(r['price_cents'])+500)//1000 for r in rows)),"low_stock_products":sum(1 for r in rows if int(r['q'])<=r['min_stock_milli'])},"note":"Relatório calculado somente sobre o ledger desta filial; estoque legado sem atribuição foi excluído."}
+
+@app.get("/v1/branches/{branch_id}/sales")
+def list_branch_sales(branch_id: str,conn: DB,user: USER,limit: int=Query(default=100,ge=1,le=200)):
+    require_permission(conn,user,"sales.read");require_branch_membership(conn,user,branch_id)
+    rows=conn.execute("SELECT * FROM branch_sales WHERE company_id=? AND branch_id=? ORDER BY created_at DESC LIMIT ?",(user["company_id"],branch_id,limit)).fetchall();items=[]
+    for r in rows:
+        lines=conn.execute("SELECT product_id,name,sku,quantity_milli,unit_price_cents,line_total_cents FROM branch_sale_items WHERE company_id=? AND branch_id=? AND sale_id=?",(user["company_id"],branch_id,r["id"])).fetchall()
+        items.append({"id":r["id"],"status":r["status"],"created_at":r["created_at"],"total":cents_to_money(r["total_cents"]),"change":cents_to_money(r["change_cents"]),"payment_method":"cash","items":[{"product_id":i["product_id"],"name":i["name"],"sku":i["sku"],"quantity":milli_to_decimal(i["quantity_milli"]),"line_total":cents_to_money(i["line_total_cents"])} for i in lines]})
+    return {"branch_id":branch_id,"items":items,"total":len(items)}
+
+@app.get("/v1/branches/{branch_id}/sales/report")
+def branch_sales_report(branch_id: str,start_date: date,end_date: date,group_by: str="day",conn: DB=None,user: USER=None):
+    require_permission(conn,user,"reports.read");require_branch_membership(conn,user,branch_id)
+    if end_date<start_date or (end_date-start_date).days>366:raise HTTPException(422,"Período inválido.")
+    if group_by not in {"day","week","month"}:raise HTTPException(422,"Agrupamento inválido.")
+    rows=conn.execute("SELECT status,total_cents,created_at FROM branch_sales WHERE company_id=? AND branch_id=? AND substr(created_at,1,10) BETWEEN ? AND ?",(user["company_id"],branch_id,start_date.isoformat(),end_date.isoformat())).fetchall();groups={}
+    for row in rows:
+        d=row["created_at"][:10]
+        key=d if group_by=="day" else d[:7] if group_by=="month" else date.fromisoformat(d).strftime("%G-W%V")
+        g=groups.setdefault(key,{"period":key,"sale_count":0,"paid_count":0,"voided_count":0,"gross_paid_cents":0,"voided_value_cents":0})
+        g["sale_count"]+=1
+        if row["status"]=="paid":g["paid_count"]+=1;g["gross_paid_cents"]+=row["total_cents"]
+        else:g["voided_count"]+=1;g["voided_value_cents"]+=row["total_cents"]
+    items=[{**g,"gross_paid":cents_to_money(g.pop("gross_paid_cents")),"voided_value":cents_to_money(g.pop("voided_value_cents"))} for _,g in sorted(groups.items())]
+    return {"branch_id":branch_id,"start_date":start_date.isoformat(),"end_date":end_date.isoformat(),"items":items,"totals":{"sale_count":sum(x["sale_count"] for x in items),"paid_count":sum(x["paid_count"] for x in items),"voided_count":sum(x["voided_count"] for x in items),"gross_paid":cents_to_money(sum(r["total_cents"] for r in rows if r["status"]=="paid")),"voided_value":cents_to_money(sum(r["total_cents"] for r in rows if r["status"]!="paid"))}}
+
+@app.get("/v1/branches/{branch_id}/products")
+def list_branch_products(branch_id: str,conn: DB,user: USER,search: str=Query(default="",max_length=100),limit: int=Query(default=200,ge=1,le=500)):
+    require_permission(conn,user,"products.read");require_branch_membership(conn,user,branch_id)
+    term="%"+search.strip().replace("%","\%").replace("_","\_")+"%"
+    rows=conn.execute("SELECT p.id,p.sku,p.name,p.unit,p.price_cents,p.cost_cents,p.category,p.barcode,p.min_stock_milli,COALESCE(bs.quantity_milli,0) AS branch_stock FROM products p LEFT JOIN branch_product_stock bs ON bs.company_id=p.company_id AND bs.product_id=p.id AND bs.branch_id=? WHERE p.company_id=? AND p.active=1 AND (p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR COALESCE(p.barcode,'') LIKE ? ESCAPE '\\') ORDER BY p.name LIMIT ?",(branch_id,user["company_id"],term,term,term,limit)).fetchall()
+    return {"branch_id":branch_id,"total":len(rows),"items":[{"id":r["id"],"sku":r["sku"],"name":r["name"],"unit":r["unit"],"price":cents_to_money(r["price_cents"]),"cost":cents_to_money(r["cost_cents"]),"category":r["category"],"barcode":r["barcode"],"minimum_stock":milli_to_decimal(r["min_stock_milli"]),"stock":milli_to_decimal(r["branch_stock"]),"active":True,"low_stock":int(r["branch_stock"])<=int(r["min_stock_milli"])} for r in rows]}
+
 @app.get("/v1/branches/{branch_id}/inventory")
 def list_branch_inventory(branch_id: str,conn: DB,user: USER,search: str=Query(default="",max_length=100)):
     require_permission(conn,user,"inventory.read");require_branch_membership(conn,user,branch_id)
@@ -1750,12 +1840,15 @@ def adjust_branch_stock(branch_id: str,product_id: str,data: StockAdjustmentIn,c
     return {"movement_id":movement_id,"branch_id":branch_id,"product_id":product_id,"before":milli_to_decimal(before),"after":milli_to_decimal(after)}
 
 @app.get("/v1/branches/{branch_id}/stock-movements")
-def list_branch_stock_events(branch_id: str,conn: DB,user: USER,product_id: str|None=None,limit: int=Query(default=100,ge=1,le=200)):
+def list_branch_stock_events(branch_id: str,conn: DB,user: USER,product_id: str|None=None,kind: str|None=None,limit: int=Query(default=100,ge=1,le=200)):
     require_permission(conn,user,"inventory.read");require_branch_membership(conn,user,branch_id)
-    clauses=["company_id=?","branch_id=?"];params=[user["company_id"],branch_id]
-    if product_id: clauses.append("product_id=?");params.append(product_id)
-    rows=conn.execute(f"SELECT * FROM branch_stock_events WHERE {' AND '.join(clauses)} ORDER BY created_at DESC,id DESC LIMIT ?",(*params,limit)).fetchall()
-    return {"branch_id":branch_id,"items":[{"id":r["id"],"product_id":r["product_id"],"kind":r["kind"],"quantity":milli_to_decimal(abs(r["quantity_milli"])),"before":milli_to_decimal(r["before_milli"]),"after":milli_to_decimal(r["after_milli"]),"reason":r["reason"],"transfer_id":r["transfer_id"],"created_at":r["created_at"]} for r in rows]}
+    clauses=["e.company_id=?","e.branch_id=?"];params=[user["company_id"],branch_id]
+    if product_id: clauses.append("e.product_id=?");params.append(product_id)
+    if kind:
+        if kind not in {"adjustment_in","adjustment_out","transfer_in","transfer_out","sale","reversal"}:raise HTTPException(422,"Tipo de movimento inválido.")
+        clauses.append("e.kind=?");params.append(kind)
+    rows=conn.execute(f"SELECT e.*,p.name AS product,p.sku,u.full_name AS actor FROM branch_stock_events e JOIN products p ON p.id=e.product_id AND p.company_id=e.company_id JOIN users u ON u.id=e.actor_id AND u.company_id=e.company_id WHERE {' AND '.join(clauses)} ORDER BY e.created_at DESC,e.id DESC LIMIT ?",(*params,limit)).fetchall()
+    return {"branch_id":branch_id,"items":[{"id":r["id"],"product_id":r["product_id"],"product":r["product"],"sku":r["sku"],"actor":r["actor"],"kind":r["kind"],"quantity":milli_to_decimal(abs(r["quantity_milli"])),"before":milli_to_decimal(r["before_milli"]),"after":milli_to_decimal(r["after_milli"]),"reason":r["reason"],"transfer_id":r["transfer_id"],"created_at":r["created_at"]} for r in rows],"total":len(rows)}
 
 @app.post("/v1/branches/stock-transfers",status_code=201)
 def transfer_branch_stock(data: BranchStockTransferIn,conn: DB,user: USER,idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
@@ -2226,6 +2319,164 @@ def create_supplier(data: SupplierIn,conn: DB,user: USER):
         raise HTTPException(409,"Já existe um fornecedor com esse nome nesta empresa.")
     return {"id":supplier_id,"name":data.name,"active":True,"created_at":created}
 
+
+@app.post("/v1/branches/{branch_id}/purchase-orders",status_code=201)
+def create_branch_purchase_order(branch_id: str,data: PurchaseCreateIn,conn: DB,user: USER):
+    require_permission(conn,user,"purchases.manage");require_branch_membership(conn,user,branch_id)
+    order_id,created=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            supplier=conn.execute("SELECT id FROM suppliers WHERE id=? AND company_id=? AND active=1",(data.supplier_id,user["company_id"])).fetchone()
+            if not supplier:raise HTTPException(404,"Fornecedor não encontrado nesta empresa.")
+            conn.execute("INSERT INTO purchase_orders(id,company_id,supplier_id,order_number,status,notes,created_by,created_at,updated_at,branch_id) VALUES(?,?,?,?,'draft',?,?,?,?,?)",(order_id,user["company_id"],data.supplier_id,data.order_number.strip(),data.notes.strip(),user["id"],created,created,branch_id))
+            for line in data.items:
+                product=company_product(conn,user["company_id"],line.product_id)
+                conn.execute("INSERT INTO purchase_order_items(id,purchase_order_id,company_id,product_id,ordered_milli,received_milli,unit_cost_cents,branch_id) VALUES(?,?,?,?,?,0,?,?)",(new_id(),order_id,user["company_id"],product["id"],decimal_milli(line.quantity),decimal_money_cents(line.unit_cost),branch_id))
+            audit(conn,user["company_id"],user["id"],"branch_purchase_order.created","purchase_order",order_id,{"branch_id":branch_id,"supplier_id":data.supplier_id,"order_number":data.order_number,"line_count":len(data.items)})
+    except sqlite3.IntegrityError:raise HTTPException(409,"Número de pedido já cadastrado ou item inválido.")
+    return {"id":order_id,"branch_id":branch_id,"order_number":data.order_number.strip(),"status":"draft","created_at":created}
+
+@app.get("/v1/branches/{branch_id}/purchase-orders")
+def list_branch_purchase_orders(branch_id: str,conn: DB,user: USER,limit: int=Query(default=100,ge=1,le=200)):
+    require_permission(conn,user,"purchases.manage");require_branch_membership(conn,user,branch_id)
+    rows=conn.execute("SELECT po.*,s.name AS supplier_name FROM purchase_orders po JOIN suppliers s ON s.id=po.supplier_id AND s.company_id=po.company_id WHERE po.company_id=? AND po.branch_id=? ORDER BY po.created_at DESC LIMIT ?",(user["company_id"],branch_id,limit)).fetchall();items=[]
+    for row in rows:
+        lines=conn.execute("SELECT poi.id,poi.product_id,p.name,p.sku,poi.ordered_milli,poi.received_milli,poi.unit_cost_cents FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id AND p.company_id=poi.company_id WHERE poi.company_id=? AND poi.purchase_order_id=? AND poi.branch_id=? ORDER BY p.name",(user["company_id"],row["id"],branch_id)).fetchall()
+        items.append({"id":row["id"],"branch_id":branch_id,"supplier_id":row["supplier_id"],"supplier":row["supplier_name"],"order_number":row["order_number"],"status":row["status"],"notes":row["notes"],"created_at":row["created_at"],"items":[{"id":i["id"],"product_id":i["product_id"],"name":i["name"],"sku":i["sku"],"ordered":milli_to_decimal(i["ordered_milli"]),"received":milli_to_decimal(i["received_milli"]),"unit_cost":cents_to_money(i["unit_cost_cents"])} for i in lines]})
+    return {"items":items}
+
+@app.patch("/v1/branches/{branch_id}/purchase-orders/{order_id}")
+def update_branch_purchase_status(branch_id: str,order_id: str,data: PurchaseStatusIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_permission(conn,user,"purchases.manage");require_branch_membership(conn,user,branch_id)
+    with transaction(conn):
+        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=? AND branch_id=?",(order_id,user["company_id"],branch_id)).fetchone()
+        if not order:raise HTTPException(404,"Pedido não encontrado nesta filial.")
+        if order["status"] not in {"draft","ordered"}:raise HTTPException(409,"Este pedido não pode mudar de estado.")
+        if data.status=="cancelled" and conn.execute("SELECT 1 FROM purchase_order_items WHERE purchase_order_id=? AND company_id=? AND branch_id=? AND received_milli>0",(order_id,user["company_id"],branch_id)).fetchone():raise HTTPException(409,"Pedido com recebimento parcial não pode ser cancelado; finalize recebimento primeiro.")
+        conn.execute("UPDATE purchase_orders SET status=?,updated_at=? WHERE id=? AND company_id=? AND branch_id=?",(data.status,now_iso(),order_id,user["company_id"],branch_id))
+        audit(conn,user["company_id"],user["id"],"branch_purchase_order.status_changed","purchase_order",order_id,{"branch_id":branch_id,"before":order["status"],"after":data.status})
+    return {"id":order_id,"branch_id":branch_id,"status":data.status}
+
+@app.post("/v1/branches/{branch_id}/purchase-orders/{order_id}/receipts",status_code=201)
+def receive_branch_purchase(branch_id: str,order_id: str,data: PurchaseReceiveIn,request: Request,conn: DB,user: USER,
+                            idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
+    require_permission(conn,user,"purchases.manage");require_branch_membership(conn,user,branch_id)
+    if not idempotency_key or len(idempotency_key)>128:raise HTTPException(400,"Envie Idempotency-Key para evitar recebimento duplicado.")
+    normalized={"branch_id":branch_id,"items":sorted([{"item":x.order_item_id,"quantity":str(x.quantity)} for x in data.items],key=lambda x:x["item"]),"due_date":data.due_date.isoformat() if data.due_date else None}
+    request_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":")).encode()).hexdigest();receipt_id,now=new_id(),now_iso()
+    with transaction(conn):
+        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=? AND branch_id=?",(order_id,user["company_id"],branch_id)).fetchone()
+        if not order:raise HTTPException(404,"Pedido não encontrado nesta filial.")
+        prior=conn.execute("SELECT * FROM purchase_receipts WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
+        if prior:
+            if prior["request_hash"]!=request_hash or prior["purchase_order_id"]!=order_id:raise HTTPException(409,"Chave de idempotência reutilizada com dados diferentes.")
+            if response is not None:response.status_code=200
+            return {"receipt_id":prior["id"],"branch_id":branch_id,"status":"already_received","idempotent":True}
+        if order["status"] not in {"ordered","partially_received"}:raise HTTPException(409,"Pedido precisa estar enviado e aberto para recebimento.")
+        if len({x.order_item_id for x in data.items})!=len(data.items):raise HTTPException(422,"Não repita a mesma linha de pedido no recebimento.")
+        receipt_rows=[]
+        for line in data.items:
+            qty=decimal_milli(line.quantity)
+            item=conn.execute("SELECT poi.*,p.name,p.sku FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id AND p.company_id=poi.company_id WHERE poi.id=? AND poi.purchase_order_id=? AND poi.company_id=? AND poi.branch_id=?",(line.order_item_id,order_id,user["company_id"],branch_id)).fetchone()
+            if not item:raise HTTPException(404,"Linha do pedido não encontrada nesta filial.")
+            if item["received_milli"]+qty>item["ordered_milli"]:raise HTTPException(409,"Quantidade recebida supera o saldo do pedido.")
+            receipt_rows.append((line,item,qty))
+        if data.due_date is not None and data.due_date<date.today():raise HTTPException(422,"Vencimento não pode ser anterior à data de hoje.")
+        conn.execute("INSERT INTO purchase_receipts(id,company_id,purchase_order_id,received_by,received_at,idempotency_key,request_hash,branch_id) VALUES(?,?,?,?,?,?,?,?)",(receipt_id,user["company_id"],order_id,user["id"],now,idempotency_key,request_hash,branch_id))
+        payable_amount=0
+        for line,item,qty in receipt_rows:
+            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,item["product_id"])).fetchone();before=int(row[0]) if row else 0;after=before+qty
+            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO UPDATE SET quantity_milli=excluded.quantity_milli,updated_at=excluded.updated_at",(user["company_id"],branch_id,item["product_id"],after,now))
+            conn.execute("UPDATE purchase_order_items SET received_milli=received_milli+? WHERE id=? AND company_id=? AND branch_id=?",(qty,line.order_item_id,user["company_id"],branch_id))
+            conn.execute("INSERT INTO purchase_receipt_items(id,receipt_id,purchase_order_item_id,product_id,quantity_milli,unit_cost_cents,branch_id) VALUES(?,?,?,?,?,?,?)",(new_id(),receipt_id,line.order_item_id,item["product_id"],qty,item["unit_cost_cents"],branch_id))
+            conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'adjustment_in',?,?,?,?,NULL,?)",(new_id(),user["company_id"],branch_id,item["product_id"],user["id"],qty,before,after,"Recebimento de pedido "+order["order_number"],now))
+            payable_amount+=(qty*item["unit_cost_cents"]+500)//1000
+        remaining=conn.execute("SELECT COUNT(*) FROM purchase_order_items WHERE purchase_order_id=? AND company_id=? AND branch_id=? AND received_milli<ordered_milli",(order_id,user["company_id"],branch_id)).fetchone()[0];new_status="received" if remaining==0 else "partially_received"
+        payable_id=None
+        if data.due_date is not None:
+            payable_id=new_id();conn.execute("INSERT INTO accounts_payable(id,company_id,supplier_id,source_receipt_id,description,amount_cents,due_date,status,created_by,created_at,branch_id) VALUES(?,?,?,?,?,?,?,'open',?,?,?)",(payable_id,user["company_id"],order["supplier_id"],receipt_id,"Recebimento pedido "+order["order_number"],payable_amount,data.due_date.isoformat(),user["id"],now,branch_id))
+            audit(conn,user["company_id"],user["id"],"branch_payable.created_from_receipt","accounts_payable",payable_id,{"branch_id":branch_id,"receipt_id":receipt_id,"amount":cents_to_money(payable_amount),"due_date":data.due_date.isoformat()})
+        conn.execute("UPDATE purchase_orders SET status=?,updated_at=? WHERE id=? AND company_id=? AND branch_id=?",(new_status,now,order_id,user["company_id"],branch_id))
+        audit(conn,user["company_id"],user["id"],"branch_purchase.received","purchase_order",order_id,{"branch_id":branch_id,"receipt_id":receipt_id,"payable_id":payable_id,"status":new_status})
+    return {"receipt_id":receipt_id,"branch_id":branch_id,"payable_id":payable_id,"payable_amount":cents_to_money(payable_amount) if payable_id else None,"due_date":data.due_date.isoformat() if payable_id else None,"status":new_status,"received_at":now,"idempotent":False}
+
+@app.get("/v1/branches/{branch_id}/finance/summary")
+def branch_finance_summary(branch_id: str,conn: DB,user: USER):
+    require_permission(conn,user,"finance.read");require_branch_membership(conn,user,branch_id)
+    sales=conn.execute("SELECT COALESCE(SUM(total_cents),0) FROM branch_sales WHERE company_id=? AND branch_id=? AND status='paid'",(user["company_id"],branch_id)).fetchone()[0]
+    open_total=conn.execute("SELECT COALESCE(SUM(CASE WHEN amount_cents-COALESCE((SELECT SUM(pp.amount_cents) FROM payable_payments pp WHERE pp.company_id=ap.company_id AND pp.payable_id=ap.id),0)>0 THEN amount_cents-COALESCE((SELECT SUM(pp.amount_cents) FROM payable_payments pp WHERE pp.company_id=ap.company_id AND pp.payable_id=ap.id),0) ELSE 0 END),0) FROM accounts_payable ap WHERE company_id=? AND branch_id=? AND status='open'",(user["company_id"],branch_id)).fetchone()[0]
+    overdue=conn.execute("SELECT COALESCE(SUM(CASE WHEN amount_cents-COALESCE((SELECT SUM(pp.amount_cents) FROM payable_payments pp WHERE pp.company_id=ap.company_id AND pp.payable_id=ap.id),0)>0 THEN amount_cents-COALESCE((SELECT SUM(pp.amount_cents) FROM payable_payments pp WHERE pp.company_id=ap.company_id AND pp.payable_id=ap.id),0) ELSE 0 END),0) FROM accounts_payable ap WHERE company_id=? AND branch_id=? AND status='open' AND due_date<?",(user["company_id"],branch_id,date.today().isoformat())).fetchone()[0]
+    return {"branch_id":branch_id,"cash_sales_total":cents_to_money(sales),"open_payables":cents_to_money(open_total),"overdue_payables":cents_to_money(overdue),"note":"Dados isolados da filial; baixas manuais não são confirmação bancária."}
+
+@app.get("/v1/branches/{branch_id}/finance/cashflow")
+def branch_finance_cashflow(branch_id: str,conn: DB,user: USER,start_date: date=Query(...),end_date: date=Query(...)):
+    require_permission(conn,user,"finance.read");require_branch_membership(conn,user,branch_id)
+    if end_date<start_date or (end_date-start_date).days>365:raise HTTPException(422,"Período inválido (máximo 366 dias).")
+    start,end=start_date.isoformat(),end_date.isoformat()
+    sales=conn.execute("SELECT substr(created_at,1,10) AS day,SUM(total_cents) AS cents,COUNT(*) AS count FROM branch_sales WHERE company_id=? AND branch_id=? AND status='paid' AND substr(created_at,1,10) BETWEEN ? AND ? GROUP BY day",(user["company_id"],branch_id,start,end)).fetchall()
+    pays=conn.execute("SELECT pp.payment_date AS day,SUM(pp.amount_cents) AS cents,COUNT(*) AS count FROM payable_payments pp JOIN accounts_payable ap ON ap.id=pp.payable_id AND ap.company_id=pp.company_id WHERE pp.company_id=? AND ap.branch_id=? AND pp.payment_date BETWEEN ? AND ? GROUP BY pp.payment_date",(user["company_id"],branch_id,start,end)).fetchall()
+    a={r["day"]:{"amount":cents_to_money(r["cents"]),"count":r["count"]} for r in sales};b={r["day"]:{"amount":cents_to_money(r["cents"]),"count":r["count"]} for r in pays}
+    return {"branch_id":branch_id,"start_date":start,"end_date":end,"items":[{"date":d,"cash_sales":a.get(d,{"amount":"0.00","count":0}),"manual_payments_out":b.get(d,{"amount":"0.00","count":0})} for d in sorted(set(a)|set(b))],"note":"Movimentos da filial; saídas são baixas manuais não conciliadas."}
+
+@app.post("/v1/branches/{branch_id}/finance/expenses",status_code=201)
+def create_branch_expense(branch_id: str,data: ExpenseIn,conn: DB,user: USER,idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
+    require_role(user,"owner","admin","manager");require_permission(conn,user,"finance.write");require_branch_membership(conn,user,branch_id)
+    if not idempotency_key or len(idempotency_key)>128:raise HTTPException(400,"Envie Idempotency-Key para evitar duplicidade.")
+    cents=decimal_money_cents(data.amount)
+    if data.due_date<date.today():raise HTTPException(422,"Vencimento não pode ser anterior à data de hoje.")
+    if data.payment_date and data.payment_date>date.today():raise HTTPException(422,"Data de pagamento não pode ser futura.")
+    body={"branch_id":branch_id,"description":data.description.strip(),"amount":cents,"due_date":data.due_date.isoformat(),"cost_center":data.cost_center.strip(),"payment_date":data.payment_date.isoformat() if data.payment_date else None,"payment_reference":data.payment_reference.strip()}
+    digest=hashlib.sha256(json.dumps(body,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest();pid,now=new_id(),now_iso()
+    with transaction(conn):
+        prior=conn.execute("SELECT ed.payable_id,ed.request_hash,ap.status,ap.amount_cents,ap.due_date FROM payable_expense_details ed JOIN accounts_payable ap ON ap.id=ed.payable_id AND ap.company_id=ed.company_id WHERE ed.company_id=? AND ed.idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
+        if prior:
+            if prior["request_hash"]!=digest:raise HTTPException(409,"Idempotency-Key reutilizada com outros dados.")
+            if response is not None:response.status_code=200
+            return {"id":prior["payable_id"],"branch_id":branch_id,"status":prior["status"],"amount":cents_to_money(prior["amount_cents"]),"idempotent":True}
+        conn.execute("INSERT INTO accounts_payable(id,company_id,supplier_id,source_receipt_id,description,amount_cents,due_date,status,created_by,created_at,branch_id) VALUES(?,?,NULL,NULL,?,?,?,'open',?,?,?)",(pid,user["company_id"],data.description.strip(),cents,data.due_date.isoformat(),user["id"],now,branch_id))
+        conn.execute("INSERT INTO payable_expense_details(payable_id,company_id,cost_center,idempotency_key,request_hash) VALUES(?,?,?,?,?)",(pid,user["company_id"],data.cost_center.strip(),idempotency_key,digest))
+        status="open"
+        if data.payment_date:
+            payid=new_id();conn.execute("INSERT INTO payable_payments(id,company_id,payable_id,amount_cents,payment_date,reference,idempotency_key,created_by,created_at,branch_id) VALUES(?,?,?,?,?,?,?,?,?,?)",(payid,user["company_id"],pid,cents,data.payment_date.isoformat(),data.payment_reference.strip(),"expense-"+payid,user["id"],now,branch_id))
+            conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=? AND branch_id=?",(now,data.payment_reference.strip(),pid,user["company_id"],branch_id));status="paid"
+        audit(conn,user["company_id"],user["id"],"branch_expense.created","accounts_payable",pid,{"branch_id":branch_id,"description":data.description.strip(),"amount":cents_to_money(cents),"due_date":data.due_date.isoformat(),"status":status,"manual_payment":bool(data.payment_date)})
+    return {"id":pid,"branch_id":branch_id,"status":status,"amount":cents_to_money(cents),"due_date":data.due_date.isoformat(),"idempotent":False,"note":"Despesa da filial registrada; baixas manuais não confirmam pagamento bancário."}
+
+@app.get("/v1/branches/{branch_id}/payables")
+def list_branch_payables(branch_id: str,conn: DB,user: USER,status_filter: str=Query(default="all",alias="status"),limit: int=Query(default=100,ge=1,le=200)):
+    require_permission(conn,user,"finance.read");require_branch_membership(conn,user,branch_id)
+    if status_filter not in {"all","open","paid","cancelled"}:raise HTTPException(422,"Filtro de situação inválido.")
+    rows=conn.execute("SELECT ap.*,s.name AS supplier_name,COALESCE((SELECT SUM(pp.amount_cents) FROM payable_payments pp WHERE pp.company_id=ap.company_id AND pp.payable_id=ap.id),0) AS paid_cents FROM accounts_payable ap LEFT JOIN suppliers s ON s.id=ap.supplier_id AND s.company_id=ap.company_id WHERE ap.company_id=? AND ap.branch_id=? AND (?='all' OR ap.status=?) ORDER BY ap.due_date,ap.created_at DESC LIMIT ?",(user["company_id"],branch_id,status_filter,status_filter,limit)).fetchall()
+    return {"items":[{"id":r["id"],"branch_id":branch_id,"supplier_id":r["supplier_id"],"supplier":r["supplier_name"],"description":r["description"],"amount":cents_to_money(r["amount_cents"]),"paid":cents_to_money(r["paid_cents"]),"remaining":cents_to_money(max(0,r["amount_cents"]-r["paid_cents"])),"due_date":r["due_date"],"status":r["status"],"created_at":r["created_at"],"paid_at":r["paid_at"]} for r in rows]}
+
+@app.post("/v1/branches/{branch_id}/payables/{payable_id}/payments",status_code=201)
+def pay_branch_payable(branch_id: str,payable_id: str,data: PayablePartialIn,conn: DB,user: USER,
+                       idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
+    require_role(user,"owner","admin","manager");require_permission(conn,user,"finance.write");require_branch_membership(conn,user,branch_id)
+    if not idempotency_key or len(idempotency_key)>128:raise HTTPException(400,"Envie Idempotency-Key para registrar a baixa sem duplicidade.")
+    amount=decimal_money_cents(data.amount)
+    if amount<=0:raise HTTPException(422,"Valor deve ser de ao menos R$ 0,01.")
+    if data.payment_date>date.today():raise HTTPException(422,"Data de pagamento não pode ser futura.")
+    now=now_iso()
+    with transaction(conn):
+        prior=conn.execute("SELECT * FROM payable_payments WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
+        if prior:
+            if prior["payable_id"]!=payable_id or prior["amount_cents"]!=amount or prior["reference"]!=data.reference or prior["payment_date"]!=data.payment_date.isoformat():raise HTTPException(409,"Chave de idempotência reutilizada com outros dados.")
+            payable=conn.execute("SELECT amount_cents,status FROM accounts_payable WHERE id=? AND company_id=? AND branch_id=?",(payable_id,user["company_id"],branch_id)).fetchone()
+            if not payable:raise HTTPException(404,"Conta não encontrada nesta filial.")
+            paid=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0]
+            if response is not None:response.status_code=200
+            return {"id":prior["id"],"branch_id":branch_id,"status":payable["status"],"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,payable["amount_cents"]-paid)),"idempotent":True,"note":"Baixa manual; não confirmada por banco."}
+        payable=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=? AND branch_id=?",(payable_id,user["company_id"],branch_id)).fetchone()
+        if not payable:raise HTTPException(404,"Conta não encontrada nesta filial.")
+        if payable["status"]!="open":raise HTTPException(409,"Conta não está em aberto.")
+        paid=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0];remaining=payable["amount_cents"]-paid
+        if amount>remaining:raise HTTPException(409,"Pagamento supera o saldo restante.")
+        pid=new_id();conn.execute("INSERT INTO payable_payments(id,company_id,payable_id,amount_cents,payment_date,reference,idempotency_key,created_by,created_at,branch_id) VALUES(?,?,?,?,?,?,?,?,?,?)",(pid,user["company_id"],payable_id,amount,data.payment_date.isoformat(),data.reference,idempotency_key,user["id"],now,branch_id))
+        updated=paid+amount;status="paid" if updated==payable["amount_cents"] else "open"
+        if status=="paid":conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=? AND branch_id=?",(now,data.reference,payable_id,user["company_id"],branch_id))
+        audit(conn,user["company_id"],user["id"],"branch_payable.payment_recorded","payable_payment",pid,{"branch_id":branch_id,"payable_id":payable_id,"amount":cents_to_money(amount),"status":"manual_not_bank_confirmed"})
+    return {"id":pid,"branch_id":branch_id,"status":status,"paid":cents_to_money(updated),"remaining":cents_to_money(max(0,payable["amount_cents"]-updated)),"idempotent":False,"note":"Baixa manual; não confirmada por banco."}
 
 @app.post("/v1/purchase-orders",status_code=201)
 def create_purchase_order(data: PurchaseCreateIn,conn: DB,user: USER):

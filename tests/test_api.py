@@ -721,7 +721,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1204,6 +1204,8 @@ def test_branch_sale_uses_only_branch_stock_and_cash_register(world):
     assert any(x['kind']=='sale' and x['quantity']=='2' for x in movements)
     assert world.get(f'/v1/branches/{second}/inventory',headers=headers).json()['items'][0]['quantity']=='0'
     assert world.get(f'/v1/branches/{first}/registers/current',headers=headers).json()['expected_amount']=='9.00'
+    closed=world.post(f"/v1/branches/{first}/registers/{world.get(f'/v1/branches/{first}/registers/current',headers=headers).json()['register']['id']}/close",headers=headers,json={'counted_amount':'9.00'})
+    assert closed.status_code==200 and closed.json()['difference']=='0.00'
     assert world.get(f'/v1/branches/{second}/registers/current',headers=headers).json()['expected_amount']=='0.00'
 
 
@@ -1221,3 +1223,74 @@ def test_branch_sale_void_reverses_only_branch_stock_and_cash_with_audit(world):
     assert world.get(f'/v1/branches/{first}/registers/current',headers=headers).json()['expected_amount']=='20.00'
     assert world.get(f'/v1/branches/{other}/registers/current',headers=headers).json()['expected_amount']=='2.00'
     assert world.post(f'/v1/branches/{first}/sales/{sale["id"]}/void',headers=headers,json={'reason':'Repetir'}).status_code==409
+
+
+def test_branch_purchase_receipt_posts_only_to_branch_ledger_and_payable(world):
+    token=company(world);headers=auth(token)
+    branches=world.get('/v1/company/branches',headers=headers).json()['items'];first=branches[0]['id']
+    supplier=world.post('/v1/suppliers',headers=headers,json={'name':'Fornecedor Branch'}).json()
+    product_data=product(world,token,sku='BRANCH-PO')
+    second=world.post('/v1/company/branches',headers=headers,json={'code':'po-north','name':'Norte'}).json()['id']
+    order=world.post(f'/v1/branches/{first}/purchase-orders',headers=headers,json={'supplier_id':supplier['id'],'order_number':'PO-BR-1','items':[{'product_id':product_data['id'],'quantity':'8','unit_cost':'2.50'}]})
+    assert order.status_code==201,order.text
+    assert world.patch(f'/v1/branches/{first}/purchase-orders/{order.json()["id"]}',headers=headers,json={'status':'ordered'}).status_code==200
+    lines=world.get(f'/v1/branches/{first}/purchase-orders',headers=headers).json()['items'][0]['items'];line=lines[0]
+    rec=world.post(f'/v1/branches/{first}/purchase-orders/{order.json()["id"]}/receipts',headers={**headers,'Idempotency-Key':'branch-receipt-1'},json={'items':[{'order_item_id':line['id'],'quantity':'3'}],'due_date':'2026-12-20'})
+    assert rec.status_code==201,rec.text
+    assert rec.json()['payable_amount']=='7.50'
+    assert world.get(f'/v1/branches/{first}/inventory',headers=headers).json()['items'][0]['quantity']=='3'
+    assert world.get(f'/v1/branches/{second}/inventory',headers=headers).json()['items'][0]['quantity']=='0'
+    legacy=world.get('/v1/products',headers=headers);assert legacy.status_code==409,legacy.text
+    assert world.get(f'/v1/branches/{first}/payables',headers=headers).json()['items'][0]['amount']=='7.50'
+    assert world.get(f'/v1/branches/{second}/payables',headers=headers).json()['items']==[]
+    replay=world.post(f'/v1/branches/{first}/purchase-orders/{order.json()["id"]}/receipts',headers={**headers,'Idempotency-Key':'branch-receipt-1'},json={'items':[{'order_item_id':line['id'],'quantity':'3'}],'due_date':'2026-12-20'})
+    assert replay.status_code==200 and replay.json()['idempotent'] is True
+    paid=world.post(f'/v1/branches/{first}/payables/{rec.json()["payable_id"]}/payments',headers={**headers,'Idempotency-Key':'branch-pay-1'},json={'amount':'7.50','payment_date':'2026-11-16','reference':'Pagamento manual de teste'})
+    assert paid.status_code==201 and paid.json()['status']=='paid'
+    assert world.post(f'/v1/branches/{second}/payables/{rec.json()["payable_id"]}/payments',headers={**headers,'Idempotency-Key':'foreign-branch-pay'},json={'amount':'7.50','payment_date':'2026-11-16','reference':'Não autorizado'}).status_code==404
+
+
+def test_branch_finance_summary_expenses_and_cashflow_are_branch_isolated(world):
+    token=company(world);headers=auth(token);first=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    second=world.post('/v1/company/branches',headers=headers,json={'code':'fin2','name':'Financeiro Norte'}).json()['id']
+    today='2026-11-16'
+    one=world.post(f'/v1/branches/{first}/finance/expenses',headers={**headers,'Idempotency-Key':'branch-exp-1'},json={'description':'Despesa filial A','amount':'50.00','due_date':'2026-12-01','cost_center':'Loja'})
+    assert one.status_code==201,one.text
+    replay=world.post(f'/v1/branches/{first}/finance/expenses',headers={**headers,'Idempotency-Key':'branch-exp-1'},json={'description':'Despesa filial A','amount':'50.00','due_date':'2026-12-01','cost_center':'Loja'})
+    assert replay.status_code==200 and replay.json()['idempotent'] is True
+    assert world.get(f'/v1/branches/{first}/finance/summary',headers=headers).json()['open_payables']=='50.00'
+    assert world.get(f'/v1/branches/{second}/finance/summary',headers=headers).json()['open_payables']=='0.00'
+    payable=world.get(f'/v1/branches/{first}/payables',headers=headers).json()['items'][0]
+    paid=world.post(f'/v1/branches/{first}/payables/{payable["id"]}/payments',headers={**headers,'Idempotency-Key':'branch-exp-pay'},json={'amount':'20.00','payment_date':today,'reference':'Parcial manual'})
+    assert paid.status_code==201 and paid.json()['remaining']=='30.00'
+    cf=world.get(f'/v1/branches/{first}/finance/cashflow?start_date={today}&end_date={today}',headers=headers)
+    assert cf.status_code==200,cf.text
+    assert world.get(f'/v1/branches/{second}/payables',headers=headers).json()['items']==[]
+
+
+def test_branch_dashboard_sales_history_and_reports_exclude_other_branches(world):
+    token=company(world);headers=auth(token);first=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    p=product(world,token,sku='BR-REPORT',price='4.00')
+    second=world.post('/v1/company/branches',headers=headers,json={'code':'rep2','name':'Relatório 2'}).json()['id']
+    for bid in (first,second):world.post(f'/v1/branches/{bid}/registers/open',headers=headers,json={'label':'PDV','opening_amount':'0'})
+    world.post(f'/v1/branches/{first}/inventory/{p["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'3','reason':'Entrada teste'})
+    sale=world.post(f'/v1/branches/{first}/sales',headers={**headers,'Idempotency-Key':'report-sale-branch'},json={'items':[{'product_id':p['id'],'quantity':'1'}],'payment_method':'cash','received_amount':'4.00'}).json()
+    hist=world.get(f'/v1/branches/{first}/sales',headers=headers)
+    assert hist.status_code==200 and hist.json()['items'][0]['id']==sale['id']
+    assert world.get(f'/v1/branches/{second}/sales',headers=headers).json()['items']==[]
+    dashboard=world.get(f'/v1/branches/{first}/dashboard/summary',headers=headers)
+    assert dashboard.status_code==200 and dashboard.json()['sales_today']==1
+    today=__import__('datetime').date.today().isoformat()
+    report=world.get(f'/v1/branches/{first}/sales/report?start_date={today}&end_date={today}',headers=headers)
+    assert report.status_code==200 and report.json()['totals']['paid_count']==1
+    assert world.get(f'/v1/branches/{second}/sales/report?start_date={today}&end_date={today}',headers=headers).json()['totals']['sale_count']==0
+
+
+def test_branch_stock_role_can_create_but_not_send_or_cancel_purchase_order(world):
+    token=company(world);headers=auth(token);branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    sup=world.post('/v1/suppliers',headers=headers,json={'name':'Stock supplier'}).json();p=product(world,token,sku='BRANCH-ROLE')
+    world.post('/v1/users',headers=headers,json={'full_name':'Stock User','email':'branchstock@example.test','password':'secure-password-123','role':'stock'})
+    tok=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'branchstock@example.test','password':'secure-password-123'}).json()['access_token'];h=auth(tok)
+    order=world.post(f'/v1/branches/{branch}/purchase-orders',headers=h,json={'supplier_id':sup['id'],'order_number':'ROLE-PO','items':[{'product_id':p['id'],'quantity':'1','unit_cost':'2.00'}]})
+    assert order.status_code==201,order.text
+    assert world.patch(f'/v1/branches/{branch}/purchase-orders/{order.json()["id"]}',headers=h,json={'status':'ordered'}).status_code==403
