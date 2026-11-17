@@ -426,6 +426,17 @@ def apply_schema_migrations(conn) -> None:
             conn.execute("DROP TABLE branch_stock_events_old")
             conn.execute("CREATE INDEX branch_stock_events_lookup ON branch_stock_events(company_id,branch_id,product_id,created_at)")
     migration(11,"branch_stock_sale_reversal_event_kinds",allow_branch_sale_reversals)
+    def add_nullable_restaurant_branch_scope():
+        tables=("restaurant_areas","restaurant_tables","restaurant_reservations","restaurant_services","restaurant_tabs","restaurant_orders","restaurant_order_items","restaurant_tab_payments","restaurant_events")
+        for table in tables:
+            if is_postgres(conn):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS branch_id TEXT REFERENCES branches(id)")
+            else:
+                cols={row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if "branch_id" not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN branch_id TEXT REFERENCES branches(id)")
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {table}_branch_scope ON {table}(company_id,branch_id)")
+    migration(12,"nullable_restaurant_branch_scope",add_nullable_restaurant_branch_scope)
 
 
 def init_db() -> None:

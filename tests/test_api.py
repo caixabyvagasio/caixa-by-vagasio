@@ -722,7 +722,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1304,3 +1304,20 @@ def test_multi_branch_restaurant_routes_fail_closed_before_any_legacy_access(wor
     for path in ['/v1/restaurant/areas','/v1/restaurant/floor','/v1/restaurant/reservations','/v1/restaurant/menu','/v1/restaurant/tabs','/v1/restaurant/production?station=kitchen','/v1/restaurant/reports/operations']:
         response=world.get(path,headers=headers);assert response.status_code==409,(path,response.status_code,response.text)
     response=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Tentativa bloqueada'});assert response.status_code==409,response.text
+
+
+def test_restaurant_branch_scope_migration_keeps_legacy_rows_unassigned(world):
+    token=company(world);headers=auth(token)
+    configured=world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}});assert configured.status_code==200,configured.text
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Sala legada'});assert area.status_code==201,area.text
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area.json()['id'],'label':'L1','capacity':4});assert table.status_code==201,table.text
+    branch=world.post('/v1/company/branches',headers=headers,json={'name':'Segunda unidade','code':'UN2'});assert branch.status_code==201,branch.text
+    conn=main.connect_db()
+    try:
+        for table_name in ('restaurant_areas','restaurant_tables','restaurant_reservations','restaurant_services','restaurant_tabs','restaurant_orders','restaurant_order_items','restaurant_tab_payments','restaurant_events'):
+            columns={r[1] for r in conn.execute(f'PRAGMA table_info({table_name})').fetchall()};assert 'branch_id' in columns,table_name
+        legacy=conn.execute('SELECT branch_id FROM restaurant_areas WHERE id=?',(area.json()['id'],)).fetchone();assert legacy[0] is None
+        legacy_table=conn.execute('SELECT branch_id FROM restaurant_tables WHERE id=?',(table.json()['id'],)).fetchone();assert legacy_table[0] is None
+    finally:conn.close()
+    headers['X-Branch-Id']=branch.json()['id']
+    assert world.get('/v1/restaurant/floor',headers=headers).status_code==409
