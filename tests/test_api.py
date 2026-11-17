@@ -1610,3 +1610,21 @@ def test_middleware_permission_matches_local_handler_permission_checks():
             if expected is not None and expected not in local:
                 mismatches.append((method,path,expected,sorted(local)))
     assert mismatches==[]
+
+
+def test_branch_inventory_concurrent_increments_preserve_ledger_and_balance(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    p=product(world,owner,sku='CONCURRENT-STOCK',name='Estoque Concorrente')
+    def increment(i):
+        return world.post(f'/v1/branches/{branch}/inventory/{p["id"]}/adjustments',headers=headers,
+                          json={'direction':'in','quantity':'1','reason':f'Ajuste paralelo QA {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses=list(pool.map(increment,range(8)))
+    assert all(r.status_code==201 for r in responses),[(r.status_code,r.text) for r in responses]
+    inventory=world.get(f'/v1/branches/{branch}/inventory',headers=headers).json()
+    assert inventory['items'][0]['quantity']=='8'
+    movements=world.get(f'/v1/branches/{branch}/stock-movements?product_id={p["id"]}',headers=headers).json()
+    assert len(movements['items'])==8
+    assert {m['after'] for m in movements['items']}=={str(i) for i in range(1,9)}
