@@ -164,3 +164,11 @@
 ## Ajuste de navegação após retorno visual — 17/11/2026
 - Seguindo a captura enviada pelo titular, removidos os pictogramas ambíguos de todos os 13 itens do menu lateral da aplicação; mantidos os rótulos textuais e os mesmos botões/atributos de navegação. Removidos também os pictogramas inventados da prévia ilustrativa da landing.
 - CSS elimina o espaço reservado ao ícone e testes verificam os 13 nomes e a ausência dos spans pictográficos no menu. Nada foi alterado nos fluxos ou ações das páginas.
+
+
+## Portal dedicado do garçom — desenvolvimento em andamento (17/11/2026)
+- Migration idempotente v16 cria perfil de garçom e atribuição nullable em mesa, atendimento e comanda; conserva os roles básicos existentes e sem backfill histórico.
+- Acesso novo de garçom usa usuário individual operador, profile dedicado e restrição middleware ao conjunto `/v1/waiter/*` e `/v1/me`; o restante do Caixa retorna 403. APIs do portal validam atribuição/tenant, listam mesas e comandas próprias, iniciam atendimento, abrem comanda, criam e enviam pedido. Há atribuição por mesa pela gestão e caixa manual só em dinheiro, após entrega integral, com caixa aberto; nenhuma confirmação Pix/cartão.
+- Interface mobile-first do portal, cardápio, detalhe da comanda, criação de pedido, marcação de entrega, saldo e recebimento cash; gestão cadastra login e atribui garçom no salão. Multi-filial continua recusado até escopo operacional completo.
+- Testes novos cobrem criação/login de garçom, acesso restrito, atribuição, abertura, menu, pedido, envio, transitions e cash, proteção cross-tenant e migration. Full local: **101 passed, 1 skipped**; testes dedicados cobrem tenant/perfil/restrição, criação, atribuição, fluxo operacional e bloqueio multi-filial. Ainda precisa CI remota (incluindo PostgreSQL), deploy somente dev e verificação funcional/visual publicada; não declarar produção/homologação.
+- Restaurante além do portal continua incompleto: adicionais/combos, ficha técnica/insumos, delivery, divisão detalhada de conta, cancelamentos/estornos auditáveis e impressão seguem fora deste escopo/futuros.
