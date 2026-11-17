@@ -492,6 +492,19 @@ def test_restaurant_open_table_rejects_conflicting_occupation(world):
     assert world.get('/v1/restaurant/floor',headers=headers).json()['items'][0]['status']=='occupied'
 
 
+def test_module_status_catalog_has_no_duplicate_keys_and_all_features_are_classified():
+    import ast
+    import inspect
+    tree=ast.parse(inspect.getsource(main))
+    assignment=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="MODULE_STATUSES" for t in n.targets))
+    keys=[ast.literal_eval(k) for k in assignment.value.keys]
+    assert len(keys)==len(set(keys))
+    assert set(main.MODULE_STATUSES)=={row[0] for row in main.FEATURES}
+    assert main.MODULE_STATUSES["restaurant_floor"]=="AVAILABLE"
+    for feature in {"tables_tabs","delivery","kitchen","barcode","weighed_items","expiry_control","variants","returns","commissions","appointments","measurement_sales"}:
+        assert main.MODULE_STATUSES[feature]=="NOT_IMPLEMENTED"
+
+
 def test_partial_restaurant_floor_cannot_be_activated_as_complete_module(world):
     owner=company(world);headers=auth(owner)
     world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
