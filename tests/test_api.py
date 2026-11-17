@@ -1872,3 +1872,37 @@ def test_concurrent_branch_empty_service_close_and_tab_open_cannot_orphan_tab(wo
         tabs=conn.execute('SELECT COUNT(*) FROM restaurant_tabs WHERE service_id=? AND branch_id=?',(service['id'],branch)).fetchone()[0]
         assert (state=='closed' and tabs==0) or (state=='open' and tabs==1), (state,tabs,[(r.status_code,r.text) for r in responses])
     finally: conn.close()
+
+
+def test_concurrent_legacy_restaurant_final_payments_close_once_and_debit_stock_once(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,'Legacy restaurant concurrency','legacy-restaurant-concurrency','legacy-restaurant-concurrency@example.test');headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    prod=product(world,owner,sku='LEGACY-REST-CONC',name='Prato legacy',price='12.50')
+    assert world.post(f'/v1/products/{prod["id"]}/stock-adjustments',headers=headers,json={'direction':'in','quantity':'3','reason':'Carga QA legacy'}).status_code==201
+    assert world.post('/v1/registers/open',headers=headers,json={'label':'Caixa legacy','opening_amount':'0'}).status_code==201
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Salão legacy'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'LG1','capacity':2}).json()
+    service=world.post(f'/v1/restaurant/tables/{table["id"]}/open',headers=headers).json()
+    tab=world.post(f'/v1/restaurant/services/{service["id"]}/tabs',headers=headers,json={'label':'Legacy concurrency'}).json()
+    category=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Pratos legacy'}).json()
+    menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':prod['id'],'station':'kitchen'}).json()
+    order=world.post(f'/v1/restaurant/tabs/{tab["id"]}/orders',headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1'}]})
+    assert order.status_code==201,order.text
+    assert world.post(f'/v1/restaurant/orders/{order.json()["id"]}/send',headers=headers).status_code==200
+    item=world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items'][0]
+    for status in ('preparing','ready','delivered'):
+        r=world.patch(f'/v1/restaurant/order-items/{item["id"]}',headers=headers,json={'status':status});assert r.status_code==200,r.text
+    def pay(i):return world.post(f'/v1/restaurant/tabs/{tab["id"]}/payments',headers=headers,json={'amount':'12.50','received_amount':'12.50','idempotency_key':f'legacy-final-concurrent-{i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(pay,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert all(r.status_code in {201,409} for r in responses),[(r.status_code,r.text) for r in responses]
+    detail=world.get(f'/v1/restaurant/tabs/{tab["id"]}',headers=headers).json()
+    assert detail['status']=='closed' and detail['paid']=='12.50' and detail['remaining']=='0.00'
+    assert world.get('/v1/registers/current',headers=headers).json()['expected_amount']=='12.50'
+    assert world.get('/v1/products',headers=headers).json()['items'][0]['stock']=='2'
+    conn=main.connect_db()
+    try:
+        assert conn.execute('SELECT COUNT(*) FROM sales WHERE idempotency_key=?',('restaurant-tab:'+tab['id'],)).fetchone()[0]==1
+        assert conn.execute('SELECT COUNT(*) FROM restaurant_tab_payments WHERE tab_id=?',(tab['id'],)).fetchone()[0]==1
+    finally: conn.close()
