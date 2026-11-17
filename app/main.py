@@ -1783,7 +1783,7 @@ def open_branch_register(branch_id: str,data: BranchRegisterOpenIn,conn: DB,user
     require_permission(conn,user,"cash.manage");require_branch_membership(conn,user,branch_id)
     register_id,now=new_id(),now_iso()
     try:
-        with transaction(conn):
+        with transaction(conn,"READ COMMITTED"):
             if conn.execute("SELECT 1 FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open'",(user["company_id"],branch_id)).fetchone(): raise HTTPException(409,"Já existe caixa aberto nesta filial.")
             conn.execute("INSERT INTO branch_cash_registers(id,company_id,branch_id,label,status,opening_cents,opened_by,opened_at) VALUES(?,?,?,?,'open',?,?,?)",(register_id,user["company_id"],branch_id,data.label.strip(),decimal_money_cents(data.opening_amount),user["id"],now))
             audit(conn,user["company_id"],user["id"],"branch_register.opened","branch_cash_register",register_id,{"branch_id":branch_id,"label":data.label.strip()})
@@ -3405,7 +3405,7 @@ def open_register(data: RegisterOpenIn, conn: DB, user: USER):
     require_permission(conn,user,"cash.manage")
     register_id, opened_at = new_id(), now_iso()
     try:
-        with transaction(conn):
+        with transaction(conn,"READ COMMITTED"):
             conn.execute("INSERT INTO cash_registers(id,company_id,label,status,opening_cents,opened_by,opened_at) VALUES(?,?,?,'open',?,?,?)",
                          (register_id, user["company_id"], data.label.strip(), decimal_money_cents(data.opening_amount), user["id"], opened_at))
             audit(conn, user["company_id"], user["id"], "register.opened", "register", register_id,
