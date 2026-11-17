@@ -241,3 +241,10 @@
 - Encontrado risco: sangria considerava apenas eventos de suprimento/sangria, não vendas/estornos, podendo autorizar retirada maior que o saldo real; movimento não bloqueava concorrência; fechamento podia fechar antes de uma sangria/venda concorrente; vendas e estornos não serializavam com encerramento.
 - Alteração local: movement, close, sale e void sincronizam na linha do register (PostgreSQL FOR UPDATE); sangria valida saldo combinado de opening + cash events + sale/return movements. Close calcula esperado após exclusão mútua; venda/estorno lock register após validar seleção/estoque ou sale.
 - Testes cobrindo caixa com venda seguida de 8 sangrias paralelas (uma aceita, sete 409, expected R$20), saldo negativo bloqueado e fechamento concorrente com suprimento; mais fluxos existentes. Focado 5 passed; full local **105 passed, 1 skipped**. Ainda não CI/deploy desta alteração.
+
+
+## Continuação — ciclo de comanda concorrente (2026-11-17 14:01 BRT)
+- Caixa branch concurrency fix foi CI general/Postgres verificado e live em dev: commit `a9aeec33a0f5cf79bb72afce2204d48918da1a97`, deploy `dep-dbu8frafngtc73e2e67g`, health PostgreSQL.
+- Restaurant branch ops agora usam a mesma linha da comanda como lock: criação de pedido, transição de produção e recebimento/fechamento. Settlement também trava caixa e saldo de cada produto em ordem estável, validando estoque apenas após lock. Recebimentos ficam atômicos com pagamentos, cash event, sale snapshot, stock ledger, close da tab/service e liberação mesa.
+- Correção regressiva: repetição idempotente de pagamento de comanda fechada deve ser checada ANTES de recusar tab já fechada; reordenado tratamento e preservada resposta 200 replay.
+- Novo teste oito pagamentos simultâneos para comanda entregue: exatamente um 201; comanda fechada, uma payment, uma sale (idempotency key restaurant-tab), saldo reduzido uma vez, caixa atualizado uma vez. Focados 2 passed; full local **106 passed, 1 skipped**. Warnings existentes de pytest/Starlette HTTPX. Nenhuma CI/deploy dessa alteração ainda.
