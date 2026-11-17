@@ -1617,7 +1617,7 @@ def me(user: USER):
 def list_branches(conn: DB,user: USER):
     rows=conn.execute("SELECT b.id,b.code,b.name,b.status FROM branches b JOIN branch_users bu ON bu.branch_id=b.id AND bu.company_id=b.company_id WHERE b.company_id=? AND bu.user_id=? AND b.status='active' ORDER BY b.created_at",(user["company_id"],user["id"])).fetchall()
     count=conn.execute("SELECT COUNT(*) FROM branches WHERE company_id=? AND status='active'",(user["company_id"],)).fetchone()[0]
-    return {"items":[dict(r) for r in rows],"multi_branch":count>1,"branch_count":count,"operational_data_partitioning":"partial"}
+    return {"items":[dict(r) for r in rows],"multi_branch":count>1,"restaurant_multi_branch_ready":False,"branch_count":count,"operational_data_partitioning":"partial"}
 
 @app.post("/v1/company/branches",status_code=201)
 def create_branch(data: BranchCreateIn,conn: DB,user: USER):
