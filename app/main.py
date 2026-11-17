@@ -2179,8 +2179,9 @@ def branch_restaurant_create_tab(branch_id: str,service_id: str,data: Restaurant
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
     tid,now=new_id(),now_iso()
     try:
-        with transaction(conn):
-            service=conn.execute("SELECT id FROM restaurant_services WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(service_id,user["company_id"],branch_id)).fetchone()
+        with transaction(conn,"READ COMMITTED"):
+            lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+            service=conn.execute("SELECT id FROM restaurant_services WHERE id=? AND company_id=? AND branch_id=? AND status='open'"+lock_clause,(service_id,user["company_id"],branch_id)).fetchone()
             if not service: raise HTTPException(404,"Atendimento aberto não encontrado nesta filial.")
             conn.execute("INSERT INTO branch_restaurant_tabs(id,company_id,branch_id,service_id,label,status,opened_by,opened_at) VALUES(?,?,?,?,?,'open',?,?)",(tid,user["company_id"],branch_id,service_id,data.label.strip(),user["id"],now))
             conn.execute("INSERT INTO branch_restaurant_events(id,company_id,branch_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],branch_id,tid,"tab",tid,"opened",json.dumps({"service_id":service_id,"label":data.label.strip()}),user["id"],now))
@@ -2403,11 +2404,12 @@ def branch_restaurant_list_reservations(branch_id: str,conn: DB,user: USER,statu
 def branch_restaurant_reserve(branch_id: str,data: RestaurantReservationIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
     if data.ends_at<=data.starts_at: raise HTTPException(422,"Fim da reserva deve ser depois do início.")
-    table=conn.execute("SELECT capacity FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1",(data.table_id,user["company_id"],branch_id)).fetchone()
-    if not table: raise HTTPException(404,"Mesa não encontrada nesta filial.")
-    if data.party_size>table["capacity"]: raise HTTPException(409,"Grupo excede a capacidade da mesa.")
     rid,now=new_id(),now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        table=conn.execute("SELECT capacity FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1"+lock_clause,(data.table_id,user["company_id"],branch_id)).fetchone()
+        if not table: raise HTTPException(404,"Mesa não encontrada nesta filial.")
+        if data.party_size>table["capacity"]: raise HTTPException(409,"Grupo excede a capacidade da mesa.")
         if conn.execute("SELECT 1 FROM restaurant_reservations WHERE company_id=? AND branch_id=? AND table_id=? AND status IN ('confirmed','seated') AND starts_at<? AND ends_at>?",(user["company_id"],branch_id,data.table_id,data.ends_at,data.starts_at)).fetchone(): raise HTTPException(409,"Reserva conflitante nesta mesa.")
         conn.execute("INSERT INTO restaurant_reservations(id,company_id,table_id,customer_name,party_size,starts_at,ends_at,status,created_by,created_at,branch_id) VALUES(?,?,?,?,?,?,?,'confirmed',?,?,?)",(rid,user["company_id"],data.table_id,data.customer_name.strip(),data.party_size,data.starts_at,data.ends_at,user["id"],now,branch_id))
         audit(conn,user["company_id"],user["id"],"restaurant.branch_reservation_created","restaurant_reservation",rid,{"branch_id":branch_id,"table_id":data.table_id,"starts_at":data.starts_at,"ends_at":data.ends_at})
@@ -2585,11 +2587,12 @@ def restaurant_list_reservations(conn: DB,user: USER,status_filter: Literal["con
 def restaurant_reserve(data: RestaurantReservationIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user)
     if data.ends_at<=data.starts_at: raise HTTPException(422,"Fim da reserva deve ser depois do início.")
-    table=conn.execute("SELECT capacity FROM restaurant_tables WHERE id=? AND company_id=? AND active=1",(data.table_id,user["company_id"])).fetchone()
-    if not table: raise HTTPException(404,"Mesa não encontrada.")
-    if data.party_size>table["capacity"]: raise HTTPException(409,"Grupo excede a capacidade da mesa.")
     rid,now=new_id(),now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        table=conn.execute("SELECT capacity FROM restaurant_tables WHERE id=? AND company_id=? AND active=1"+lock_clause,(data.table_id,user["company_id"])).fetchone()
+        if not table: raise HTTPException(404,"Mesa não encontrada.")
+        if data.party_size>table["capacity"]: raise HTTPException(409,"Grupo excede a capacidade da mesa.")
         if conn.execute("SELECT 1 FROM restaurant_reservations WHERE company_id=? AND table_id=? AND status IN ('confirmed','seated') AND starts_at<? AND ends_at>?",(user["company_id"],data.table_id,data.ends_at,data.starts_at)).fetchone(): raise HTTPException(409,"Reserva conflitante.")
         conn.execute("INSERT INTO restaurant_reservations(id,company_id,table_id,customer_name,party_size,starts_at,ends_at,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,'confirmed',?,?)",(rid,user["company_id"],data.table_id,data.customer_name.strip(),data.party_size,data.starts_at,data.ends_at,user["id"],now))
         audit(conn,user["company_id"],user["id"],"restaurant.reservation_created","restaurant_reservation",rid,{"table_id":data.table_id,"starts_at":data.starts_at,"ends_at":data.ends_at})
