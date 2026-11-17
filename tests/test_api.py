@@ -1450,7 +1450,8 @@ def test_branch_restaurant_order_production_cash_close_and_branch_ledgers(world)
 
 def test_frontend_favicon_asset_is_served_and_linked(world):
     html=world.get('/').text
-    assert 'href="/static/favicon.svg"' in html
-    response=world.get('/static/favicon.svg')
+    assert 'href="/static/favicon.png?v=logo1"' in html
+    response=world.get('/static/favicon.png')
     assert response.status_code==200
-    assert '<svg' in response.text and 'viewBox="0 0 64 64"' in response.text
+    assert response.headers['content-type'].startswith('image/png')
+    assert response.content.startswith(b'\x89PNG\r\n\x1a\n')
