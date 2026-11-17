@@ -2359,8 +2359,9 @@ def branch_restaurant_open_table(branch_id: str,table_id: str,conn: DB,user: USE
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
     sid,now=new_id(),now_iso()
     try:
-        with transaction(conn):
-            table=conn.execute("SELECT status FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1",(table_id,user["company_id"],branch_id)).fetchone()
+        with transaction(conn,"READ COMMITTED"):
+            lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+            table=conn.execute("SELECT status FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1"+lock_clause,(table_id,user["company_id"],branch_id)).fetchone()
             if not table: raise HTTPException(404,"Mesa não encontrada nesta filial.")
             if table["status"]!='available': raise HTTPException(409,"Mesa não está livre.")
             conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at,branch_id) VALUES(?,?,?,'open',?,?,NULL,?)",(sid,user["company_id"],table_id,user["id"],now,branch_id))
@@ -2378,8 +2379,9 @@ def branch_restaurant_open_table(branch_id: str,table_id: str,conn: DB,user: USE
 def branch_restaurant_close_empty_service(branch_id: str,service_id: str,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
     now=now_iso()
-    with transaction(conn):
-        service=conn.execute("SELECT id,table_id,status FROM restaurant_services WHERE id=? AND company_id=? AND branch_id=?",(service_id,user["company_id"],branch_id)).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        service=conn.execute("SELECT id,table_id,status FROM restaurant_services WHERE id=? AND company_id=? AND branch_id=?"+lock_clause,(service_id,user["company_id"],branch_id)).fetchone()
         if not service: raise HTTPException(404,"Atendimento não encontrado nesta filial.")
         if service["status"]!='open': raise HTTPException(409,"Atendimento não está aberto.")
         if conn.execute("SELECT 1 FROM restaurant_tabs WHERE service_id=? AND company_id=? AND branch_id=?",(service_id,user["company_id"],branch_id)).fetchone(): raise HTTPException(409,"Atendimento com comandas deve ser encerrado pelo fluxo de recebimento da filial.")
