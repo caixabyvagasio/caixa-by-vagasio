@@ -1278,7 +1278,7 @@ USER = Annotated[dict, Depends(current_user)]
 
 PERMISSION_CATALOG={"products.read":"Consultar produtos","products.write":"Gerenciar produtos","stock.adjust":"Ajustar estoque","sales.create":"Registrar vendas","sales.void":"Cancelar vendas","cash.manage":"Operar caixa","customers.read":"Consultar clientes","customers.write":"Gerenciar clientes","purchases.manage":"Gerenciar compras","finance.read":"Consultar financeiro","finance.write":"Gerenciar financeiro","users.manage":"Gerenciar acessos","profile.manage":"Configurar perfil","branches.manage":"Gerenciar filiais","modules.manage":"Gerenciar módulos","restaurant.floor":"Operar ambientes, mesas e reservas","reports.read":"Consultar relatórios","restaurant.menu":"Gerenciar cardápio","restaurant.orders":"Criar e distribuir pedidos","restaurant.production":"Atualizar produção e entrega","restaurant.cash":"Receber e encerrar comandas","sales.read":"Consultar vendas e relatórios","inventory.read":"Consultar estoque","audit.read":"Consultar auditoria","branch.read":"Consultar filiais","users.read":"Consultar equipe"}
 ROLE_PERMISSIONS={"owner":set(PERMISSION_CATALOG),"admin":set(PERMISSION_CATALOG)-{"branches.manage","modules.manage"},"manager":set(PERMISSION_CATALOG)-{"users.manage","branches.manage","modules.manage"},"operator":{"products.read","products.write","sales.create","sales.read","sales.void","cash.manage","inventory.read","customers.read","customers.write","restaurant.floor","restaurant.orders","restaurant.production","restaurant.cash","reports.read","branch.read"},"stock":{"products.read","products.write","stock.adjust","purchases.manage","inventory.read","branch.read"}}
-MODULE_STATUSES={"sales":"ENABLED","inventory":"ENABLED","purchasing":"ENABLED","customers":"ENABLED","finance":"ENABLED","reports":"ENABLED","staff":"ENABLED","profile_setup":"ENABLED","restaurant_floor":"AVAILABLE","barcode":"NOT_IMPLEMENTED","weighed_items":"NOT_IMPLEMENTED","expiry_control":"NOT_IMPLEMENTED","tables_tabs":"NOT_IMPLEMENTED","delivery":"NOT_IMPLEMENTED","kitchen":"NOT_IMPLEMENTED","variants":"NOT_IMPLEMENTED","returns":"NOT_IMPLEMENTED","commissions":"NOT_IMPLEMENTED","appointments":"NOT_IMPLEMENTED","measurement_sales":"NOT_IMPLEMENTED","restaurant_floor":"AVAILABLE"}
+MODULE_STATUSES={"sales":"ENABLED","inventory":"ENABLED","purchasing":"ENABLED","customers":"ENABLED","finance":"ENABLED","reports":"ENABLED","staff":"ENABLED","profile_setup":"ENABLED","restaurant_floor":"AVAILABLE","barcode":"NOT_IMPLEMENTED","weighed_items":"NOT_IMPLEMENTED","expiry_control":"NOT_IMPLEMENTED","tables_tabs":"NOT_IMPLEMENTED","delivery":"NOT_IMPLEMENTED","kitchen":"NOT_IMPLEMENTED","variants":"NOT_IMPLEMENTED","returns":"NOT_IMPLEMENTED","commissions":"NOT_IMPLEMENTED","appointments":"NOT_IMPLEMENTED","measurement_sales":"NOT_IMPLEMENTED"}
 
 def require_role(user: dict, *roles: str) -> None:
     if user["role"] not in roles:
@@ -1850,7 +1850,7 @@ def branch_dashboard_summary(branch_id: str,conn: DB,user: USER):
 @app.get("/v1/branches/{branch_id}/reports/inventory")
 def branch_inventory_report(branch_id: str,conn: DB,user: USER,limit: int=Query(default=500,ge=1,le=500),search: str=Query(default="",max_length=100)):
     require_permission(conn,user,"reports.read");require_branch_membership(conn,user,branch_id)
-    term="%"+search.strip().replace("%","\%").replace("_","\_")+"%"
+    term="%"+search.strip().replace("%","\\%").replace("_","\\_")+"%"
     rows=conn.execute("SELECT p.sku,p.name,p.category,p.unit,p.cost_cents,p.price_cents,p.min_stock_milli,COALESCE(b.quantity_milli,0) AS q FROM products p LEFT JOIN branch_product_stock b ON b.company_id=p.company_id AND b.product_id=p.id AND b.branch_id=? WHERE p.company_id=? AND p.active=1 AND (p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\') ORDER BY p.name LIMIT ?",(branch_id,user["company_id"],term,term,limit)).fetchall()
     items=[]
     for r in rows:
@@ -1886,7 +1886,7 @@ def branch_sales_report(branch_id: str,start_date: date,end_date: date,group_by:
 @app.get("/v1/branches/{branch_id}/products")
 def list_branch_products(branch_id: str,conn: DB,user: USER,search: str=Query(default="",max_length=100),limit: int=Query(default=200,ge=1,le=500)):
     require_permission(conn,user,"products.read");require_branch_membership(conn,user,branch_id)
-    term="%"+search.strip().replace("%","\%").replace("_","\_")+"%"
+    term="%"+search.strip().replace("%","\\%").replace("_","\\_")+"%"
     rows=conn.execute("SELECT p.id,p.sku,p.name,p.unit,p.price_cents,p.cost_cents,p.category,p.barcode,p.min_stock_milli,COALESCE(bs.quantity_milli,0) AS branch_stock FROM products p LEFT JOIN branch_product_stock bs ON bs.company_id=p.company_id AND bs.product_id=p.id AND bs.branch_id=? WHERE p.company_id=? AND p.active=1 AND (p.name LIKE ? ESCAPE '\\' OR p.sku LIKE ? ESCAPE '\\' OR COALESCE(p.barcode,'') LIKE ? ESCAPE '\\') ORDER BY p.name LIMIT ?",(branch_id,user["company_id"],term,term,term,limit)).fetchall()
     return {"branch_id":branch_id,"total":len(rows),"items":[{"id":r["id"],"sku":r["sku"],"name":r["name"],"unit":r["unit"],"price":cents_to_money(r["price_cents"]),"cost":cents_to_money(r["cost_cents"]),"category":r["category"],"barcode":r["barcode"],"minimum_stock":milli_to_decimal(r["min_stock_milli"]),"stock":milli_to_decimal(r["branch_stock"]),"active":True,"low_stock":int(r["branch_stock"])<=int(r["min_stock_milli"])} for r in rows]}
 
@@ -1894,7 +1894,7 @@ def list_branch_products(branch_id: str,conn: DB,user: USER,search: str=Query(de
 def list_branch_inventory(branch_id: str,conn: DB,user: USER,search: str=Query(default="",max_length=100)):
     require_permission(conn,user,"inventory.read");require_branch_membership(conn,user,branch_id)
     if not conn.execute("SELECT 1 FROM branches WHERE company_id=? AND id=?",(user["company_id"],branch_id)).fetchone(): raise HTTPException(404,"Filial não encontrada.")
-    term="%"+search.strip().replace("%","\%").replace("_","\_")+"%"
+    term="%"+search.strip().replace("%","\\%").replace("_","\\_")+"%"
     rows=conn.execute("""SELECT p.id,p.sku,p.name,p.unit,p.price_cents,p.cost_cents,p.category,p.barcode,
         COALESCE(bps.quantity_milli,0) AS quantity_milli,bps.updated_at
         FROM products p LEFT JOIN branch_product_stock bps ON bps.product_id=p.id AND bps.company_id=p.company_id AND bps.branch_id=?
@@ -3411,7 +3411,7 @@ def sales_report(conn: DB,user: USER,start_date: date,end_date: date,group_by: s
 @app.get("/v1/reports/inventory")
 def inventory_report(conn: DB,user: USER,search: str=Query(default="",max_length=100),limit: int=Query(default=200,ge=1,le=500),offset: int=Query(default=0,ge=0)):
     require_role(user,"owner","admin","manager")
-    term="%"+search.strip().replace("%","\\%").replace("_","\\_")+"%"
+    term="%"+search.strip().replace("%","\\\\%").replace("_","\\\\_")+"%"
     rows=conn.execute("""SELECT * FROM products WHERE company_id=? AND active=1 AND (?='' OR name LIKE ? ESCAPE '\\' OR sku LIKE ? ESCAPE '\\')
         ORDER BY name LIMIT ? OFFSET ?""",(user["company_id"],search.strip(),term,term,limit,offset)).fetchall()
     total=conn.execute("SELECT COUNT(*) FROM products WHERE company_id=? AND active=1",(user["company_id"],)).fetchone()[0]
