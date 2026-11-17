@@ -1494,6 +1494,20 @@ def test_waiter_portal_assignment_ordering_and_scope(world):
     assert world.get(f"/v1/waiter/tabs/{tab.json()['id']}",headers=auth(other)).status_code==403
     # The owner can read the roster.
     assert world.get('/v1/restaurant/waiters',headers=headers).json()['items'][0]['id']==waiter['id']
+    deactivated=world.patch(f"/v1/users/{waiter['id']}",headers=headers,json={'active':False})
+    assert deactivated.status_code==200,deactivated.text
+    assert world.get('/v1/waiter/me',headers=wh).status_code==401
+    assert world.get('/v1/restaurant/waiters',headers=headers).json()['items']==[]
+    conn=main.connect_db()
+    try:
+        assert conn.execute('SELECT active FROM waiter_profiles WHERE user_id=?',(waiter['id'],)).fetchone()[0]==0
+    finally: conn.close()
+    reactivated=world.patch(f"/v1/users/{waiter['id']}",headers=headers,json={'active':True})
+    assert reactivated.status_code==200,reactivated.text
+    assert world.get('/v1/restaurant/waiters',headers=headers).json()['items'][0]['active'] is True
+    new_login=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':waiter['email'],'password':'strong-waiter-password-123'})
+    assert new_login.status_code==200
+    assert world.get('/v1/waiter/me',headers={'Authorization':'Bearer '+new_login.json()['access_token']}).status_code==200
 
 
 def test_waiter_cannot_access_unassigned_table_or_other_tenant(world):
