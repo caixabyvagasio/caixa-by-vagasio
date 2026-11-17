@@ -81,7 +81,7 @@ def test_frontend_is_served_from_same_app(world):
     assert "Entrar na sua empresa" in world.get("/").text
     assert "Acessar demonstração fictícia" in world.get("/").text
     assert world.get("/static/app.js").status_code == 200
-    assert 'id="loginForm" method="post" action="/"' in world.get("/").text
+    assert 'id="loginForm" method="post" action="/" autocomplete="off"' in world.get("/").text
     assert world.get("/static/app.css").status_code == 200
 
 
@@ -1295,3 +1295,12 @@ def test_branch_stock_role_can_create_but_not_send_or_cancel_purchase_order(worl
     order=world.post(f'/v1/branches/{branch}/purchase-orders',headers=h,json={'supplier_id':sup['id'],'order_number':'ROLE-PO','items':[{'product_id':p['id'],'quantity':'1','unit_cost':'2.00'}]})
     assert order.status_code==201,order.text
     assert world.patch(f'/v1/branches/{branch}/purchase-orders/{order.json()["id"]}',headers=h,json={'status':'ordered'}).status_code==403
+
+
+def test_multi_branch_restaurant_routes_fail_closed_before_any_legacy_access(world):
+    token=company(world);headers=auth(token);first=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    second=world.post('/v1/company/branches',headers=headers,json={'name':'Segunda unidade','code':'UN2'});assert second.status_code==201,second.text
+    headers['X-Branch-Id']=first
+    for path in ['/v1/restaurant/areas','/v1/restaurant/floor','/v1/restaurant/reservations','/v1/restaurant/menu','/v1/restaurant/tabs','/v1/restaurant/production?station=kitchen','/v1/restaurant/reports/operations']:
+        response=world.get(path,headers=headers);assert response.status_code==409,(path,response.status_code,response.text)
+    response=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Tentativa bloqueada'});assert response.status_code==409,response.text
