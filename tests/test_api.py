@@ -1937,3 +1937,21 @@ def test_concurrent_legacy_register_withdrawals_respect_balance_and_close_lock(w
     closed=world.post(f'/v1/registers/{rid}/close',headers=headers,json={'counted_amount':'40.00'})
     assert closed.status_code==200,closed.text
     assert world.post(f'/v1/registers/{rid}/movements',headers=headers,json={'kind':'supply','amount':'5.00','reason':'After close'}).status_code==404
+
+
+def test_concurrent_legacy_payable_payments_do_not_exceed_open_balance(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,'Payables concurrency','payables-concurrency','payables-concurrency@example.test');headers=auth(owner)
+    payable=world.post('/v1/finance/expenses',headers={**headers,'Idempotency-Key':'concurrency-expense-create'},json={'description':'Conta concorrência','amount':'100.00','due_date':'2026-12-10','cost_center':'QA'})
+    assert payable.status_code==201,payable.text
+    pid=payable.json()['id']
+    def pay(i):return world.post(f'/v1/finance/payables/{pid}/payments',headers={**headers,'Idempotency-Key':f'concurrent-payable-{i}'},json={'amount':'40.00','payment_date':'2026-11-17','reference':f'Pagamento concorrente {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(pay,range(8)))
+    assert sum(r.status_code==201 for r in responses)==2,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==6,[(r.status_code,r.text) for r in responses]
+    listed=world.get('/v1/finance/payables?status=all',headers=headers).json()['items']
+    row=next(x for x in listed if x['id']==pid)
+    assert row['paid']=='80.00' and row['remaining']=='20.00' and row['status']=='open'
+    conn=main.connect_db()
+    try: assert conn.execute('SELECT SUM(amount_cents) FROM payable_payments WHERE payable_id=?',(pid,)).fetchone()[0]==8000
+    finally: conn.close()
