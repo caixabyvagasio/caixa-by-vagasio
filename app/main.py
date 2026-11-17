@@ -2193,8 +2193,9 @@ def branch_restaurant_create_tab(branch_id: str,service_id: str,data: Restaurant
 def branch_restaurant_create_order(branch_id: str,tab_id: str,data: RestaurantOrderIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
     oid,now=new_id(),now_iso()
-    with transaction(conn):
-        tab=conn.execute("SELECT id FROM branch_restaurant_tabs WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(tab_id,user["company_id"],branch_id)).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        tab=conn.execute("SELECT id FROM branch_restaurant_tabs WHERE id=? AND company_id=? AND branch_id=? AND status='open'"+lock_clause,(tab_id,user["company_id"],branch_id)).fetchone()
         if not tab: raise HTTPException(404,"Comanda aberta não encontrada nesta filial.")
         conn.execute("INSERT INTO branch_restaurant_orders(id,company_id,branch_id,tab_id,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,'open',?,?,?,?)",(oid,user["company_id"],branch_id,tab_id,data.notes.strip(),user["id"],now,now))
         for line in data.items:
@@ -2231,7 +2232,11 @@ def branch_restaurant_production(branch_id: str,station: Literal["kitchen","bar"
 def branch_restaurant_update_item(branch_id: str,item_id: str,data: RestaurantItemStatusIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.production")
     now=now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        candidate=conn.execute("SELECT o.tab_id FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id WHERE i.id=? AND i.company_id=? AND i.branch_id=?",(item_id,user["company_id"],branch_id)).fetchone()
+        if not candidate: raise HTTPException(404,"Item do pedido não encontrado nesta filial.")
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        conn.execute("SELECT id FROM branch_restaurant_tabs WHERE id=? AND company_id=? AND branch_id=?"+lock_clause,(candidate["tab_id"],user["company_id"],branch_id)).fetchone()
         row=conn.execute("SELECT i.*,o.tab_id,o.status AS order_status,t.status AS tab_status FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id JOIN branch_restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id AND t.branch_id=o.branch_id WHERE i.id=? AND i.company_id=? AND i.branch_id=?",(item_id,user["company_id"],branch_id)).fetchone()
         if not row: raise HTTPException(404,"Item do pedido não encontrado nesta filial.")
         allowed={"queued":{"preparing","cancelled"},"preparing":{"ready","cancelled"},"ready":{"delivered"}}
@@ -2269,29 +2274,32 @@ def branch_restaurant_cash_payment(branch_id: str,tab_id: str,data: RestaurantCa
     amount=decimal_money_cents(data.amount);received=decimal_money_cents(data.received_amount)
     if received<amount: raise HTTPException(422,"Dinheiro recebido insuficiente.")
     now=now_iso();request_hash=hashlib.sha256(json.dumps({"tab_id":tab_id,"amount":amount,"received":received},sort_keys=True).encode()).hexdigest()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        tab=conn.execute("SELECT t.*,s.table_id FROM branch_restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id AND s.branch_id=t.branch_id WHERE t.id=? AND t.company_id=? AND t.branch_id=?"+lock_clause,(tab_id,user["company_id"],branch_id)).fetchone()
+        if not tab: raise HTTPException(404,"Comanda não encontrada nesta filial.")
         prior=conn.execute("SELECT * FROM branch_restaurant_tab_payments WHERE company_id=? AND branch_id=? AND idempotency_key=?",(user["company_id"],branch_id,data.idempotency_key)).fetchone()
         if prior:
             if prior["tab_id"]!=tab_id or prior["request_hash"]!=request_hash: raise HTTPException(409,"Chave idempotente reutilizada com dados diferentes.")
             response.status_code=200
             return {"tab_id":tab_id,"branch_id":branch_id,"amount":cents_to_money(amount),"change":cents_to_money(received-amount),"method":"cash","status":"already_recorded","idempotent":True}
-        tab=conn.execute("SELECT t.*,s.table_id FROM branch_restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id AND s.branch_id=t.branch_id WHERE t.id=? AND t.company_id=? AND t.branch_id=? AND t.status='open'",(tab_id,user["company_id"],branch_id)).fetchone()
-        if not tab: raise HTTPException(404,"Comanda aberta não encontrada nesta filial.")
+        if tab["status"]!='open': raise HTTPException(404,"Comanda aberta não encontrada nesta filial.")
         sums=conn.execute("SELECT COALESCE(SUM((i.quantity_milli*i.unit_price_cents+500)/1000),0) AS total FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id WHERE o.tab_id=? AND i.company_id=? AND i.branch_id=? AND i.status<>'cancelled'",(tab_id,user["company_id"],branch_id)).fetchone()
         total=int(sums["total"]);paid=int(conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM branch_restaurant_tab_payments WHERE tab_id=? AND company_id=? AND branch_id=?",(tab_id,user["company_id"],branch_id)).fetchone()[0])
         if total<=0 or paid+amount>total: raise HTTPException(409,"Valor excede o saldo da comanda ou não há itens cobraveis.")
         items=conn.execute("SELECT DISTINCT o.id,o.status FROM branch_restaurant_orders o JOIN branch_restaurant_order_items i ON i.order_id=o.id AND i.company_id=o.company_id AND i.branch_id=o.branch_id WHERE o.tab_id=? AND o.company_id=? AND o.branch_id=? AND i.status<>'cancelled'",(tab_id,user["company_id"],branch_id)).fetchall()
         if not items or any(x["status"]!="delivered" for x in items): raise HTTPException(409,"Todos os pedidos devem ser entregues antes de receber.")
-        register=conn.execute("SELECT * FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1",(user["company_id"],branch_id)).fetchone()
+        register=conn.execute("SELECT * FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1"+(" FOR UPDATE" if is_postgres(conn) else ""),(user["company_id"],branch_id)).fetchone()
         if not register: raise HTTPException(409,"Abra o caixa desta filial antes de receber a comanda.")
-        # Serialize settlements against the same branch register to prevent concurrent overpayment/duplicate final sale.
-        conn.execute("UPDATE branch_cash_registers SET label=label WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(register["id"],user["company_id"],branch_id))
         # Ensure aggregated ingredients/products can be debited exactly once at final settlement.
         quantities=conn.execute("SELECT product_id,SUM(quantity_milli) AS qty FROM branch_restaurant_order_items WHERE company_id=? AND branch_id=? AND status='delivered' AND id IN (SELECT i.id FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id WHERE o.tab_id=? AND i.company_id=? AND i.branch_id=?) GROUP BY product_id",(user["company_id"],branch_id,tab_id,user["company_id"],branch_id)).fetchall()
+        stocks={}
         if paid+amount==total:
-            for q in quantities:
-                stock=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,q["product_id"])).fetchone()
+            for q in sorted(quantities,key=lambda x:x["product_id"]):
+                conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO NOTHING",(user["company_id"],branch_id,q["product_id"],0,now))
+                stock=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?"+(" FOR UPDATE" if is_postgres(conn) else ""),(user["company_id"],branch_id,q["product_id"])).fetchone()
                 if not stock or int(stock[0])<int(q["qty"]): raise HTTPException(409,"Estoque insuficiente nesta filial para concluir a comanda.")
+                stocks[q["product_id"]]=int(stock[0])
         conn.execute("INSERT INTO branch_restaurant_tab_payments(id,company_id,branch_id,tab_id,amount_cents,method,idempotency_key,request_hash,received_by,received_at) VALUES(?,?,?,?,?,'cash',?,?,?,?)",(new_id(),user["company_id"],branch_id,tab_id,amount,data.idempotency_key,request_hash,user["id"],now))
         conn.execute("INSERT INTO branch_cash_movements(id,company_id,branch_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,'sale',?,?,?,?)",(new_id(),user["company_id"],branch_id,register["id"],user["id"],amount,"Comanda "+tab_id,None,now))
         if paid+amount==total:
@@ -2302,7 +2310,7 @@ def branch_restaurant_cash_payment(branch_id: str,tab_id: str,data: RestaurantCa
                 gross=(line["quantity_milli"]*line["unit_price_cents"]+500)//1000
                 conn.execute("INSERT INTO branch_sale_items(id,company_id,branch_id,sale_id,product_id,sku,name,quantity_milli,unit_price_cents,discount_cents,line_total_cents) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],branch_id,sale_id,line["product_id"],line["sku"],line["name_snapshot"],line["quantity_milli"],line["unit_price_cents"],0,gross))
             for q in quantities:
-                stock=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,q["product_id"])).fetchone();before=int(stock[0]);after=before-int(q["qty"])
+                before=stocks[q["product_id"]];after=before-int(q["qty"])
                 conn.execute("UPDATE branch_product_stock SET quantity_milli=?,updated_at=? WHERE company_id=? AND branch_id=? AND product_id=?",(after,now,user["company_id"],branch_id,q["product_id"]))
                 conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'sale',?,?,?,?,NULL,?)",(new_id(),user["company_id"],branch_id,q["product_id"],user["id"],-int(q["qty"]),before,after,"Baixa comanda "+tab_id,now))
             audit(conn,user["company_id"],user["id"],"branch_sale.completed","branch_sale",sale_id,{"branch_id":branch_id,"total":cents_to_money(total),"source":"restaurant_tab","tab_id":tab_id,"cash_only":True})
