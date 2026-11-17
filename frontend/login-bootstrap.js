@@ -3,7 +3,7 @@
   if(!form)return;
   const message=document.getElementById('loginMessage');
   form.addEventListener('submit',async event=>{
-    event.preventDefault();
+    event.preventDefault();event.stopImmediatePropagation();
     const button=form.querySelector('button[type="submit"]');
     if(button?.disabled)return;
     if(button)button.disabled=true;
