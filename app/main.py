@@ -1459,16 +1459,18 @@ async def granular_permission_guard(request: Request, call_next):
                     if not branch_exempt and request.url.path.startswith("/v1/"):
                         active_branches=conn.execute("SELECT id FROM branches WHERE company_id=? AND status='active' ORDER BY created_at,id",(company_user["company_id"],)).fetchall()
                         requested_branch=request.headers.get("X-Branch-Id")
+                        shared_catalog_write=(request.url.path=="/v1/products" and request.method=="POST") or (request.url.path.startswith("/v1/products/") and request.method=="PUT" and "stock-adjustments" not in request.url.path) or (request.url.path in {"/v1/suppliers","/v1/customers"} and request.method=="POST")
+                        shared_directory_read=request.method=="GET" and request.url.path in {"/v1/suppliers","/v1/customers"}
                         if requested_branch:
                             authorized=conn.execute("SELECT 1 FROM branch_users bu JOIN branches b ON b.id=bu.branch_id AND b.company_id=bu.company_id WHERE bu.company_id=? AND bu.user_id=? AND bu.branch_id=? AND b.status='active'",(company_user["company_id"],company_user["id"],requested_branch)).fetchone()
                             if not authorized: raise HTTPException(403,"Filial inexistente ou não autorizada para este usuário.")
+                            if len(active_branches)>1 and not request.url.path.startswith("/v1/branches/") and not shared_directory_read and not shared_catalog_write:
+                                raise HTTPException(409,"Esta rota ainda não usa escopo operacional de filial. Use os endpoints branch-scoped; nenhuma consulta ou gravação multi-filial foi executada.")
                             catalog_write=(request.url.path=="/v1/products" and request.method=="POST") or (request.url.path.startswith("/v1/products/") and request.method=="PUT" and "stock-adjustments" not in request.url.path) or (request.url.path in {"/v1/suppliers","/v1/customers"} and request.method=="POST")
                             shared_read=request.method=="GET" and request.url.path in {"/v1/suppliers","/v1/customers"}
-                            if len(active_branches)>1 and not request.url.path.startswith("/v1/branches/") and not shared_read and not catalog_write:
-                                raise HTTPException(409,"Particionamento operacional por filial ainda não foi ativado; esta operação não altera nem filtra dados até os fluxos serem migrados.")
                             request.state.branch_id=requested_branch
-                        elif len(active_branches)>1 and not request.url.path.startswith("/v1/branches/") and not (request.method=="GET" and request.url.path in {"/v1/suppliers","/v1/customers"}) and not ((request.url.path in {"/v1/products","/v1/suppliers","/v1/customers"} and request.method=="POST") or (request.url.path.startswith("/v1/products/") and request.method=="PUT" and "stock-adjustments" not in request.url.path)):
-                            raise HTTPException(409,"Operações multi-filial ainda não estão particionadas. Os dados históricos permanecem sem atribuição e nenhuma filial foi selecionada automaticamente.")
+                        elif len(active_branches)>1 and not request.url.path.startswith("/v1/branches/") and not shared_directory_read and not shared_catalog_write:
+                            raise HTTPException(409,"Esta rota ainda não usa escopo operacional de filial. Use os endpoints branch-scoped; nenhuma consulta ou gravação multi-filial foi executada.")
                         elif request.url.path.startswith("/v1/branches/"):
                             match=re.match(r"^/v1/branches/([^/]+)(?:/|$)",request.url.path)
                             if match and match.group(1)!="stock-transfers":
