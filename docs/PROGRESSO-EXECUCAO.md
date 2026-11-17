@@ -234,3 +234,10 @@
 - Estorno sob concorrência: SELECT sale FOR UPDATE serializa requisições; movimento de caixa e retorno único; saldo produto bloqueado em ordem determinística. Novo teste envia oito estornos simultâneos, prova exatamente um 200, sete 409, estoque/caixa restaurados uma vez e uma linha de retorno + reversal event. CI Postgres aprovado.
 - Full suite atual do código de void foi 103 passed, 1 skipped em SQLite (inclui teste concorrente de receipt); transfer suite 102/1 executada anteriormente. O lote final de estornos passou CI general/Postgres. Deploy runtime feito após CI; health 200/PostgreSQL; integração payments/fiscal false.
 - Ainda sem fluxo de UI autenticado, nem concorrência para operações legadas company-wide; estoque/financial multi branch não totalmente integrado, feature breadth e Portal Master continuam fora do concluído.
+
+
+## Continuação — serialização do caixa por filial (2026-11-17 13:53 BRT)
+- HEAD verificado: `9a12da23b45dbaec11d9bd6ae45fe7607c756da6`; CI geral/Postgres success.
+- Encontrado risco: sangria considerava apenas eventos de suprimento/sangria, não vendas/estornos, podendo autorizar retirada maior que o saldo real; movimento não bloqueava concorrência; fechamento podia fechar antes de uma sangria/venda concorrente; vendas e estornos não serializavam com encerramento.
+- Alteração local: movement, close, sale e void sincronizam na linha do register (PostgreSQL FOR UPDATE); sangria valida saldo combinado de opening + cash events + sale/return movements. Close calcula esperado após exclusão mútua; venda/estorno lock register após validar seleção/estoque ou sale.
+- Testes cobrindo caixa com venda seguida de 8 sangrias paralelas (uma aceita, sete 409, expected R$20), saldo negativo bloqueado e fechamento concorrente com suprimento; mais fluxos existentes. Focado 5 passed; full local **105 passed, 1 skipped**. Ainda não CI/deploy desta alteração.
