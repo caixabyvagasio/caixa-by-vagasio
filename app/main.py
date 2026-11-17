@@ -1787,7 +1787,7 @@ def open_branch_register(branch_id: str,data: BranchRegisterOpenIn,conn: DB,user
             if conn.execute("SELECT 1 FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open'",(user["company_id"],branch_id)).fetchone(): raise HTTPException(409,"Já existe caixa aberto nesta filial.")
             conn.execute("INSERT INTO branch_cash_registers(id,company_id,branch_id,label,status,opening_cents,opened_by,opened_at) VALUES(?,?,?,?,'open',?,?,?)",(register_id,user["company_id"],branch_id,data.label.strip(),decimal_money_cents(data.opening_amount),user["id"],now))
             audit(conn,user["company_id"],user["id"],"branch_register.opened","branch_cash_register",register_id,{"branch_id":branch_id,"label":data.label.strip()})
-    except sqlite3.IntegrityError: raise HTTPException(409,"Já existe caixa aberto nesta filial.")
+    except constraint_errors(): raise HTTPException(409,"Já existe caixa aberto nesta filial.")
     return {"id":register_id,"branch_id":branch_id,"label":data.label.strip(),"status":"open","opening_amount":cents_to_money(decimal_money_cents(data.opening_amount)),"opened_at":now}
 
 @app.get("/v1/branches/{branch_id}/registers/current")
@@ -3410,7 +3410,7 @@ def open_register(data: RegisterOpenIn, conn: DB, user: USER):
                          (register_id, user["company_id"], data.label.strip(), decimal_money_cents(data.opening_amount), user["id"], opened_at))
             audit(conn, user["company_id"], user["id"], "register.opened", "register", register_id,
                   {"label": data.label.strip(), "opening_amount": cents_to_money(decimal_money_cents(data.opening_amount))})
-    except sqlite3.IntegrityError:
+    except constraint_errors():
         raise HTTPException(409, "Já existe um caixa aberto com esse nome.")
     row = conn.execute("SELECT * FROM cash_registers WHERE id=?", (register_id,)).fetchone()
     return register_json(row)
