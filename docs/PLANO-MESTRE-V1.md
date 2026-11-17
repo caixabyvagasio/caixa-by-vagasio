@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 13:53 | `9a12da23b45dbaec11d9bd6ae45fe7607c756da6` | Caixa branch movements/sales/void/close local row-lock and cash balance validation; tests 105/1. | CI general/Postgres for register concurrency and verify before dev deployment. |
+
+## Work log / checkpoints
+
 | 2026-11-17 12:49 | `c2389d1088c7dca5a6ec858f74db25274418768f` | Revisão AST comparou permission_for_endpoint e require_permission em todos os handlers (finding inicial 5 divergências); alinhei sales report, branch product reads, close-empty, waiter management, restaurant operations report e branch restaurant payment. CI geral/Postgres posterior verde; Render dev live no commit da ordem. Full local 96/1. | Continuar teste PostgreSQL de concorrência de saldo. |
 | 2026-11-17 12:57 | `d1167d484a1462e2347f0c4d3b06526a7cdbadd9` | Deploy verificado live. Teste concorrente em Postgres revelou SerializationFailure. | Aplicar lock e testar estoque/venda concorrentes no Postgres. |
 | 2026-11-17 13:10 | `14b861d675802341f4f161a7caacfa98f9325d1f` | CI PostgreSQL `44121112420` falhou por serialização concorrente em branch stock upsert. | Corrigir locking e testar contra Postgres. |
