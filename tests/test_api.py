@@ -735,7 +735,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1455,3 +1455,60 @@ def test_frontend_favicon_asset_is_served_and_linked(world):
     assert response.status_code==200
     assert response.headers['content-type'].startswith('image/png')
     assert response.content.startswith(b'\x89PNG\r\n\x1a\n')
+
+
+def test_waiter_portal_assignment_ordering_and_scope(world):
+    owner=company(world);headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    created=world.post('/v1/restaurant/waiters',headers=headers,json={'full_name':'Garçom QA','email':'waiter@example.test','password':'strong-waiter-password-123'})
+    assert created.status_code==201,created.text
+    waiter=created.json()
+    login=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':waiter['email'],'password':'strong-waiter-password-123'});assert login.status_code==200,login.text
+    wh={'Authorization':'Bearer '+login.json()['access_token']}
+    assert world.get('/v1/waiter/me',headers=wh).json()['waiter'] is True
+    assert world.get('/v1/products',headers=wh).status_code==403
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Salão'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'G1','capacity':4}).json()
+    assert world.put(f"/v1/restaurant/tables/{table['id']}/waiter",headers=headers,json={'waiter_id':waiter['id']}).status_code==200
+    floor=world.get('/v1/waiter/floor',headers=wh);assert floor.status_code==200 and floor.json()['tables'][0]['id']==table['id']
+    opened=world.post(f"/v1/waiter/tables/{table['id']}/open",headers=wh);assert opened.status_code==200,opened.text
+    tab=world.post(f"/v1/waiter/services/{opened.json()['id']}/tabs",headers=wh);assert tab.status_code==201,tab.text
+    assert world.get(f"/v1/waiter/tabs/{tab.json()['id']}",headers=wh).status_code==200
+    product_row=product(world,owner,sku='WTR-1',name='Suco',price='8.50')
+    assert world.post(f"/v1/products/{product_row['id']}/stock-adjustments",headers=headers,json={'direction':'in','quantity':'5','reason':'Estoque de teste garçom'}).status_code==201
+    category=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Bebidas'}).json()
+    menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':product_row['id'],'station':'bar'});assert menu.status_code==201,menu.text
+    ordered=world.post(f"/v1/waiter/tabs/{tab.json()['id']}/orders",headers=wh,json={'items':[{'menu_item_id':menu.json()['id'],'quantity':'2'}],'notes':'Sem gelo'});assert ordered.status_code==201,ordered.text
+    sent=world.post(f"/v1/waiter/orders/{ordered.json()['id']}/send",headers=wh);assert sent.status_code==200 and sent.json()['status']=='sent'
+    detail=world.get(f"/v1/waiter/tabs/{tab.json()['id']}",headers=wh).json();assert detail['total']=='17.00'
+    # Manager/production transitions remain auditable; waiter can record only the supported cash receipt.
+    owner_reg=world.post('/v1/registers/open',headers=headers,json={'label':'Caixa salão','opening_amount':'0'});assert owner_reg.status_code==201,owner_reg.text
+    item=world.get('/v1/restaurant/production?station=bar',headers=headers).json()['items'][0]
+    for status in ('preparing','ready'):
+        transition=world.patch(f"/v1/restaurant/order-items/{item['id']}",headers=headers,json={'status':status});assert transition.status_code==200,transition.text
+    delivered=world.patch(f"/v1/waiter/order-items/{item['id']}/delivered",headers=wh);assert delivered.status_code==200,delivered.text
+    payment=world.post(f"/v1/waiter/tabs/{tab.json()['id']}/payments",headers=wh,json={'amount':'17.00','received_amount':'20.00','idempotency_key':'waiter-cash-0001'});assert payment.status_code==201,payment.text
+    assert payment.json()['change']=='3.00' and payment.json()['electronic_confirmation'] is False
+    # A different tenant cannot read a comanda assigned here.
+    other=company(world,name='Outra empresa',slug='outra-empresa',email='other-owner@example.test')
+    assert world.get(f"/v1/waiter/tabs/{tab.json()['id']}",headers=auth(other)).status_code==403
+    # The owner can read the roster.
+    assert world.get('/v1/restaurant/waiters',headers=headers).json()['items'][0]['id']==waiter['id']
+
+
+def test_waiter_cannot_access_unassigned_table_or_other_tenant(world):
+    owner=company(world);headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    w=world.post('/v1/restaurant/waiters',headers=headers,json={'full_name':'Garçom B','email':'waiter-b@example.test','password':'strong-waiter-password-456'}).json()
+    login=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':w['email'],'password':'strong-waiter-password-456'}).json();wh={'Authorization':'Bearer '+login['access_token']}
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Área'}).json();table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'B1','capacity':2}).json()
+    assert world.post(f"/v1/waiter/tables/{table['id']}/open",headers=wh).status_code==409
+    assert world.get('/v1/restaurant/tabs',headers=wh).status_code==403
+
+
+def test_waiter_portal_stays_blocked_for_multi_branch_company(world):
+    owner=company(world);headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    assert world.post('/v1/company/branches',headers=headers,json={'name':'Filial 2','code':'branch-2'}).status_code==201
+    response=world.post('/v1/restaurant/waiters',headers=headers,json={'full_name':'Garçom multi','email':'waiter-multi@example.test','password':'strong-waiter-password-789'})
+    assert response.status_code==409 and 'multi-filial' in response.text
