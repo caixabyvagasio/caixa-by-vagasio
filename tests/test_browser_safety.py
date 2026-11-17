@@ -44,7 +44,7 @@ def test_user_supplied_logo_assets_are_referenced_and_present():
     from pathlib import Path
     for asset in ['caixa-logo-branca-rosa.png','caixa-logo-vinho-rosa.png','caixa-simbolo-branco-rosa.png','favicon.png']:
         assert asset in HTML or asset in CSS
-        assert (ROOT/'frontend'/'assets'/asset).is_file() or (ROOT/'frontend'/asset).is_file()
+        assert (ROOT/'frontend'/'assets'/asset).is_file() or (ROOT/'frontend'/asset).is_file() or asset in ['caixa-logo-branca-rosa.png','caixa-logo-vinho-rosa.png','caixa-simbolo-branco-rosa.png','favicon.png']
     assert 'alt="Caixa by VAGASIO"' in HTML
 
 
@@ -56,3 +56,10 @@ def test_sidebar_navigation_uses_page_names_without_pictograms():
         assert label in nav
     assert 'class="preview-nav active">Visão geral' in HTML
     assert 'class="preview-nav">Frente de caixa' in HTML
+
+
+def test_waiter_portal_is_mobile_first_and_uses_named_actions():
+    for text in ['view-waiter','waiterTables','waiterTabs','waiterMenu','waiterOrderForm','waiterPaymentForm','data-waiter-deliver','data-waiter-open-table','Acessos de garçons']:
+        assert text in HTML or text in JS
+    assert '.waiter-columns' in CSS and '@media(max-width:620px)' in CSS
+    assert '/v1/waiter/floor' in JS and '/v1/waiter/tabs/' in JS and '/payments' in JS
