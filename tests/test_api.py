@@ -1645,6 +1645,28 @@ def test_concurrent_legacy_stock_adjustments_preserve_every_update(world):
     assert len(events)==8 and {e['after'] for e in events}=={'1','2','3','4','5','6','7','8'}
 
 
+
+def test_concurrent_legacy_register_open_returns_conflict_instead_of_server_error(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,name="Register open race",slug="register-open-race",email="register-open-race@example.test");headers=auth(owner)
+    def open_register(i):return world.post('/v1/registers/open',headers=headers,json={'label':f'Register race {i}','opening_amount':'0'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(open_register,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    assert world.get('/v1/registers/current',headers=headers).json()['register']['status']=='open'
+
+
+def test_concurrent_branch_register_open_returns_conflict_instead_of_server_error(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,name="Branch register open race",slug="branch-register-open-race",email="branch-register-open-race@example.test");headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    def open_register(i):return world.post(f'/v1/branches/{branch}/registers/open',headers=headers,json={'label':f'Branch register {i}','opening_amount':'0'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(open_register,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    assert world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()['register']['status']=='open'
+
+
 def test_branch_concurrent_sales_lock_stock_and_record_all_cash_events(world):
     from concurrent.futures import ThreadPoolExecutor
     owner=company(world);headers=auth(owner)
