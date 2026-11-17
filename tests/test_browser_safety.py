@@ -38,3 +38,11 @@ def test_public_landing_matches_caixa_brand_and_avoids_unimplemented_claims():
     assert 'Valores demonstrativos não são dados reais.' in HTML
     assert 'As ferramentas específicas de cada segmento são liberadas conforme sua implementação e validação.' in HTML
     assert 'Integrações completas' not in HTML
+
+
+def test_user_supplied_logo_assets_are_referenced_and_present():
+    from pathlib import Path
+    for asset in ['caixa-logo-branca-rosa.png','caixa-logo-vinho-rosa.png','caixa-simbolo-branco-rosa.png','favicon.png']:
+        assert asset in HTML or asset in CSS
+        assert (ROOT/'frontend'/'assets'/asset).is_file() or (ROOT/'frontend'/asset).is_file()
+    assert 'alt="Caixa by VAGASIO"' in HTML
