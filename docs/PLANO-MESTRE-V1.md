@@ -1,0 +1,99 @@
+# Plano mestre de entrega — Caixa by VAGASIO
+
+**Início:** 2026-11-17 12:22 BRT  
+**Base inicialmente pedida:** auditoria do commit `c6ea16fd7496976f4d2d777ff018616ee4521507`.  
+**Branch alvo:** `development-v1` exclusivamente.  
+**Produção e `vagasio-2026`:** fora de escopo de escrita; nunca usar nos testes.  
+**Status global:** EM ANDAMENTO — não homologado, não pronto para produção.
+
+## Estado inicial confirmado nesta retomada
+
+- HEAD remoto lido antes de editar: `c6ea16fd7496976f4d2d777ff018616ee4521507`, mensagem “Document waiter portal progress and safety gates”. Sem commits posteriores observados.
+- Deploy dev associado ao mesmo commit; execução confirmada anteriormente na auditoria como live. Nenhum dado de empresa real será alterado.
+- O relatório de auditoria completo está em `relatorio_auditoria_caixa.md` e `/` não deve ser confundido com tela Master. O estado inicial continua: FastAPI monolítico, SPA, migrations 1–16, negócio cash-only, sem integrações pagamento/fiscal homologadas.
+- O primeiro passo é corrigir o ciclo de desativação/reativação de contas garçom, verificável com tenant descartável de teste. Nenhuma implementação é declarada enquanto CI/Postgres e runtime não forem verificados.
+
+## Regras de segurança e publicação
+
+1. Antes de cada lote, reler branch HEAD e baixar/verificar as versões atuais dos arquivos a alterar; nunca sobrescrever um commit concorrente.
+2. Alterações somente em `development-v1`. Rodar suíte geral e PostgreSQL antes de deploy; não aplicar migrations diretamente no banco persistente sem backup/restore comprovado.
+3. Tratar todo dado de QA como fictício, isolado e não ligado a `vagasio-2026`. Não executar pagamentos, emissão fiscal nem operações financeiras reais.
+4. Nunca atribuir registros históricos com `branch_id NULL` automaticamente. Desenhar conciliação explícita, preview/dry-run, dupla verificação e trilha auditável.
+5. Não ativar feature status `AVAILABLE/ENABLED` nem anunciar conclusão sem backend+frontend+schema+permissões+testes+E2E e integração pertinente.
+6. Se um provedor externo não estiver homologado, manter estado `unavailable`; não simular pagamento, fiscal, impressora, balança ou TEF.
+7. A aplicação inicia migrations automaticamente. Toda migration deve ser aditiva/idempotente, CI PostgreSQL, revisão de lock/recovery e rollback strategy; se não houver recovery comprovada, não aplicar em base persistente.
+
+## Ordem de implementação e critérios
+
+### Fase 0 — Continuidade, checkpoint e baseline
+- Confirmar HEAD, workflows, branch e serviço dev antes de cada lote.
+- Fixar problema, impacto, arquivos/rotas e teste de regressão neste plano.
+- Critério: evidência do commit remoto e do estado do deployment documentada; sem alteração em produção.
+
+### Fase 1 — Segurança e integridade crítica
+- Consolidar matriz de políticas endpoint→permission→role→tenant→branch; rejeitar acesso fail-closed.
+- Corrigir desativação/reativação de waiter profile e validar tokens/sessões existentes.
+- Auditar atomicidade, lock/concurrency, idempotência e constraint em operações de caixa, venda, estoque, pagamento manual, transferência e reserva.
+- Definir backup, export, restore drill, RPO/RTO antes de qualquer migration persistente relevante. Estado atual backup/PITR não comprovado.
+- Critério: teste negativo parametrizado, PostgreSQL concorrente para invariantes; estratégia e restore verificados em DB isolado; usuário desativado sem acesso.
+
+### Fase 2 — Escopo multiempresa/multifilial
+- Fazer inventário de 134 operações, contexts e queries; estruturar helper/request context de branch e escopo de repos.
+- Definir um único source of truth para saldo: migrar transacionalmente para ledger por filial com snapshots/reconciliação; manter legado `NULL` intocado até conciliação manual assinada/auditada.
+- Escopar estoque, catálogo policies, compras, caixa/venda, financeiro, clientes/fornecedores, restaurante e relatórios; composite FK/unique constraints onde seguro.
+- UI de seleção e transferências devem operar só filiais associadas; produto/cliente master catalog precisa política compartilhada explícita.
+- Critério: duas filiais operam em paralelo; cross-tenant/cross-branch retorna 403/404; ledger, relatórios e liquidação batem; dados NULL não acessíveis como atribuídos.
+
+### Fase 3 — Arquitetura e núcleo comercial
+- Extrair módulos de domínio incrementalmente de `app/main.py`: auth/tenant, products/inventory, sales/cash, purchasing, finance, branches, restaurant, permissions/master; routers/services/repositories/schemas.
+- Preservar APIs, migração/teste por módulo.
+- Completar categorias, produto ativo/histórico, variantes, barcode input contract, inventory count, loss, reservation, supplier orders/divergence, customer history/privacy, accounts receivable, cash reconciliation e relatórios.
+- UI sem `prompt()/alert()`, forms com validation, loading/empty/error states e accessibles.
+- Critério: contratos de API e testes behavior/UI completos e ledger reconciliado.
+
+### Fase 4 — Restaurante
+- Completar modelo de praça/garçom, adicionais/combos/variantes, recipes/ingredient stock decrement, KDS, counter/pickup/delivery, reservations lifecycle, table/service transfer, bill split by item/person, reversals/voids, cash settlement and reports.
+- Corrigir offboarding, permissões e escopo branch.
+- Critério: fluxograma solicitado executado via browser autenticado e Postgres QA; concorrência de mesa/estoque/recebimento; impressão externa apenas após aparelho e protocolo definidos.
+
+### Fase 5 — Cinco segmentos restantes
+- Grocery: barcode/scales contract, weighed item pricing, promotions, lots/expiry, inventory/loss/replenishment, multi registers.
+- Apparel: sizes/colors/grades/SKUs, stock variants, sellers/goals/commissions, reservations, exchanges/returns/loyalty.
+- Construction: estimates/quotes, conversion, UOM conversion, price lists, warehouse/reservations, pick/delivery/partial delivery.
+- Services: professionals, availability/calendar, appointment reschedule/conflict exclusion, work order/quote/packages/materials/commission/client history.
+- Retail general: complete common flow, promotion and returns.
+- Critério de cada vertical: data model, migrations, permissions, API/UI, report, tenant/branch constraints, E2E workflow, feature catalog available only after proof.
+
+### Fase 6 — Portal Master e ativação inteligente
+- Implementar admin identity/MFA/least privilege, UI, company search/status/suspension, plans, subscription pending→active only through trusted manual administration or verified provider, entitlements, support/audit/service health.
+- Subscription pending remains no access. No payment simulation.
+- Activity recommendations must not activate unavailable modules; validate entitlement+plan+subscription period+permission+branch dependencies server-side.
+- Critério: browser auth UI and negative cross-tenant/master RBAC tests; audit all privileged actions.
+
+### Fase 7 — Integrações
+- Prepare adapters for payments (Pix/cards/TEF), fiscal, printers/barcode scanners/scales, notifications and delivery providers.
+- Implement only if credentials/provider/sandbox and formal requirements exist; webhook verification, replay/idempotency and reconciliation required.
+- Until homologated, explicit unavailable state.
+
+### Fase 8 — Testes e homologação
+- Unit/domain, Postgres migrations, branch/cross-tenant negative, concurrency/integrity, failures/rollback, API and browser E2E all roles, desktop/mobile/a11y, load/performance, backup restore.
+- Stage only synthetic QA. Provide exact run IDs, commits, deployment and screenshots.
+- Critério de release: every module in scope has traceable acceptance; no critical issues; backups restore; integrations real/homologated or clearly disabled; do not claim more than verified.
+
+## Work log / checkpoints
+
+| BRT/data | HEAD | Trabalho/resultado | Próxima ação |
+|---|---|---|---|
+| 2026-11-17 12:22 | `c6ea16fd7496976f4d2d777ff018616ee4521507` | HEAD confirmado antes de alterações; auditoria completa relida. Sem dados modificados. | Corrigir user/waiter active lifecycle; testes e CI; prosseguir em segurança/multibranch. |
+
+## Pendências de maior prioridade visíveis no baseline
+
+- Backup/PITR/restore do Postgres persistente não comprovados; sem alteração de schema persistente até estratégia verificada.
+- Multi-filial é parcial, legacy branch NULL e dois ledgers de stock; endpoint policy scope revisto route by route.
+- Produtos e compras ainda coexistem em caminhos company-wide e branch-scoped.
+- Portal Master web e roles/administration inexistentes.
+- Cinco verticais especializadas ainda não implementadas.
+- Restaurante não tem adicionais/recipes/delivery/KDS real/bill-by-item/cancel-close UX completa.
+- `prompt()/alert()` operacional em frontend.
+- Pagamento, fiscal e hardware indisponíveis; não simular.
+- UI autenticada E2E ausente; exigência para próxima validação QA.
