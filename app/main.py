@@ -3360,8 +3360,9 @@ def adjust_stock(product_id: str, data: StockAdjustmentIn, conn: DB, user: USER)
     require_permission(conn,user,"stock.adjust")
     quantity = decimal_milli(data.quantity)
     movement_id, created = new_id(), now_iso()
-    with transaction(conn):
-        product = company_product(conn, user["company_id"], product_id)
+    with transaction(conn,"READ COMMITTED"):
+        product = conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND active=1"+(" FOR UPDATE" if is_postgres(conn) else ""),(product_id,user["company_id"])).fetchone()
+        if not product: raise HTTPException(404,"Produto não encontrado nesta empresa.")
         before = product["stock_milli"]
         after = before + quantity if data.direction == "in" else before - quantity
         if after < 0:
