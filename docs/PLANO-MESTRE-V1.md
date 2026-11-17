@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 14:31 | `f254388c0615539c4da21a6f05f3f70060bd0180` | Branch/legacy reservations and tab-vs-service close concurrency fix deployed/live, CI general/Postgres green. Legacy restaurant table/tab/order/production/payment locks local; suite 111/1. | Run CI general/Postgres and deploy dev. |
+
+## Work log / checkpoints
+
 | 2026-11-17 14:22 | `aa6add7c72bde83bab775c8e89c3584a9863d91a` | Branch/legacy reservation overlap locks and service close-empty vs tab-open lock; local 110 passed/1 skipped. | CI general/PostgreSQL, then dev deploy. |
 
 ## Work log / checkpoints
