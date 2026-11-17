@@ -1446,3 +1446,11 @@ def test_branch_restaurant_order_production_cash_close_and_branch_ledgers(world)
         assert conn.execute('SELECT COUNT(*) FROM sales WHERE company_id=?',(company_id,)).fetchone()[0]==0
         assert conn.execute('SELECT COUNT(*) FROM branch_sales WHERE branch_id=?',(branch,)).fetchone()[0]==1
     finally:conn.close()
+
+
+def test_frontend_favicon_asset_is_served_and_linked(world):
+    html=world.get('/').text
+    assert 'href="/static/favicon.svg"' in html
+    response=world.get('/static/favicon.svg')
+    assert response.status_code==200
+    assert '<svg' in response.text and 'viewBox="0 0 64 64"' in response.text
