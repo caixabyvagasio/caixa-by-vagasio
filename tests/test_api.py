@@ -1706,6 +1706,44 @@ def test_concurrent_purchase_receipts_never_exceed_ordered_quantity(world):
 
 
 
+
+def test_concurrent_legacy_purchase_cancel_and_receipt_are_serialized(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,name="Cancel receipt race",slug="cancel-receipt-race",email="cancel-receipt-race@example.test");headers=auth(owner)
+    supplier=world.post('/v1/suppliers',headers=headers,json={'name':'Race supplier'}).json()
+    p=product(world,owner,sku='CANCEL-RECEIPT-RACE')
+    order=world.post('/v1/purchase-orders',headers=headers,json={'supplier_id':supplier['id'],'order_number':'CANCEL-RACE-1','items':[{'product_id':p['id'],'quantity':'1','unit_cost':'2.00'}]}).json()
+    assert world.patch(f"/v1/purchase-orders/{order['id']}",headers=headers,json={'status':'ordered'}).status_code==200
+    item=world.get('/v1/purchase-orders',headers=headers).json()['items'][0]['items'][0]
+    def cancel():return world.patch(f"/v1/purchase-orders/{order['id']}",headers=headers,json={'status':'cancelled'})
+    def receive():return world.post(f"/v1/purchase-orders/{order['id']}/receipts",headers={**headers,'Idempotency-Key':'cancel-receipt-race-key'},json={'items':[{'order_item_id':item['id'],'quantity':'1'}]})
+    with ThreadPoolExecutor(max_workers=2) as pool: cancel_result,receipt_result=list(pool.map(lambda f:f(),(cancel,receive)))
+    state=world.get('/v1/purchase-orders',headers=headers).json()['items'][0]['status']
+    stock=next(x for x in world.get('/v1/products',headers=headers).json()['items'] if x['id']==p['id'])['stock']
+    assert (cancel_result.status_code,receipt_result.status_code,state,stock) in {
+        (200,409,'cancelled','0'),(409,201,'received','1')
+    },(cancel_result.status_code,receipt_result.status_code,state,stock,cancel_result.text,receipt_result.text)
+
+
+def test_concurrent_branch_purchase_cancel_and_receipt_are_serialized(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,name="Branch cancel receipt race",slug="branch-cancel-receipt-race",email="branch-cancel-receipt-race@example.test");headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    supplier=world.post('/v1/suppliers',headers=headers,json={'name':'Branch race supplier'}).json()
+    p=product(world,owner,sku='BRANCH-CANCEL-RECEIPT-RACE')
+    order=world.post(f'/v1/branches/{branch}/purchase-orders',headers=headers,json={'supplier_id':supplier['id'],'order_number':'BRANCH-CANCEL-RACE-1','items':[{'product_id':p['id'],'quantity':'1','unit_cost':'2.00'}]}).json()
+    assert world.patch(f"/v1/branches/{branch}/purchase-orders/{order['id']}",headers=headers,json={'status':'ordered'}).status_code==200
+    item=world.get(f'/v1/branches/{branch}/purchase-orders',headers=headers).json()['items'][0]['items'][0]
+    def cancel():return world.patch(f"/v1/branches/{branch}/purchase-orders/{order['id']}",headers=headers,json={'status':'cancelled'})
+    def receive():return world.post(f"/v1/branches/{branch}/purchase-orders/{order['id']}/receipts",headers={**headers,'Idempotency-Key':'branch-cancel-receipt-race-key'},json={'items':[{'order_item_id':item['id'],'quantity':'1'}]})
+    with ThreadPoolExecutor(max_workers=2) as pool: cancel_result,receipt_result=list(pool.map(lambda f:f(),(cancel,receive)))
+    state=world.get(f'/v1/branches/{branch}/purchase-orders',headers=headers).json()['items'][0]['status']
+    stock=next(x for x in world.get(f'/v1/branches/{branch}/inventory',headers=headers).json()['items'] if x['product_id']==p['id'])['quantity']
+    assert (cancel_result.status_code,receipt_result.status_code,state,stock) in {
+        (200,409,'cancelled','0'),(409,201,'received','1')
+    },(cancel_result.status_code,receipt_result.status_code,state,stock,cancel_result.text,receipt_result.text)
+
+
 def test_concurrent_legacy_receipts_on_distinct_orders_do_not_lose_shared_stock_updates(world):
     from concurrent.futures import ThreadPoolExecutor
     owner=company(world,name="Concurrent receipts",slug="concurrent-receipts",email="concurrent-receipts@example.test")
