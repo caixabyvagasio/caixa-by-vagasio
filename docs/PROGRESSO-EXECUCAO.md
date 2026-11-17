@@ -272,3 +272,9 @@
 - Legacy restaurant concurrency locks ficaram live no dev: commit `f2c649321749350cb57b598896b3edee7956007c`, deploy `dep-dbu92tsipgvc73dtg8u0`, CI general/Postgres `44138994585`/`44138994435` success.
 - Próxima rodada detectou concorrência em venda/caixa legacy: caixa não era bloqueado em sangria/fechamento/venda/void; venda não travava saldo dos produtos. Alterei venda para READ COMMITTED, bloqueio de caixa, bloqueio de produtos por id e releitura de quantidades; cash movement/close bloqueiam caixa; void bloqueia venda, caixa e estoque em ordem determinística.
 - Teste sintético 8 vendas contra 4 unidades: 4 sucesso, 4 409, saldo 0 e caixa R$80. Oito sangrias de R$60 contra R$100: uma sucesso e sete 409, caixa R$40; fechamento e recusa posterior validados. Focados 3 pass; full local **113 passed, 1 skipped**. Código ainda não validado em CI/deploy.
+
+
+## Continuação — vendas, caixa e contas a pagar (2026-11-17 14:49 BRT)
+- A proteção de vendas legacy/caixa está localmente verificada; duas operações de pagamento de contas também estavam sujeitas a saldo concorrente. `pay_branch_payable`, `record_payable_payment` e `mark_payable_paid` agora usam READ COMMITTED e bloqueiam a linha da conta antes do cálculo/inserção, incluindo idempotência e atualização de status.
+- Teste de conta de R$100 com 8 pagamentos concorrentes de R$40: exatamente dois aceitos, seis 409, total R$80 em ledger, saldo R$20; focados (varejo, sangria, payables) 6 passaram. Suite completa **114 passed, 1 skipped**.
+- CI/deploy destas alterações de varejo/payables pendentes. Código continua só em dev branch quando CI verde; nenhum dado persistente alterado.
