@@ -1647,3 +1647,38 @@ def test_branch_concurrent_sales_lock_stock_and_record_all_cash_events(world):
     assert len(sales)==8 and all(x['status']=='paid' for x in sales)
     register=world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()
     assert register['expected_amount']=='36.00'
+
+
+def test_branch_concurrent_transfers_lock_both_balances_and_post_ledger(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    source=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    dest=world.post('/v1/company/branches',headers=headers,json={'code':'transfer-dest','name':'Destino transfer QA'}).json()['id']
+    p=product(world,owner,sku='CONCURRENT-TRANSFER',name='Transferência Concorrente')
+    assert world.post(f'/v1/branches/{source}/inventory/{p["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'8','reason':'Carga concorrência QA'}).status_code==201
+    def transfer(i):
+        return world.post('/v1/branches/stock-transfers',headers={**headers,'Idempotency-Key':f'concurrent-transfer-{i}'},json={'from_branch_id':source,'to_branch_id':dest,'product_id':p['id'],'quantity':'1','reason':f'Transfer QA {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(transfer,range(8)))
+    assert all(r.status_code==201 for r in responses),[(r.status_code,r.text) for r in responses]
+    src_inv=world.get(f'/v1/branches/{source}/inventory',headers=headers).json()['items'][0]['quantity']
+    dst_inv=world.get(f'/v1/branches/{dest}/inventory',headers=headers).json()['items'][0]['quantity']
+    assert (src_inv,dst_inv)==('0','8')
+    assert world.get(f'/v1/branches/{source}/stock-movements?product_id={p["id"]}&kind=transfer_out',headers=headers).json()['total']==8
+    assert world.get(f'/v1/branches/{dest}/stock-movements?product_id={p["id"]}&kind=transfer_in',headers=headers).json()['total']==8
+
+
+def test_concurrent_transfers_cannot_overdraw_branch_stock(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    source=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    dest=world.post('/v1/company/branches',headers=headers,json={'code':'transfer-limit','name':'Destino limite'}).json()['id']
+    p=product(world,owner,sku='TRANSFER-LIMIT',name='Limite concorrência')
+    assert world.post(f'/v1/branches/{source}/inventory/{p["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'4','reason':'Carga QA'}).status_code==201
+    def transfer(i):
+        return world.post('/v1/branches/stock-transfers',headers={**headers,'Idempotency-Key':f'limited-transfer-{i}'},json={'from_branch_id':source,'to_branch_id':dest,'product_id':p['id'],'quantity':'1','reason':f'Limite QA {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(transfer,range(8)))
+    assert sum(r.status_code==201 for r in responses)==4,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==4,[(r.status_code,r.text) for r in responses]
+    src=world.get(f'/v1/branches/{source}/inventory',headers=headers).json()['items'][0]['quantity']
+    dst=world.get(f'/v1/branches/{dest}/inventory',headers=headers).json()['items'][0]['quantity']
+    assert (src,dst)==('0','4')
