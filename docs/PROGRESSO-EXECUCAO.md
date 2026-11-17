@@ -179,3 +179,9 @@
 - Plano persistente da ordem: `docs/PLANO-MESTRE-V1.md`, com etapas, critérios, restrições e checkpoint.
 - Primeira correção em implementação: desativar/reativar um user garçom deve atualizar na mesma transação `waiter_profiles.active`, retirar do roster e bloquear tokens existentes pelo current_user; reativação permite login novo e retorna profile. Teste específico adicionado. Aguardando testes totais/CI antes de qualquer publicação dev.
 - Nenhuma alteração de dados de tenant real; testes locais usam fixtures descartáveis. Nenhum deploy/migration executado nesta retomada ainda.
+
+- CI remoto da correção waiter em `0bc9104f8af612e168ceff04d488ae8306010ccf`: general run `44114199324` success, PostgreSQL `44114199396` success; Render dev `dep-dbu74up42hec73bp4jbg` live, health PostgreSQL.
+- Segunda correção em andamento: guard fail-closed agora considera toda rota `/v1/` operacional não branch-scoped quando existem várias filiais, inclusive quando recebe `X-Branch-Id`; lista permitida mínima é shared directory GET e gravações compartilhadas de catálogo explicitamente classificadas. Novo teste faz probes GET a estoque, movimentos, vendas, compras, financeiro, dashboard/reports, salão/comandas e garante 409; ainda necessita suite+CI e revisão de compatibilidade da UI.
+
+- O primeiro full test no snapshot de trabalho teve falso 404 do favicon porque o checkout inicial não tinha assets binários; foram baixadas cópias idênticas ao branch remoto para o workspace temporário (nenhuma alteração nos arquivos do branch). Full final: **94 passed, 1 skipped**. Anterior ao asset restore foi 93/1 + 1 falso falho; teste focado multibranch 5/5.
+- Correção do fail-closed ainda não enviada ao remoto. Os testes existentes de barcode/branch/shared catalog não foram todos exercitados ainda na alteração, e CI geral+PostgreSQL deve passar antes da publicação.
