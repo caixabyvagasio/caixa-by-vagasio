@@ -437,6 +437,18 @@ def apply_schema_migrations(conn) -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN branch_id TEXT REFERENCES branches(id)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS {table}_branch_scope ON {table}(company_id,branch_id)")
     migration(12,"nullable_restaurant_branch_scope",add_nullable_restaurant_branch_scope)
+    def create_branch_restaurant_menu():
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_restaurant_menu_categories(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
+            name TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),created_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL,
+            UNIQUE(company_id,branch_id,name),UNIQUE(id,company_id,branch_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_restaurant_menu_items(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
+            category_id TEXT NOT NULL,product_id TEXT NOT NULL REFERENCES products(id),station TEXT NOT NULL CHECK(station IN ('kitchen','bar','counter')),
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),created_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL,
+            UNIQUE(company_id,branch_id,product_id),FOREIGN KEY(category_id,company_id,branch_id) REFERENCES branch_restaurant_menu_categories(id,company_id,branch_id))""")
+        conn.execute("CREATE INDEX IF NOT EXISTS branch_restaurant_menu_lookup ON branch_restaurant_menu_items(company_id,branch_id,active,category_id)")
+    migration(13,"branch_scoped_restaurant_menu",create_branch_restaurant_menu)
 
 
 def init_db() -> None:
@@ -2022,6 +2034,40 @@ def branch_restaurant_create_area(branch_id: str,data: RestaurantAreaIn,conn: DB
             audit(conn,user["company_id"],user["id"],"restaurant.branch_area_created","restaurant_area",rid,{"branch_id":branch_id,"name":data.name.strip()})
     except sqlite3.IntegrityError: raise HTTPException(409,"Ambiente já cadastrado.")
     return {"id":rid,"branch_id":branch_id,"name":data.name.strip(),"active":True}
+
+
+@app.get("/v1/branches/{branch_id}/restaurant/menu")
+def branch_restaurant_menu(branch_id: str,conn: DB,user: USER):
+    require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"products.read")
+    cats=conn.execute("SELECT id,name FROM branch_restaurant_menu_categories WHERE company_id=? AND branch_id=? AND active=1 ORDER BY name,id",(user["company_id"],branch_id)).fetchall()
+    rows=conn.execute("SELECT m.id,m.category_id,c.name AS category,m.product_id,p.name,p.price_cents,p.unit,m.station FROM branch_restaurant_menu_items m JOIN branch_restaurant_menu_categories c ON c.id=m.category_id AND c.company_id=m.company_id AND c.branch_id=m.branch_id JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.company_id=? AND m.branch_id=? AND m.active=1 AND p.active=1 ORDER BY c.name,p.name,m.id",(user["company_id"],branch_id)).fetchall()
+    return {"branch_id":branch_id,"categories":[dict(r) for r in cats],"items":[{"id":r["id"],"category_id":r["category_id"],"category":r["category"],"product_id":r["product_id"],"name":r["name"],"price":cents_to_money(r["price_cents"]),"unit":r["unit"],"station":r["station"]} for r in rows],"legacy_unassigned_excluded":True}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/menu/categories",status_code=201)
+def branch_restaurant_create_category(branch_id: str,data: RestaurantCategoryIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.menu")
+    cid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO branch_restaurant_menu_categories(id,company_id,branch_id,name,active,created_by,created_at) VALUES(?,?,?,?,1,?,?)",(cid,user["company_id"],branch_id,data.name.strip(),user["id"],now))
+            audit(conn,user["company_id"],user["id"],"restaurant.branch_menu_category_created","restaurant_menu_category",cid,{"branch_id":branch_id,"name":data.name.strip()})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Categoria já cadastrada nesta filial.")
+    return {"id":cid,"branch_id":branch_id,"name":data.name.strip()}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/menu/items",status_code=201)
+def branch_restaurant_create_menu_item(branch_id: str,data: RestaurantMenuItemIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.menu")
+    if not conn.execute("SELECT 1 FROM branch_restaurant_menu_categories WHERE id=? AND company_id=? AND branch_id=? AND active=1",(data.category_id,user["company_id"],branch_id)).fetchone(): raise HTTPException(404,"Categoria não encontrada nesta filial.")
+    if not conn.execute("SELECT 1 FROM products WHERE id=? AND company_id=? AND active=1",(data.product_id,user["company_id"])).fetchone(): raise HTTPException(404,"Produto do catálogo da empresa não encontrado.")
+    mid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO branch_restaurant_menu_items(id,company_id,branch_id,category_id,product_id,station,active,created_by,created_at) VALUES(?,?,?,?,?,?,1,?,?)",(mid,user["company_id"],branch_id,data.category_id,data.product_id,data.station,user["id"],now))
+            audit(conn,user["company_id"],user["id"],"restaurant.branch_menu_item_created","restaurant_menu_item",mid,{"branch_id":branch_id,"product_id":data.product_id,"category_id":data.category_id,"station":data.station})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Produto já vinculado ao cardápio desta filial.")
+    return {"id":mid,"branch_id":branch_id,"category_id":data.category_id,"product_id":data.product_id,"station":data.station}
 
 
 @app.get("/v1/branches/{branch_id}/restaurant/floor")
