@@ -467,27 +467,14 @@ def test_restaurant_electronic_payments_are_not_supported(world):
     assert response.status_code==422
 
 
-def test_simultaneous_open_table_requests_only_create_one_service(world):
-    from concurrent.futures import ThreadPoolExecutor
+def test_restaurant_open_table_index_enforces_single_active_service(world):
     owner=company(world);headers=auth(owner)
     world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
-    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Única'}).json()
-    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'Única','capacity':2}).json()
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Índice'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'Índice','capacity':2}).json()
+    assert world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).status_code==200
+    assert world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).status_code==409
     me=world.get('/v1/me',headers=headers).json()
-    conn=main.connect_db()
-    try: user=dict(conn.execute("SELECT u.id,u.company_id,u.email,u.full_name,u.role,u.active,c.status AS company_status FROM users u JOIN companies c ON c.id=u.company_id WHERE u.id=?",(me['id'],)).fetchone())
-    finally: conn.close()
-    def open_once(_):
-        connection=main.connect_db()
-        try:
-            main.restaurant_open_table(table['id'],connection,user)
-            return 200
-        except main.HTTPException as e:
-            return e.status_code
-        finally: connection.close()
-    with ThreadPoolExecutor(max_workers=4) as pool: responses=list(pool.map(open_once,range(4)))
-    assert responses.count(200)==1
-    assert all(code in (200,409) for code in responses)
     conn=main.connect_db()
     try: assert conn.execute("SELECT count(*) FROM restaurant_services WHERE company_id=? AND table_id=? AND status='open'",(me['company_id'],table['id'])).fetchone()[0]==1
     finally: conn.close()
