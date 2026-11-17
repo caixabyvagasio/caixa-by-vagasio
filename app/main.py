@@ -3260,7 +3260,10 @@ def update_user(user_id: str, data: UserStatusIn, conn: DB, user: USER):
         if user["role"] == "admin" and target["role"] == "admin":
             raise HTTPException(403, "Somente o titular pode alterar outro administrador.")
         conn.execute("UPDATE users SET active=? WHERE id=? AND company_id=?", (1 if data.active else 0, user_id, user["company_id"]))
-        audit(conn, user["company_id"], user["id"], "user.status_changed", "user", user_id, {"active": data.active})
+        waiter = conn.execute("SELECT 1 FROM waiter_profiles WHERE user_id=? AND company_id=?", (user_id, user["company_id"])).fetchone()
+        if waiter:
+            conn.execute("UPDATE waiter_profiles SET active=? WHERE user_id=? AND company_id=?", (1 if data.active else 0, user_id, user["company_id"]))
+        audit(conn, user["company_id"], user["id"], "user.status_changed", "user", user_id, {"active": data.active, "waiter_profile_updated": bool(waiter)})
     return {"id": user_id, "active": data.active}
 
 
