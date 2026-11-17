@@ -172,3 +172,10 @@
 - Interface mobile-first do portal, cardápio, detalhe da comanda, criação de pedido, marcação de entrega, saldo e recebimento cash; gestão cadastra login e atribui garçom no salão. Multi-filial continua recusado até escopo operacional completo.
 - Testes novos cobrem criação/login de garçom, acesso restrito, atribuição, abertura, menu, pedido, envio, transitions e cash, proteção cross-tenant e migration. Full local: **101 passed, 1 skipped**; testes dedicados cobrem tenant/perfil/restrição, criação, atribuição, fluxo operacional e bloqueio multi-filial. Ainda precisa CI remota (incluindo PostgreSQL), deploy somente dev e verificação funcional/visual publicada; não declarar produção/homologação.
 - Restaurante além do portal continua incompleto: adicionais/combos, ficha técnica/insumos, delivery, divisão detalhada de conta, cancelamentos/estornos auditáveis e impressão seguem fora deste escopo/futuros.
+
+
+## Ordem Mestre Definitiva — execução retomada (2026-11-17)
+- HEAD inicial da ordem conferido antes de alterações: `c6ea16fd7496976f4d2d777ff018616ee4521507` no branch `development-v1`; nenhum commit posterior. A auditoria completa foi lida a partir de `relatorio_auditoria_caixa.md`.
+- Plano persistente da ordem: `docs/PLANO-MESTRE-V1.md`, com etapas, critérios, restrições e checkpoint.
+- Primeira correção em implementação: desativar/reativar um user garçom deve atualizar na mesma transação `waiter_profiles.active`, retirar do roster e bloquear tokens existentes pelo current_user; reativação permite login novo e retorna profile. Teste específico adicionado. Aguardando testes totais/CI antes de qualquer publicação dev.
+- Nenhuma alteração de dados de tenant real; testes locais usam fixtures descartáveis. Nenhum deploy/migration executado nesta retomada ainda.
