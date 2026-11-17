@@ -46,3 +46,13 @@ def test_user_supplied_logo_assets_are_referenced_and_present():
         assert asset in HTML or asset in CSS
         assert (ROOT/'frontend'/'assets'/asset).is_file() or (ROOT/'frontend'/asset).is_file()
     assert 'alt="Caixa by VAGASIO"' in HTML
+
+
+def test_sidebar_navigation_uses_page_names_without_pictograms():
+    import re
+    nav=re.search(r'<nav>(.*?)</nav>',HTML).group(1)
+    assert '<span>' not in nav
+    for label in ['Visão geral','Frente de caixa','Produtos e estoque','Relatório de estoque','Movimentos de estoque','Vendas','Relatórios','Compras','Clientes','Financeiro','Equipe e acessos','Salão e reservas','Perfil do negócio']:
+        assert label in nav
+    assert 'class="preview-nav active">Visão geral' in HTML
+    assert 'class="preview-nav">Frente de caixa' in HTML
