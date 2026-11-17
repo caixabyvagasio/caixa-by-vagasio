@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 12:49 | `c2389d1088c7dca5a6ec858f74db25274418768f` | Revisão AST comparou permission_for_endpoint e require_permission em todos os handlers (finding inicial 5 divergências); alinhei sales report, branch product reads, close-empty, waiter management, restaurant operations report e branch restaurant payment. CI anterior ao lote estava verde. | Suíte local, teste de consistência AST, CI general/Postgres e deploy dev. |
+
+## Work log / checkpoints
+
 | BRT/data | HEAD | Trabalho/resultado | Próxima ação |
 |---|---|---|---|
 | 2026-11-17 12:22 | `c6ea16fd7496976f4d2d777ff018616ee4521507` | HEAD confirmado antes de alterações; auditoria completa relida. Sem dados modificados. | Corrigir user/waiter active lifecycle; testes e CI; prosseguir em segurança/multibranch. |
