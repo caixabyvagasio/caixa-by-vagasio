@@ -1765,3 +1765,40 @@ def test_branch_register_close_and_cash_movement_are_serialized(world):
         assert movement.status_code==201
     current=world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()
     assert current['register'] is None
+
+
+def test_concurrent_branch_restaurant_final_payments_close_once_and_debit_stock_once(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,'Restaurant concurrency','restaurant-concurrency','restaurant-concurrency@example.test');headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    product_row=product(world,owner,sku='REST-CONCURRENT',name='Prato concorrente',price='12.50')
+    assert world.post(f'/v1/branches/{branch}/inventory/{product_row["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'3','reason':'Carga QA restaurante'}).status_code==201
+    assert world.post(f'/v1/branches/{branch}/registers/open',headers=headers,json={'label':'Restaurante QA','opening_amount':'0'}).status_code==201
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Salão concorrente'}).json()
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'C1','capacity':2}).json()
+    service=world.post(f'/v1/branches/{branch}/restaurant/tables/{table["id"]}/open',headers=headers).json()
+    tab=world.post(f'/v1/branches/{branch}/restaurant/services/{service["id"]}/tabs',headers=headers,json={'label':'Comanda concorrente'}).json()
+    category=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Pratos'}).json()
+    menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':product_row['id'],'station':'kitchen'}).json()
+    order=world.post(f'/v1/branches/{branch}/restaurant/tabs/{tab["id"]}/orders',headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1'}]})
+    assert order.status_code==201,order.text
+    assert world.post(f'/v1/branches/{branch}/restaurant/orders/{order.json()["id"]}/send',headers=headers).status_code==200
+    item=world.get(f'/v1/branches/{branch}/restaurant/production?station=kitchen',headers=headers).json()['items'][0]
+    for status in ('preparing','ready','delivered'):
+        response=world.patch(f'/v1/branches/{branch}/restaurant/order-items/{item["id"]}',headers=headers,json={'status':status})
+        assert response.status_code==200,response.text
+    def pay(i):
+        return world.post(f'/v1/branches/{branch}/restaurant/tabs/{tab["id"]}/payments',headers=headers,json={'amount':'12.50','received_amount':'12.50','idempotency_key':f'rest-final-concurrent-{i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(pay,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert all(r.status_code in {201,404,409} for r in responses),[(r.status_code,r.text) for r in responses]
+    detail=world.get(f'/v1/branches/{branch}/restaurant/tabs/{tab["id"]}',headers=headers).json()
+    assert detail['status']=='closed' and detail['paid']=='12.50' and detail['remaining']=='0.00'
+    assert world.get(f'/v1/branches/{branch}/inventory',headers=headers).json()['items'][0]['quantity']=='2'
+    assert world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()['expected_amount']=='12.50'
+    conn=main.connect_db()
+    try:
+        assert conn.execute('SELECT COUNT(*) FROM branch_sales WHERE branch_id=? AND idempotency_key=?',(branch,'restaurant-tab:'+tab['id'])).fetchone()[0]==1
+        assert conn.execute('SELECT COUNT(*) FROM branch_restaurant_tab_payments WHERE tab_id=?',(tab['id'],)).fetchone()[0]==1
+    finally: conn.close()
