@@ -406,7 +406,7 @@ def apply_schema_migrations(conn) -> None:
     migration(10,"branch_purchase_scope_indexes",index_branch_purchases)
     def allow_branch_sale_reversals():
         if is_postgres(conn):
-            constraints=conn.execute("SELECT conname FROM pg_constraint WHERE conrelid='branch_stock_events'::regclass AND contype='c' AND pg_get_constraintdef(oid) ILIKE '%kind%'").fetchall()
+            constraints=conn.execute("SELECT conname FROM pg_constraint WHERE conrelid='branch_stock_events'::regclass AND contype='c' AND pg_get_constraintdef(oid) ILIKE ?",("%kind%",)).fetchall()
             for row in constraints:
                 name=row[0]
                 conn.execute(f'ALTER TABLE branch_stock_events DROP CONSTRAINT "{name.replace(chr(34),chr(34)*2)}"')
