@@ -1682,3 +1682,24 @@ def test_concurrent_transfers_cannot_overdraw_branch_stock(world):
     src=world.get(f'/v1/branches/{source}/inventory',headers=headers).json()['items'][0]['quantity']
     dst=world.get(f'/v1/branches/{dest}/inventory',headers=headers).json()['items'][0]['quantity']
     assert (src,dst)==('0','4')
+
+
+def test_concurrent_purchase_receipts_never_exceed_ordered_quantity(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    supplier=world.post('/v1/suppliers',headers=headers,json={'name':'Concurrent supplier'}).json()
+    p=product(world,owner,sku='CONCURRENT-RECEIPT',name='Recebimento Concorrente')
+    order=world.post(f'/v1/branches/{branch}/purchase-orders',headers=headers,json={'supplier_id':supplier['id'],'order_number':'CONCURRENT-PO','items':[{'product_id':p['id'],'quantity':'4','unit_cost':'2.00'}]})
+    assert order.status_code==201,order.text
+    assert world.patch(f'/v1/branches/{branch}/purchase-orders/{order.json()["id"]}',headers=headers,json={'status':'ordered'}).status_code==200
+    line=world.get(f'/v1/branches/{branch}/purchase-orders',headers=headers).json()['items'][0]['items'][0]
+    def receive(i):
+        return world.post(f'/v1/branches/{branch}/purchase-orders/{order.json()["id"]}/receipts',headers={**headers,'Idempotency-Key':f'concurrent-receipt-{i}'},json={'items':[{'order_item_id':line['id'],'quantity':'1'}]})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(receive,range(8)))
+    assert sum(r.status_code==201 for r in responses)==4,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==4,[(r.status_code,r.text) for r in responses]
+    inv=world.get(f'/v1/branches/{branch}/inventory',headers=headers).json()['items'][0]['quantity']
+    listing=world.get(f'/v1/branches/{branch}/purchase-orders',headers=headers).json()['items'][0]
+    assert inv=='4' and listing['items'][0]['received']=='4' and listing['status']=='received'
+    assert world.get(f'/v1/branches/{branch}/stock-movements?product_id={p["id"]}&kind=adjustment_in',headers=headers).json()['total']==4
