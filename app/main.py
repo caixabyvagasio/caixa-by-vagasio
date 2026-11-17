@@ -134,7 +134,7 @@ from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -1090,8 +1090,8 @@ def current_user(credentials: Annotated[HTTPAuthorizationCredentials | None, Dep
 USER = Annotated[dict, Depends(current_user)]
 
 
-PERMISSION_CATALOG={"products.read":"Consultar produtos","products.write":"Gerenciar produtos","stock.adjust":"Ajustar estoque","sales.create":"Registrar vendas","sales.void":"Cancelar vendas","cash.manage":"Operar caixa","customers.read":"Consultar clientes","customers.write":"Gerenciar clientes","purchases.manage":"Gerenciar compras","finance.read":"Consultar financeiro","finance.write":"Gerenciar financeiro","users.manage":"Gerenciar acessos","profile.manage":"Configurar perfil","branches.manage":"Gerenciar filiais","modules.manage":"Gerenciar módulos","restaurant.floor":"Operar ambientes, mesas e reservas","reports.read":"Consultar relatórios","restaurant.menu":"Gerenciar cardápio","restaurant.orders":"Criar e distribuir pedidos","restaurant.production":"Atualizar produção e entrega","restaurant.cash":"Receber e encerrar comandas"}
-ROLE_PERMISSIONS={"owner":set(PERMISSION_CATALOG),"admin":set(PERMISSION_CATALOG)-{"branches.manage","modules.manage"},"manager":set(PERMISSION_CATALOG)-{"users.manage","branches.manage","modules.manage"},"operator":{"products.read","sales.create","cash.manage","customers.read","restaurant.floor","restaurant.orders","restaurant.production","restaurant.cash","reports.read"},"stock":{"products.read","products.write","stock.adjust","purchases.manage"}}
+PERMISSION_CATALOG={"products.read":"Consultar produtos","products.write":"Gerenciar produtos","stock.adjust":"Ajustar estoque","sales.create":"Registrar vendas","sales.void":"Cancelar vendas","cash.manage":"Operar caixa","customers.read":"Consultar clientes","customers.write":"Gerenciar clientes","purchases.manage":"Gerenciar compras","finance.read":"Consultar financeiro","finance.write":"Gerenciar financeiro","users.manage":"Gerenciar acessos","profile.manage":"Configurar perfil","branches.manage":"Gerenciar filiais","modules.manage":"Gerenciar módulos","restaurant.floor":"Operar ambientes, mesas e reservas","reports.read":"Consultar relatórios","restaurant.menu":"Gerenciar cardápio","restaurant.orders":"Criar e distribuir pedidos","restaurant.production":"Atualizar produção e entrega","restaurant.cash":"Receber e encerrar comandas","sales.read":"Consultar vendas e relatórios","inventory.read":"Consultar estoque","audit.read":"Consultar auditoria","branch.read":"Consultar filiais","users.read":"Consultar equipe"}
+ROLE_PERMISSIONS={"owner":set(PERMISSION_CATALOG),"admin":set(PERMISSION_CATALOG)-{"branches.manage","modules.manage"},"manager":set(PERMISSION_CATALOG)-{"users.manage","branches.manage","modules.manage"},"operator":{"products.read","products.write","sales.create","sales.read","sales.void","cash.manage","inventory.read","customers.read","customers.write","restaurant.floor","restaurant.orders","restaurant.production","restaurant.cash","reports.read"},"stock":{"products.read","products.write","stock.adjust","purchases.manage"}}
 MODULE_STATUSES={"sales":"ENABLED","inventory":"ENABLED","purchasing":"ENABLED","customers":"ENABLED","finance":"ENABLED","reports":"ENABLED","staff":"ENABLED","profile_setup":"ENABLED","restaurant_floor":"AVAILABLE","barcode":"NOT_IMPLEMENTED","weighed_items":"NOT_IMPLEMENTED","expiry_control":"NOT_IMPLEMENTED","tables_tabs":"NOT_IMPLEMENTED","delivery":"NOT_IMPLEMENTED","kitchen":"NOT_IMPLEMENTED","variants":"NOT_IMPLEMENTED","returns":"NOT_IMPLEMENTED","commissions":"NOT_IMPLEMENTED","appointments":"NOT_IMPLEMENTED","measurement_sales":"NOT_IMPLEMENTED","restaurant_floor":"AVAILABLE"}
 
 def require_role(user: dict, *roles: str) -> None:
@@ -1155,6 +1155,70 @@ async def security_headers(request: Request, call_next):
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; object-src 'none'"
     response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/v1/") else "no-cache"
+    return response
+
+
+def permission_for_endpoint(method: str, path: str):
+    method=method.upper()
+    if path in {"/v1/auth/login","/v1/auth/demo","/v1/companies/register","/v1/bootstrap","/v1/segments"}: return None
+    if path=="/v1/me": return None
+    if path.startswith("/v1/master/"): return None  # separately protected by bootstrap secret
+    if path.startswith("/v1/company/branches"):
+        return "branches.manage" if method=="POST" else "branch.read"
+    if path=="/v1/company/commercial": return "finance.read"
+    if path=="/v1/permissions/effective": return None
+    if path.startswith("/v1/company/permissions") or path.startswith("/v1/users/") and path.endswith("/permissions"):
+        return "users.manage"
+    if path.startswith("/v1/company/modules") or path.startswith("/v1/company/profile"):
+        return "modules.manage" if "/modules/" in path else "profile.manage"
+    if path.startswith("/v1/restaurant/"):
+        if "/menu" in path: return "restaurant.menu" if method!="GET" else "products.read"
+        if "/payments" in path: return "restaurant.cash"
+        if "/production" in path or "/order-items/" in path: return "restaurant.production"
+        if "/reports/" in path: return "reports.read"
+        if "/tabs" in path or "/orders" in path or "/services/" in path: return "restaurant.orders"
+        return "restaurant.floor"
+    if path.startswith("/v1/products"):
+        if "stock-adjustments" in path: return "stock.adjust"
+        if method in {"POST","PUT","PATCH","DELETE"}: return "products.write"
+        return "products.read"
+    if path.startswith("/v1/stock-movements"): return "inventory.read"
+    if path.startswith("/v1/registers"):
+        if method=="GET": return "cash.manage"
+        return "cash.manage"
+    if path.startswith("/v1/sales"):
+        return "sales.void" if "/void" in path else "sales.create" if method=="POST" else "sales.read"
+    if path.startswith("/v1/customers"):
+        return "customers.write" if method in {"POST","PUT","PATCH","DELETE"} else "customers.read"
+    if path.startswith("/v1/suppliers") or path.startswith("/v1/purchase-orders"): return "purchases.manage"
+    if path.startswith("/v1/finance"):
+        return "finance.write" if method not in {"GET","HEAD"} else "finance.read"
+    if path.startswith("/v1/users"):
+        return "users.read" if method=="GET" else "users.manage"
+    if path.startswith("/v1/reports") or path.startswith("/v1/dashboard"): return "reports.read"
+    if path.startswith("/v1/audit-events"): return "audit.read"
+    if path.startswith("/v1/configuration/catalog"): return "profile.manage"
+    return None
+
+
+@app.middleware("http")
+async def granular_permission_guard(request: Request, call_next):
+    permission=permission_for_endpoint(request.method,request.url.path)
+    if permission:
+        auth=request.headers.get("authorization","")
+        if auth.lower().startswith("bearer "):
+            conn=connect_db()
+            try:
+                try:
+                    claims=verify_token(auth.split(None,1)[1])
+                    row=conn.execute("SELECT u.id,u.company_id,u.email,u.full_name,u.role,u.active,c.status AS company_status FROM users u JOIN companies c ON c.id=u.company_id WHERE u.id=? AND u.company_id=?",(claims.get("sub"),claims.get("company_id"))).fetchone()
+                    if not row or not row["active"] or row["company_status"]!="active" or row["role"]!=claims.get("role"):
+                        raise HTTPException(401,"Sessão inválida ou usuário inativo.")
+                    require_permission(conn,dict(row),permission)
+                except HTTPException as exc:
+                    return JSONResponse(status_code=exc.status_code,content={"detail":exc.detail},headers=exc.headers)
+            finally: conn.close()
+    response=await call_next(request)
     return response
 
 
@@ -1336,9 +1400,11 @@ def activate_module(module_id: str,data: ModuleActivationIn,conn: DB,user: USER)
     for dep in json.loads(feature["dependencies_json"]):
         dep_row=conn.execute("SELECT available FROM feature_catalog WHERE id=?",(dep,)).fetchone()
         if not dep_row or not dep_row["available"]: raise HTTPException(409,"Dependência técnica indisponível.")
-    sub=conn.execute("SELECT id,plan_id,status FROM company_subscriptions WHERE company_id=? ORDER BY created_at DESC LIMIT 1",(user["company_id"],)).fetchone()
+    sub=conn.execute("SELECT s.id,s.plan_id,s.status,s.starts_at,s.ends_at,p.status AS plan_status FROM company_subscriptions s JOIN plans p ON p.id=s.plan_id WHERE s.company_id=? ORDER BY s.created_at DESC LIMIT 1",(user["company_id"],)).fetchone()
     entitlement=conn.execute("SELECT 1 FROM company_module_entitlements WHERE company_id=? AND module_id=? AND status='granted'",(user["company_id"],module_id)).fetchone()
-    plan_ok=bool(sub and sub["status"]=="active" and conn.execute("SELECT 1 FROM plan_entitlements WHERE plan_id=? AND module_id=? AND included=1",(sub["plan_id"],module_id)).fetchone())
+    now=now_iso()
+    plan_current=bool(sub and sub["status"]=="active" and sub["plan_status"]=="active" and (not sub["starts_at"] or sub["starts_at"]<=now) and (not sub["ends_at"] or sub["ends_at"]>now))
+    plan_ok=bool(plan_current and conn.execute("SELECT 1 FROM plan_entitlements WHERE plan_id=? AND module_id=? AND included=1",(sub["plan_id"],module_id)).fetchone())
     if not entitlement and not plan_ok: raise HTTPException(402,"Plano ou adicional sem entitlement para este módulo.")
     now=now_iso()
     with transaction(conn):

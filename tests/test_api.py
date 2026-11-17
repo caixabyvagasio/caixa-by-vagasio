@@ -1046,3 +1046,42 @@ def test_inventory_report_estimated_values_and_role_scope(world):
     assert world.get('/v1/reports/inventory?search=ausente',headers=auth(owner)).json()['items']==[]
     other=company(world,'Outra','outra','outra@example.test')
     assert world.get('/v1/reports/inventory',headers=auth(other)).json()['summary']['product_count']==0
+
+
+def test_every_authenticated_api_endpoint_has_permission_policy():
+    exempt={"/v1/auth/login","/v1/auth/demo","/v1/companies/register","/v1/bootstrap","/v1/segments","/v1/me","/v1/permissions/effective"}
+    protected=[]
+    for route in main.app.routes:
+        path=getattr(route,"path","")
+        if path.startswith("/v1/") and path not in exempt and not path.startswith("/v1/master/"):
+            for method in getattr(route,"methods",set())-{"HEAD","OPTIONS"}: protected.append((method,path))
+    uncovered=[(m,p) for m,p in protected if main.permission_for_endpoint(m,p) is None]
+    assert uncovered==[]
+
+
+def test_permission_guard_returns_http_401_for_invalid_bearer(world):
+    response=world.get('/v1/products',headers={'Authorization':'Bearer not-a-valid-token'})
+    assert response.status_code==401
+
+
+def test_role_permission_override_is_enforced_by_endpoint_guard(world):
+    owner=company(world);headers=auth(owner)
+    created=world.post('/v1/users',headers=headers,json={'full_name':'Operador','email':'guard@example.test','password':'secure-password-123','role':'operator'})
+    assert created.status_code==201
+    token=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'guard@example.test','password':'secure-password-123'}).json()['access_token']
+    operator=auth(token)
+    assert world.get('/v1/products',headers=operator).status_code==200
+    assert world.put('/v1/company/permissions/role',headers=headers,json={'role':'operator','permission':'products.read','allowed':False}).status_code==200
+    assert world.get('/v1/products',headers=operator).status_code==403
+    assert world.get('/v1/permissions/effective?permission=products.read',headers=operator).json()['allowed'] is False
+
+
+def test_permission_router_inventory_covers_all_authenticated_endpoints():
+    exempt={"/v1/auth/login","/v1/auth/demo","/v1/companies/register","/v1/bootstrap","/v1/segments","/v1/me","/v1/permissions/effective"}
+    missing=[]
+    for route in main.app.routes:
+        path=getattr(route,"path","")
+        if path.startswith("/v1/") and path not in exempt and not path.startswith("/v1/master/"):
+            for method in getattr(route,"methods",set())-{"HEAD","OPTIONS"}:
+                if main.permission_for_endpoint(method,path) is None: missing.append((method,path))
+    assert missing==[]
