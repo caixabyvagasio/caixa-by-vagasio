@@ -284,9 +284,10 @@ def constraint_errors():
 
 
 @contextmanager
-def transaction(conn):
+def transaction(conn,isolation="SERIALIZABLE"):
+    if isolation not in {"SERIALIZABLE","READ COMMITTED"}: raise ValueError("Unsupported transaction isolation")
     set_transaction_mode(conn,"IMMEDIATE")
-    if is_postgres(conn): conn.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+    if is_postgres(conn): conn.execute(f"SET TRANSACTION ISOLATION LEVEL {isolation}")
     try:
         yield
         conn.commit()
@@ -1947,11 +1948,13 @@ def list_branch_inventory(branch_id: str,conn: DB,user: USER,search: str=Query(d
 def adjust_branch_stock(branch_id: str,product_id: str,data: StockAdjustmentIn,conn: DB,user: USER):
     require_permission(conn,user,"stock.adjust");require_branch_membership(conn,user,branch_id)
     movement_id,now=new_id(),now_iso();qty=decimal_milli(data.quantity)
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
         product=conn.execute("SELECT id FROM products WHERE id=? AND company_id=? AND active=1",(product_id,user["company_id"])).fetchone()
         if not product: raise HTTPException(404,"Produto não encontrado nesta empresa.")
-        row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,product_id)).fetchone()
-        before=int(row[0]) if row else 0;after=before+qty if data.direction=="in" else before-qty
+        conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO NOTHING",(user["company_id"],branch_id,product_id,0,now))
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?"+lock_clause,(user["company_id"],branch_id,product_id)).fetchone()
+        before=int(row[0]);after=before+qty if data.direction=="in" else before-qty
         if after<0: raise HTTPException(409,"Saldo insuficiente nesta filial.")
         conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO UPDATE SET quantity_milli=excluded.quantity_milli,updated_at=excluded.updated_at",(user["company_id"],branch_id,product_id,after,now))
         conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?)",(movement_id,user["company_id"],branch_id,product_id,user["id"],"adjustment_in" if data.direction=="in" else "adjustment_out",qty if data.direction=="in" else -qty,before,after,data.reason,now))
