@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 14:01 | `a9aeec33a0f5cf79bb72afce2204d48918da1a97` | Branch cash lock fix deployed/live, CI green. Restaurant locks for order/production/settlement + concurrent final-payment test local; suite 106/1. Pending CI/Postgres. | Run PostgreSQL CI and deploy only after green. |
+
+## Work log / checkpoints
+
 | 2026-11-17 13:53 | `9a12da23b45dbaec11d9bd6ae45fe7607c756da6` | Caixa branch movements/sales/void/close local row-lock and cash balance validation; tests 105/1. | CI general/Postgres for register concurrency and verify before dev deployment. |
 
 ## Work log / checkpoints
