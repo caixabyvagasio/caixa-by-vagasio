@@ -722,7 +722,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1366,3 +1366,30 @@ def test_branch_restaurant_empty_service_can_be_released_but_tabbed_service_cann
     opened=world.post(f'/v1/branches/{branch}/restaurant/tables/{table["id"]}/open',headers=headers);assert opened.status_code==200,opened.text
     closed=world.post(f'/v1/branches/{branch}/restaurant/services/{opened.json()["id"]}/close-empty',headers=headers);assert closed.status_code==200,closed.text
     assert world.get(f'/v1/branches/{branch}/restaurant/floor',headers=headers).json()['items'][0]['status']=='available'
+
+
+
+def test_branch_restaurant_menu_isolated_by_filial_and_legacy_menu_excluded(world):
+    token=company(world,"Menu branches", "menu-branches", "menu@branches.test");headers=auth(token)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    first=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    p=product(world,token,sku='MENU-ITEM',name='Prato de teste')
+    legacy_cat=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Catálogo antigo'});assert legacy_cat.status_code==201
+    legacy_link=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':legacy_cat.json()['id'],'product_id':p['id'],'station':'kitchen'});assert legacy_link.status_code==201
+    second=world.post('/v1/company/branches',headers=headers,json={'code':'b-menu','name':'Filial Menu B'}).json()['id']
+    me=world.get('/v1/me',headers=headers).json()['id']
+    assert world.put(f'/v1/company/branches/{second}/users',headers=headers,json={'user_ids':[me]}).status_code==200
+    a=world.post(f'/v1/branches/{first}/restaurant/menu/categories',headers=headers,json={'name':'Pratos A'});assert a.status_code==201,a.text
+    b=world.post(f'/v1/branches/{second}/restaurant/menu/categories',headers=headers,json={'name':'Pratos B'});assert b.status_code==201,b.text
+    linked=world.post(f'/v1/branches/{first}/restaurant/menu/items',headers=headers,json={'category_id':a.json()['id'],'product_id':p['id'],'station':'kitchen'});assert linked.status_code==201,linked.text
+    assert world.post(f'/v1/branches/{second}/restaurant/menu/items',headers=headers,json={'category_id':a.json()['id'],'product_id':p['id'],'station':'kitchen'}).status_code==404
+    menu_a=world.get(f'/v1/branches/{first}/restaurant/menu',headers=headers).json()
+    menu_b=world.get(f'/v1/branches/{second}/restaurant/menu',headers=headers).json()
+    assert len(menu_a['items'])==1 and menu_a['items'][0]['id']==linked.json()['id']
+    assert menu_b['items']==[] and 'Pratos A' not in [c['name'] for c in menu_b['categories']]
+    conn=main.connect_db()
+    try:
+        old_cat=conn.execute('SELECT branch_id FROM restaurant_menu_categories WHERE id=?',(legacy_cat.json()['id'],)).fetchone()
+        old_item=conn.execute('SELECT branch_id FROM restaurant_menu_items WHERE id=?',(legacy_link.json()['id'],)).fetchone()
+        assert old_cat['branch_id'] is None and old_item['branch_id'] is None
+    finally:conn.close()
