@@ -1705,6 +1705,32 @@ def test_concurrent_purchase_receipts_never_exceed_ordered_quantity(world):
     assert world.get(f'/v1/branches/{branch}/stock-movements?product_id={p["id"]}&kind=adjustment_in',headers=headers).json()['total']==4
 
 
+
+def test_concurrent_legacy_receipts_on_distinct_orders_do_not_lose_shared_stock_updates(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,name="Concurrent receipts",slug="concurrent-receipts",email="concurrent-receipts@example.test")
+    headers=auth(owner)
+    supplier=world.post('/v1/suppliers',headers=headers,json={'name':'Shared stock supplier'}).json()
+    p=product(world,owner,sku='SHARED-RECEIPT',name='Produto recebido em pedidos distintos')
+    orders=[]
+    for number in ('SHARED-PO-A','SHARED-PO-B'):
+        order=world.post('/v1/purchase-orders',headers=headers,json={'supplier_id':supplier['id'],'order_number':number,'items':[{'product_id':p['id'],'quantity':'5','unit_cost':'1.00'}]})
+        assert order.status_code==201,order.text
+        assert world.patch(f"/v1/purchase-orders/{order.json()['id']}",headers=headers,json={'status':'ordered'}).status_code==200
+        line=world.get('/v1/purchase-orders',headers=headers).json()['items']
+        matching=next(x for x in line if x['id']==order.json()['id'])['items'][0]
+        orders.append((order.json()['id'],matching['id']))
+    def receive(pair):
+        order_id,item_id=pair
+        return world.post(f'/v1/purchase-orders/{order_id}/receipts',headers={**headers,'Idempotency-Key':'shared-'+order_id},json={'items':[{'order_item_id':item_id,'quantity':'5'}]})
+    with ThreadPoolExecutor(max_workers=2) as pool: responses=list(pool.map(receive,orders))
+    assert [r.status_code for r in responses]==[201,201],[ (r.status_code,r.text) for r in responses ]
+    inventory=world.get('/v1/products',headers=headers).json()['items']
+    assert next(row for row in inventory if row['id']==p['id'])['stock']=='10'
+    movements=world.get('/v1/stock-movements',headers=headers).json()['items']
+    assert sum(row['quantity']=='5' and row['kind']=='adjustment_in' for row in movements)==2
+
+
 def test_concurrent_voids_of_same_branch_sale_refund_once(world):
     from concurrent.futures import ThreadPoolExecutor
     owner=company(world);headers=auth(owner)
