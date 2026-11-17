@@ -262,3 +262,9 @@
 - Reserva por filial e legado: lock pessimista na linha da mesa antes de verificar intervalos ativos e inserir, em READ COMMITTED; evita duas reservas sobrepostas aceitas simultaneamente.
 - Abertura de comanda agora bloqueia linha do serviço, serializando com `close-empty`; previne comanda pendurada em serviço fechado.
 - Concorrência sintética: branch+legacy 8 chamadas cada (1 aceitação, 7 HTTP 409); ciclo close-empty/open-tab verifica invariantes estado/tabs. Focados 7 pass; full suite **110 passed, 1 skipped**. Aguardando CI e deploy dev.
+
+
+## Continuação — serialização do caminho legado (2026-11-17 14:31 BRT)
+- Reserva concorrente branch+legacy e fechamento de serviço vs criação da comanda já foram publicados no dev em commit `f254388c0615539c4da21a6f05f3f70060bd0180`, deploy `dep-dbu8ur0u01pc73ddbh3g` live; CI geral e PostgreSQL (`44137376887`,`44137377012`) success. Health PostgreSQL, payments/fiscal false.
+- Lacuna nova: os endpoints legados de restaurante (single-branch) não tinham os locks introduzidos nos endpoints branch-scoped. Aplicados locks linha de mesa, serviço e comanda em READ COMMITTED para abrir mesa/comanda, criar pedido, transições de produção e liquidação; liquidação também bloqueia registro de caixa e linhas de produto em ordem estável. Modo multi-filial continua bloqueado nas rotas legadas pelo middleware fail-closed.
+- Novo teste com oito pagamentos finais concorrentes na rota legada verifica só uma cobrança/venda/baixa de estoque/movimento de caixa, tab fechada e idempotência na venda. Focados 4 pass; full local **111 passed, 1 skipped**. CI/deploy desta parte pendentes.
