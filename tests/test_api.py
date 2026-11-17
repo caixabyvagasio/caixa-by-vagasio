@@ -1321,3 +1321,48 @@ def test_restaurant_branch_scope_migration_keeps_legacy_rows_unassigned(world):
     finally:conn.close()
     headers['X-Branch-Id']=branch.json()['id']
     assert world.get('/v1/restaurant/floor',headers=headers).status_code==409
+
+
+def test_branch_restaurant_areas_floor_and_reservations_are_isolated(world):
+    token=company(world,"Restaurante", "restaurante-isolado", "dono@restaurante.test")
+    headers=auth(token)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    first=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    second_resp=world.post('/v1/company/branches',headers=headers,json={'code':'filial-b','name':'Filial B'})
+    assert second_resp.status_code==201,second_resp.text
+    second=second_resp.json()['id']
+    # Explicitly authorize owner in second branch; branch membership is not inferred by URL/header.
+    me=world.get('/v1/me',headers=headers).json()['id']
+    assert world.put(f'/v1/company/branches/{second}/users',headers=headers,json={'user_ids':[me]}).status_code==200
+
+    area_a=world.post(f'/v1/branches/{first}/restaurant/areas',headers=headers,json={'name':'Salão A'})
+    area_b=world.post(f'/v1/branches/{second}/restaurant/areas',headers=headers,json={'name':'Salão B'})
+    assert area_a.status_code==201 and area_b.status_code==201
+    table_a=world.post(f'/v1/branches/{first}/restaurant/tables',headers=headers,json={'area_id':area_a.json()['id'],'label':'A1','capacity':4})
+    table_b=world.post(f'/v1/branches/{second}/restaurant/tables',headers=headers,json={'area_id':area_b.json()['id'],'label':'B1','capacity':2})
+    assert table_a.status_code==201 and table_b.status_code==201
+    assert world.get(f'/v1/branches/{first}/restaurant/floor',headers=headers).json()['items'][0]['label']=='A1'
+    assert world.get(f'/v1/branches/{second}/restaurant/floor',headers=headers).json()['items'][0]['label']=='B1'
+
+    # A foreign branch/table combination cannot be used to open a table or reserve it.
+    assert world.post(f'/v1/branches/{first}/restaurant/tables/{table_b.json()["id"]}/open',headers=headers).status_code==404
+    assert world.post(f'/v1/branches/{second}/restaurant/reservations',headers=headers,json={'table_id':table_a.json()['id'],'customer_name':'Cliente A','party_size':2,'starts_at':'2026-12-01T12:00','ends_at':'2026-12-01T13:00'}).status_code==404
+
+    opened=world.post(f'/v1/branches/{first}/restaurant/tables/{table_a.json()["id"]}/open',headers=headers)
+    assert opened.status_code==200,opened.text
+    reservation=world.post(f'/v1/branches/{first}/restaurant/reservations',headers=headers,json={'table_id':table_a.json()['id'],'customer_name':'Cliente A','party_size':3,'starts_at':'2026-12-01T12:00','ends_at':'2026-12-01T13:00'})
+    assert reservation.status_code==201,reservation.text
+    assert len(world.get(f'/v1/branches/{first}/restaurant/reservations',headers=headers).json()['items'])==1
+    assert world.get(f'/v1/branches/{second}/restaurant/reservations',headers=headers).json()['items']==[]
+    assert world.get('/v1/restaurant/floor',headers=headers).status_code==409
+
+
+def test_branch_restaurant_empty_service_can_be_released_but_tabbed_service_cannot(world):
+    token=company(world,"Restaurant Empty", "restaurant-empty", "empty@restaurant.test");headers=auth(token)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Pátio'}).json()
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'P1','capacity':4}).json()
+    opened=world.post(f'/v1/branches/{branch}/restaurant/tables/{table["id"]}/open',headers=headers);assert opened.status_code==200,opened.text
+    closed=world.post(f'/v1/branches/{branch}/restaurant/services/{opened.json()["id"]}/close-empty',headers=headers);assert closed.status_code==200,closed.text
+    assert world.get(f'/v1/branches/{branch}/restaurant/floor',headers=headers).json()['items'][0]['status']=='available'
