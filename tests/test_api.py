@@ -1821,3 +1821,54 @@ def test_concurrent_branch_table_open_creates_one_service_only(world):
     try:
         assert conn.execute("SELECT COUNT(*) FROM restaurant_services WHERE table_id=? AND branch_id=? AND status='open'",(table['id'],branch)).fetchone()[0]==1
     finally: conn.close()
+
+
+def test_concurrent_branch_reservations_for_same_table_do_not_overlap(world):
+    from concurrent.futures import ThreadPoolExecutor
+    token=company(world,'Branch reservations','branch-reservations','branch-reservations@example.test');headers=auth(token)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Reservas'}).json()
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'R1','capacity':4}).json()
+    body={'table_id':table['id'],'customer_name':'Cliente simultâneo','party_size':2,'starts_at':'2026-12-22T12:00','ends_at':'2026-12-22T13:00'}
+    def reserve(i):return world.post(f'/v1/branches/{branch}/restaurant/reservations',headers=headers,json={**body,'customer_name':f'Cliente {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(reserve,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    listed=world.get(f'/v1/branches/{branch}/restaurant/reservations',headers=headers).json()['items']
+    assert len(listed)==1
+
+
+def test_concurrent_legacy_reservations_for_same_table_do_not_overlap(world):
+    from concurrent.futures import ThreadPoolExecutor
+    token=company(world,'Legacy reservation concurrency','legacy-reservation-concurrency','legacy-reservation@example.test');headers=auth(token)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Reservas legacy'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'L1','capacity':4}).json()
+    body={'table_id':table['id'],'customer_name':'Cliente simultâneo','party_size':2,'starts_at':'2026-12-23T12:00','ends_at':'2026-12-23T13:00'}
+    def reserve(i):return world.post('/v1/restaurant/reservations',headers=headers,json={**body,'customer_name':f'Cliente {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(reserve,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    assert len(world.get('/v1/restaurant/reservations',headers=headers).json()['items'])==1
+
+
+def test_concurrent_branch_empty_service_close_and_tab_open_cannot_orphan_tab(world):
+    from concurrent.futures import ThreadPoolExecutor
+    token=company(world,'Service lifecycle concurrency','service-concurrency','service-concurrency@example.test');headers=auth(token)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Ciclo'}).json()
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'S1','capacity':2}).json()
+    service=world.post(f'/v1/branches/{branch}/restaurant/tables/{table["id"]}/open',headers=headers).json()
+    def close():return world.post(f'/v1/branches/{branch}/restaurant/services/{service["id"]}/close-empty',headers=headers)
+    def open_tab():return world.post(f'/v1/branches/{branch}/restaurant/services/{service["id"]}/tabs',headers=headers,json={'label':'QA lifecycle'})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a=pool.submit(close);b=pool.submit(open_tab);responses=[a.result(),b.result()]
+    assert all(r.status_code in {200,201,404,409} for r in responses),[(r.status_code,r.text) for r in responses]
+    conn=main.connect_db()
+    try:
+        state=conn.execute('SELECT status FROM restaurant_services WHERE id=?',(service['id'],)).fetchone()[0]
+        tabs=conn.execute('SELECT COUNT(*) FROM restaurant_tabs WHERE service_id=? AND branch_id=?',(service['id'],branch)).fetchone()[0]
+        assert (state=='closed' and tabs==0) or (state=='open' and tabs==1), (state,tabs,[(r.status_code,r.text) for r in responses])
+    finally: conn.close()
