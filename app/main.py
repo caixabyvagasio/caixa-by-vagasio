@@ -3195,8 +3195,8 @@ def list_purchase_orders(conn: DB,user: USER,limit: int=Query(default=100,ge=1,l
 def update_purchase_status(order_id: str,data: PurchaseStatusIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager")
     require_permission(conn,user,"purchases.manage")
-    with transaction(conn):
-        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=?",(order_id,user["company_id"])).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=?"+(" FOR UPDATE" if is_postgres(conn) else ""),(order_id,user["company_id"])).fetchone()
         if not order: raise HTTPException(404,"Pedido não encontrado nesta empresa.")
         if order["status"] not in {"draft","ordered"}: raise HTTPException(409,"Este pedido não pode mudar de estado.")
         if data.status=="cancelled":
@@ -3215,8 +3215,9 @@ def receive_purchase(order_id: str,data: PurchaseReceiveIn,request: Request,conn
     normalized={"items":sorted([{"item":x.order_item_id,"quantity":str(x.quantity)} for x in data.items],key=lambda x:x["item"]),"due_date":data.due_date.isoformat() if data.due_date else None}
     request_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":")).encode()).hexdigest()
     receipt_id,received_at=new_id(),now_iso()
-    with transaction(conn):
-        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=?",(order_id,user["company_id"])).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=?"+lock_clause,(order_id,user["company_id"])).fetchone()
         if not order: raise HTTPException(404,"Pedido não encontrado nesta empresa.")
         prior=conn.execute("SELECT * FROM purchase_receipts WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
         if prior:
@@ -3226,13 +3227,27 @@ def receive_purchase(order_id: str,data: PurchaseReceiveIn,request: Request,conn
         if order["status"] not in {"ordered","partially_received"}: raise HTTPException(409,"Pedido precisa estar enviado e aberto para recebimento.")
         if len({x.order_item_id for x in data.items})!=len(data.items): raise HTTPException(422,"Não repita a mesma linha de pedido no recebimento.")
         receipt_rows=[]
-        for line in data.items:
+        for line in sorted(data.items,key=lambda x:x.order_item_id):
             qty=decimal_milli(line.quantity)
             item=conn.execute("""SELECT poi.*,p.stock_milli,p.name FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id
                 WHERE poi.id=? AND poi.purchase_order_id=? AND poi.company_id=?""",(line.order_item_id,order_id,user["company_id"])).fetchone()
             if not item: raise HTTPException(404,"Linha do pedido não encontrada.")
-            if item["received_milli"]+qty>item["ordered_milli"]: raise HTTPException(409,"Quantidade recebida supera o saldo do pedido.")
             receipt_rows.append((line,item,qty))
+        # Lock shared product balances in stable order so receipts from distinct
+        # purchase orders cannot overwrite each other's stock updates.
+        if is_postgres(conn):
+            for product_id in sorted({item["product_id"] for _,item,_ in receipt_rows}):
+                conn.execute("SELECT id FROM products WHERE id=? AND company_id=? FOR UPDATE",(product_id,user["company_id"])).fetchone()
+        # Re-read order-line and stock values after obtaining locks; the first
+        # read above only verifies ownership/existence and may now be stale.
+        refreshed=[]
+        for line,item,qty in receipt_rows:
+            item=conn.execute("""SELECT poi.*,p.stock_milli,p.name FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id
+                WHERE poi.id=? AND poi.purchase_order_id=? AND poi.company_id=?""",(line.order_item_id,order_id,user["company_id"])).fetchone()
+            if not item: raise HTTPException(404,"Linha do pedido não encontrada.")
+            if item["received_milli"]+qty>item["ordered_milli"]: raise HTTPException(409,"Quantidade recebida supera o saldo do pedido.")
+            refreshed.append((line,item,qty))
+        receipt_rows=refreshed
         conn.execute("INSERT INTO purchase_receipts(id,company_id,purchase_order_id,received_by,received_at,idempotency_key,request_hash) VALUES(?,?,?,?,?,?,?)",(receipt_id,user["company_id"],order_id,user["id"],received_at,idempotency_key,request_hash))
         for line,item,qty in receipt_rows:
             before=item["stock_milli"];after=before+qty
