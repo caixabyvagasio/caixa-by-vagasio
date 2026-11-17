@@ -1703,3 +1703,24 @@ def test_concurrent_purchase_receipts_never_exceed_ordered_quantity(world):
     listing=world.get(f'/v1/branches/{branch}/purchase-orders',headers=headers).json()['items'][0]
     assert inv=='4' and listing['items'][0]['received']=='4' and listing['status']=='received'
     assert world.get(f'/v1/branches/{branch}/stock-movements?product_id={p["id"]}&kind=adjustment_in',headers=headers).json()['total']==4
+
+
+def test_concurrent_voids_of_same_branch_sale_refund_once(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    p=product(world,owner,sku='CONCURRENT-VOID',name='Estorno Concorrente',price='3.00')
+    assert world.post(f'/v1/branches/{branch}/registers/open',headers=headers,json={'label':'Turno estorno','opening_amount':'20'}).status_code==201
+    assert world.post(f'/v1/branches/{branch}/inventory/{p["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'4','reason':'Carga QA'}).status_code==201
+    sale=world.post(f'/v1/branches/{branch}/sales',headers={**headers,'Idempotency-Key':'concurrent-void-sale'},json={'items':[{'product_id':p['id'],'quantity':'2'}],'payment_method':'cash','received_amount':'6'});assert sale.status_code==201,sale.text
+    def void(i): return world.post(f'/v1/branches/{branch}/sales/{sale.json()["id"]}/void',headers=headers,json={'reason':f'Estorno QA {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(void,range(8)))
+    assert sum(r.status_code==200 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    assert world.get(f'/v1/branches/{branch}/inventory',headers=headers).json()['items'][0]['quantity']=='4'
+    assert world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()['expected_amount']=='20.00'
+    conn=main.connect_db()
+    try:
+        assert conn.execute('SELECT COUNT(*) FROM branch_sales_returns WHERE sale_id=?',(sale.json()['id'],)).fetchone()[0]==1
+        assert conn.execute("SELECT COUNT(*) FROM branch_stock_events WHERE product_id=? AND kind='reversal'",(p['id'],)).fetchone()[0]==1
+    finally: conn.close()
