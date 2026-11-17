@@ -1802,3 +1802,22 @@ def test_concurrent_branch_restaurant_final_payments_close_once_and_debit_stock_
         assert conn.execute('SELECT COUNT(*) FROM branch_sales WHERE branch_id=? AND idempotency_key=?',(branch,'restaurant-tab:'+tab['id'])).fetchone()[0]==1
         assert conn.execute('SELECT COUNT(*) FROM branch_restaurant_tab_payments WHERE tab_id=?',(tab['id'],)).fetchone()[0]==1
     finally: conn.close()
+
+
+def test_concurrent_branch_table_open_creates_one_service_only(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,'Restaurant table concurrency','restaurant-table-concurrency','restaurant-table-concurrency@example.test');headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Concorrência'}).json()
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'T1','capacity':4}).json()
+    def open_table(_): return world.post(f'/v1/branches/{branch}/restaurant/tables/{table["id"]}/open',headers=headers)
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(open_table,range(8)))
+    assert sum(r.status_code==200 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert all(r.status_code in {200,409} for r in responses),[(r.status_code,r.text) for r in responses]
+    floor=world.get(f'/v1/branches/{branch}/restaurant/floor',headers=headers)
+    assert floor.status_code==200 and sum(t['status']=='occupied' for t in floor.json()['items'])==1
+    conn=main.connect_db()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM restaurant_services WHERE table_id=? AND branch_id=? AND status='open'",(table['id'],branch)).fetchone()[0]==1
+    finally: conn.close()
