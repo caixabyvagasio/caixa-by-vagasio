@@ -339,6 +339,18 @@ def apply_schema_migrations(conn) -> None:
         return check
     migration(5,"plans_branches_entitlements_permissions",verify_tables("plans","plan_entitlements","company_subscriptions","company_module_entitlements","branches","branch_users","role_permissions","user_permissions"))
     migration(6,"restaurant_menu_tabs_orders_cash_payments",verify_tables("restaurant_menu_categories","restaurant_menu_items","restaurant_tabs","restaurant_orders","restaurant_order_items","restaurant_tab_payments","restaurant_events"))
+    def add_nullable_branch_scope():
+        # Historical records remain NULL (unassigned) until an explicit audited
+        # reconciliation assigns them. Never silently attach legacy records to a branch.
+        tables=("products","customers","suppliers","purchase_orders","purchase_order_items","purchase_receipts","purchase_receipt_items","accounts_payable","payable_payments","payable_expense_details","cash_registers","sales","sale_items","stock_movements","cash_movements","audit_events","restaurant_areas","restaurant_tables","restaurant_reservations","restaurant_services","restaurant_menu_categories","restaurant_menu_items","restaurant_tabs","restaurant_orders","restaurant_order_items","restaurant_tab_payments","restaurant_events")
+        for table in tables:
+            columns={r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "branch_id" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN branch_id TEXT REFERENCES branches(id)")
+        # Explicit state documents that NULL data is not yet usable as partitioned
+        # multi-branch operational data; no destructive update/backfill is done.
+        conn.execute("INSERT INTO deployment_metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("branch_partitioning","schema_added_legacy_unassigned"))
+    migration(7,"nullable_branch_scope_no_legacy_backfill",add_nullable_branch_scope)
 
 
 def init_db() -> None:
@@ -638,7 +650,7 @@ def init_db() -> None:
 
 def audit(conn: sqlite3.Connection, company_id: str, actor_id: str | None,
           action: str, entity_type: str, entity_id: str, details: dict) -> None:
-    conn.execute("INSERT INTO audit_events VALUES(?,?,?,?,?,?,?,?)",
+    conn.execute("INSERT INTO audit_events(id,company_id,actor_id,action,entity_type,entity_id,details_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
                  (new_id(), company_id, actor_id, action, entity_type, entity_id,
                   json.dumps(details, ensure_ascii=False, sort_keys=True), now_iso()))
 
@@ -1215,6 +1227,21 @@ async def granular_permission_guard(request: Request, call_next):
                     if not row or not row["active"] or row["company_status"]!="active" or row["role"]!=claims.get("role"):
                         raise HTTPException(401,"Sessão inválida ou usuário inativo.")
                     require_permission(conn,dict(row),permission)
+                    company_user=dict(row)
+                    branch_exempt=(request.url.path in {"/v1/me","/v1/configuration/catalog","/v1/company/branches","/v1/company/commercial","/v1/permissions/effective"} or request.url.path.startswith(("/v1/company/profile","/v1/company/modules","/v1/company/permissions","/v1/permissions/","/v1/users")))
+                    if not branch_exempt and request.url.path.startswith("/v1/"):
+                        active_branches=conn.execute("SELECT id FROM branches WHERE company_id=? AND status='active' ORDER BY created_at,id",(company_user["company_id"],)).fetchall()
+                        requested_branch=request.headers.get("X-Branch-Id")
+                        if requested_branch:
+                            authorized=conn.execute("SELECT 1 FROM branch_users bu JOIN branches b ON b.id=bu.branch_id AND b.company_id=bu.company_id WHERE bu.company_id=? AND bu.user_id=? AND bu.branch_id=? AND b.status='active'",(company_user["company_id"],company_user["id"],requested_branch)).fetchone()
+                            if not authorized: raise HTTPException(403,"Filial inexistente ou não autorizada para este usuário.")
+                            if len(active_branches)>1:
+                                raise HTTPException(409,"Particionamento operacional por filial ainda não foi ativado; a seleção não altera nem filtra dados até os fluxos serem migrados.")
+                        elif len(active_branches)>1:
+                            raise HTTPException(409,"Operações multi-filial ainda não estão particionadas. Os dados históricos permanecem sem atribuição e nenhuma filial foi selecionada automaticamente.")
+                        elif active_branches:
+                            authorized=conn.execute("SELECT 1 FROM branch_users WHERE company_id=? AND user_id=? AND branch_id=?",(company_user["company_id"],company_user["id"],active_branches[0]["id"])).fetchone()
+                            if not authorized: raise HTTPException(403,"Este usuário não tem acesso à filial principal.")
                 except HTTPException as exc:
                     return JSONResponse(status_code=exc.status_code,content={"detail":exc.detail},headers=exc.headers)
             finally: conn.close()
@@ -1572,7 +1599,7 @@ def restaurant_create_area(data: RestaurantAreaIn,conn: DB,user: USER):
     rid,now=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO restaurant_areas VALUES(?,?,?,1,?,?)",(rid,user["company_id"],data.name.strip(),user["id"],now))
+            conn.execute("INSERT INTO restaurant_areas(id,company_id,name,active,created_by,created_at) VALUES(?,?,?,1,?,?)",(rid,user["company_id"],data.name.strip(),user["id"],now))
             audit(conn,user["company_id"],user["id"],"restaurant.area_created","restaurant_area",rid,{"name":data.name.strip()})
     except sqlite3.IntegrityError: raise HTTPException(409,"Ambiente já cadastrado.")
     return {"id":rid,"name":data.name.strip(),"active":True}
@@ -1584,7 +1611,7 @@ def restaurant_create_table(data: RestaurantTableIn,conn: DB,user: USER):
     tid,now=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO restaurant_tables VALUES(?,?,?,?,?,'available',1,?,?)",(tid,user["company_id"],data.area_id,data.label.strip(),data.capacity,user["id"],now))
+            conn.execute("INSERT INTO restaurant_tables(id,company_id,area_id,label,capacity,status,active,created_by,created_at) VALUES(?,?,?,?,?,'available',1,?,?)",(tid,user["company_id"],data.area_id,data.label.strip(),data.capacity,user["id"],now))
             audit(conn,user["company_id"],user["id"],"restaurant.table_created","restaurant_table",tid,{"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity})
     except sqlite3.IntegrityError: raise HTTPException(409,"Mesa já cadastrada.")
     return {"id":tid,"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity,"status":"available"}
@@ -1598,7 +1625,7 @@ def restaurant_open_table(table_id: str,conn: DB,user: USER):
             table=conn.execute("SELECT status FROM restaurant_tables WHERE id=? AND company_id=? AND active=1",(table_id,user["company_id"])).fetchone()
             if not table: raise HTTPException(404,"Mesa não encontrada.")
             if table["status"]!='available': raise HTTPException(409,"Mesa não está livre.")
-            conn.execute("INSERT INTO restaurant_services VALUES(?,?,?,'open',?,?,NULL)",(sid,user["company_id"],table_id,user["id"],now))
+            conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at) VALUES(?,?,?,'open',?,?,NULL)",(sid,user["company_id"],table_id,user["id"],now))
             updated=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND status='available'",(table_id,user["company_id"]))
             if updated.rowcount!=1: raise HTTPException(409,"Mesa ocupada por outra operação.")
             audit(conn,user["company_id"],user["id"],"restaurant.service_opened","restaurant_service",sid,{"table_id":table_id})
@@ -1625,7 +1652,7 @@ def restaurant_reserve(data: RestaurantReservationIn,conn: DB,user: USER):
     rid,now=new_id(),now_iso()
     with transaction(conn):
         if conn.execute("SELECT 1 FROM restaurant_reservations WHERE company_id=? AND table_id=? AND status IN ('confirmed','seated') AND starts_at<? AND ends_at>?",(user["company_id"],data.table_id,data.ends_at,data.starts_at)).fetchone(): raise HTTPException(409,"Reserva conflitante.")
-        conn.execute("INSERT INTO restaurant_reservations VALUES(?,?,?,?,?,?,?,'confirmed',?,?)",(rid,user["company_id"],data.table_id,data.customer_name.strip(),data.party_size,data.starts_at,data.ends_at,user["id"],now))
+        conn.execute("INSERT INTO restaurant_reservations(id,company_id,table_id,customer_name,party_size,starts_at,ends_at,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,'confirmed',?,?)",(rid,user["company_id"],data.table_id,data.customer_name.strip(),data.party_size,data.starts_at,data.ends_at,user["id"],now))
         audit(conn,user["company_id"],user["id"],"restaurant.reservation_created","restaurant_reservation",rid,{"table_id":data.table_id,"starts_at":data.starts_at,"ends_at":data.ends_at})
     return {"id":rid,"table_id":data.table_id,"status":"confirmed","starts_at":data.starts_at,"ends_at":data.ends_at}
 
@@ -1642,7 +1669,7 @@ def restaurant_create_category(data: RestaurantCategoryIn,conn: DB,user: USER):
     cid,now=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO restaurant_menu_categories VALUES(?,?,?,1,?,?)",(cid,user["company_id"],data.name.strip(),user["id"],now))
+            conn.execute("INSERT INTO restaurant_menu_categories(id,company_id,name,active,created_by,created_at) VALUES(?,?,?,1,?,?)",(cid,user["company_id"],data.name.strip(),user["id"],now))
             audit(conn,user["company_id"],user["id"],"restaurant.menu_category_created","restaurant_menu_category",cid,{"name":data.name.strip()})
     except sqlite3.IntegrityError: raise HTTPException(409,"Categoria já cadastrada.")
     return {"id":cid,"name":data.name.strip()}
@@ -1655,7 +1682,7 @@ def restaurant_create_menu_item(data: RestaurantMenuItemIn,conn: DB,user: USER):
     mid,now=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO restaurant_menu_items VALUES(?,?,?,?,?,1,?,?)",(mid,user["company_id"],data.category_id,data.product_id,data.station,user["id"],now))
+            conn.execute("INSERT INTO restaurant_menu_items(id,company_id,category_id,product_id,station,active,created_by,created_at) VALUES(?,?,?,?,?,1,?,?)",(mid,user["company_id"],data.category_id,data.product_id,data.station,user["id"],now))
             audit(conn,user["company_id"],user["id"],"restaurant.menu_item_created","restaurant_menu_item",mid,{"product_id":data.product_id,"category_id":data.category_id,"station":data.station})
     except sqlite3.IntegrityError: raise HTTPException(409,"Produto já vinculado ao cardápio.")
     return {"id":mid,"category_id":data.category_id,"product_id":data.product_id,"station":data.station}
@@ -1668,7 +1695,7 @@ def restaurant_create_tab(service_id: str,data: RestaurantTabIn,conn: DB,user: U
     tid,now=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO restaurant_tabs VALUES(?,?,?,?,'open',?,?,NULL)",(tid,user["company_id"],service_id,data.label.strip(),user["id"],now))
+            conn.execute("INSERT INTO restaurant_tabs(id,company_id,service_id,label,status,opened_by,opened_at,closed_at) VALUES(?,?,?,?,'open',?,?,NULL)",(tid,user["company_id"],service_id,data.label.strip(),user["id"],now))
             audit(conn,user["company_id"],user["id"],"restaurant.tab_opened","restaurant_tab",tid,{"service_id":service_id,"label":data.label.strip()})
     except sqlite3.IntegrityError: raise HTTPException(409,"Comanda já existe para este atendimento ou nome repetido.")
     return {"id":tid,"service_id":service_id,"label":data.label.strip(),"status":"open"}
@@ -1680,13 +1707,13 @@ def restaurant_create_order(tab_id: str,data: RestaurantOrderIn,conn: DB,user: U
     with transaction(conn):
         tab=conn.execute("SELECT id,status FROM restaurant_tabs WHERE id=? AND company_id=?",(tab_id,user["company_id"])).fetchone()
         if not tab or tab["status"]!='open': raise HTTPException(409,"Comanda não está aberta.")
-        conn.execute("INSERT INTO restaurant_orders VALUES(?,?,?,'open',?,?,?,?)",(oid,user["company_id"],tab_id,data.notes.strip(),user["id"],now,now))
+        conn.execute("INSERT INTO restaurant_orders(id,company_id,tab_id,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,'open',?,?,?,?)",(oid,user["company_id"],tab_id,data.notes.strip(),user["id"],now,now))
         for line in data.items:
             menu=conn.execute("SELECT m.id,m.product_id,m.station,p.name,p.price_cents FROM restaurant_menu_items m JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.id=? AND m.company_id=? AND m.active=1 AND p.active=1",(line.menu_item_id,user["company_id"])).fetchone()
             if not menu: raise HTTPException(404,"Item de cardápio não encontrado.")
-            conn.execute("INSERT INTO restaurant_order_items VALUES(?,?,?,?,?,?,?,?,?,'queued',?)",(new_id(),user["company_id"],oid,menu["id"],menu["product_id"],menu["name"],decimal_milli(line.quantity),menu["price_cents"],menu["station"],now))
+            conn.execute("INSERT INTO restaurant_order_items(id,company_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?)",(new_id(),user["company_id"],oid,menu["id"],menu["product_id"],menu["name"],decimal_milli(line.quantity),menu["price_cents"],menu["station"],now))
         audit(conn,user["company_id"],user["id"],"restaurant.order_created","restaurant_order",oid,{"tab_id":tab_id,"item_count":len(data.items),"notes":data.notes})
-        conn.execute("INSERT INTO restaurant_events VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],tab_id,"order",oid,"created",json.dumps({"items":[x.menu_item_id for x in data.items],"notes":data.notes}),user["id"],now))
+        conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],tab_id,"order",oid,"created",json.dumps({"items":[x.menu_item_id for x in data.items],"notes":data.notes}),user["id"],now))
     return {"id":oid,"tab_id":tab_id,"status":"open","items":len(data.items)}
 
 @app.post("/v1/restaurant/orders/{order_id}/send")
@@ -1699,7 +1726,7 @@ def restaurant_send_order(order_id: str,conn: DB,user: USER):
         if order["status"]!='open': raise HTTPException(409,"Pedido já foi enviado ou mudou de estado.")
         conn.execute("UPDATE restaurant_orders SET status='sent',updated_at=? WHERE id=? AND company_id=?",(now,order_id,user["company_id"]))
         audit(conn,user["company_id"],user["id"],"restaurant.order_sent","restaurant_order",order_id,{"tab_id":order["tab_id"]})
-        conn.execute("INSERT INTO restaurant_events VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],order["tab_id"],"order",order_id,"sent",json.dumps({}),user["id"],now))
+        conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],order["tab_id"],"order",order_id,"sent",json.dumps({}),user["id"],now))
     return {"id":order_id,"status":"sent","sent_at":now}
 
 @app.get("/v1/restaurant/production")
@@ -1722,7 +1749,7 @@ def restaurant_update_item(item_id: str,data: RestaurantItemStatusIn,conn: DB,us
         states={x["status"] for x in items}
         order_status="delivered" if states<={"delivered","cancelled"} and "delivered" in states else "ready" if states<={"ready","delivered","cancelled"} and "ready" in states else "preparing" if "preparing" in states else row["order_status"]
         conn.execute("UPDATE restaurant_orders SET status=?,updated_at=? WHERE id=? AND company_id=?",(order_status,now,row["order_id"],user["company_id"]))
-        conn.execute("INSERT INTO restaurant_events VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],row["tab_id"],"order_item",item_id,data.status,json.dumps({"from":row["status"],"to":data.status}),user["id"],now))
+        conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],row["tab_id"],"order_item",item_id,data.status,json.dumps({"from":row["status"],"to":data.status}),user["id"],now))
         audit(conn,user["company_id"],user["id"],"restaurant.order_item_status","restaurant_order_item",item_id,{"from":row["status"],"to":data.status,"order_id":row["order_id"]})
     return {"id":item_id,"status":data.status,"order_status":order_status}
 
@@ -1763,21 +1790,21 @@ def restaurant_tab_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: 
         if not register: raise HTTPException(409,"Abra um caixa central antes de receber a comanda.")
         orders=conn.execute("SELECT DISTINCT o.id,o.status FROM restaurant_orders o JOIN restaurant_order_items i ON i.order_id=o.id AND i.company_id=o.company_id WHERE o.tab_id=? AND o.company_id=? AND i.status<>'cancelled'",(tab_id,user["company_id"])).fetchall()
         if any(o["status"]!="delivered" for o in orders): raise HTTPException(409,"Todos os itens devem ser entregues antes de receber.")
-        conn.execute("INSERT INTO restaurant_tab_payments VALUES(?,?,?,?,'cash',?,?,?)",(new_id(),user["company_id"],tab_id,amount,data.idempotency_key,user["id"],now))
-        conn.execute("INSERT INTO cash_movements VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],register["id"],user["id"],"sale",amount,"Comanda "+tab_id,None,now))
+        conn.execute("INSERT INTO restaurant_tab_payments(id,company_id,tab_id,amount_cents,method,idempotency_key,received_by,received_at) VALUES(?,?,?,?,'cash',?,?,?)",(new_id(),user["company_id"],tab_id,amount,data.idempotency_key,user["id"],now))
+        conn.execute("INSERT INTO cash_movements(id,company_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],register["id"],user["id"],"sale",amount,"Comanda "+tab_id,None,now))
         if paid+amount==total:
             sale_id=new_id()
             request_hash=hashlib.sha256(json.dumps({"restaurant_tab":tab_id,"total_cents":total},sort_keys=True).encode()).hexdigest()
             conn.execute("INSERT INTO sales(id,company_id,register_id,created_by,idempotency_key,request_hash,status,subtotal_cents,total_cents,payment_method,received_cents,change_cents,created_at,customer_id) VALUES(?,?,?,?,?,?,'paid',?,?,'cash',?,0,?,NULL)",(sale_id,user["company_id"],register["id"],user["id"],"restaurant-tab:"+tab_id,request_hash,total,total,total,now))
             for line in conn.execute("SELECT i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,p.sku FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN products p ON p.id=i.product_id AND p.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status='delivered'",(tab_id,user["company_id"])).fetchall():
                 gross=(line["quantity_milli"]*line["unit_price_cents"]+500)//1000
-                conn.execute("INSERT INTO sale_items VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),sale_id,line["product_id"],line["sku"],line["name_snapshot"],line["quantity_milli"],line["unit_price_cents"],0,gross))
+                conn.execute("INSERT INTO sale_items(id,sale_id,product_id,sku,name,quantity_milli,unit_price_cents,discount_cents,line_total_cents) VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),sale_id,line["product_id"],line["sku"],line["name_snapshot"],line["quantity_milli"],line["unit_price_cents"],0,gross))
             for item in conn.execute("SELECT product_id,SUM(quantity_milli) AS qty FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status='delivered' GROUP BY product_id",(tab_id,user["company_id"])).fetchall():
                 product=conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND active=1",(item["product_id"],user["company_id"])).fetchone()
                 if not product or product["stock_milli"]<item["qty"]: raise HTTPException(409,"Estoque insuficiente para concluir a comanda.")
                 after=product["stock_milli"]-item["qty"]
                 conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,product["id"],user["company_id"]))
-                conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],product["id"],user["id"],"sale",-item["qty"],product["stock_milli"],after,"Baixa comanda "+tab_id,None,now))
+                conn.execute("INSERT INTO stock_movements(id,company_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],product["id"],user["id"],"sale",-item["qty"],product["stock_milli"],after,"Baixa comanda "+tab_id,None,now))
             audit(conn,user["company_id"],user["id"],"sale.completed","sale",sale_id,{"total":cents_to_money(total),"payment_method":"cash","register_id":register["id"],"source":"restaurant_tab","tab_id":tab_id})
             conn.execute("UPDATE restaurant_tabs SET status='closed',closed_at=? WHERE id=? AND company_id=?",(now,tab_id,user["company_id"]))
             service_id=tab["service_id"]
@@ -1786,7 +1813,7 @@ def restaurant_tab_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: 
                 conn.execute("UPDATE restaurant_services SET status='closed',closed_at=? WHERE id=? AND company_id=?",(now,service_id,user["company_id"]))
                 conn.execute("UPDATE restaurant_tables SET status='available' WHERE id=? AND company_id=?",(tab["table_id"],user["company_id"]))
         audit(conn,user["company_id"],user["id"],"restaurant.cash_payment","restaurant_tab",tab_id,{"amount":cents_to_money(amount),"method":"cash","fully_paid":paid+amount==total})
-        conn.execute("INSERT INTO restaurant_events VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],tab_id,"payment",data.idempotency_key,"cash_received",json.dumps({"amount_cents":amount,"change_cents":received-amount}),user["id"],now))
+        conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],tab_id,"payment",data.idempotency_key,"cash_received",json.dumps({"amount_cents":amount,"change_cents":received-amount}),user["id"],now))
     return {"tab_id":tab_id,"amount":cents_to_money(amount),"change":cents_to_money(received-amount),"method":"cash","status":"closed" if paid+amount==total else "partially_paid","electronic_confirmation":False}
 
 @app.get("/v1/restaurant/reports/operations")
@@ -1862,7 +1889,7 @@ def create_customer(data: CustomerIn,conn: DB,user: USER):
     email=data.email.strip().lower()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO customers VALUES(?,?,?,?,?,?,?,1,?,?)",(customer_id,user["company_id"],data.name.strip(),email,data.phone.strip(),data.tax_id,data.notes.strip(),created,created))
+            conn.execute("INSERT INTO customers(id,company_id,name,email,phone,tax_id,notes,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)",(customer_id,user["company_id"],data.name.strip(),email,data.phone.strip(),data.tax_id,data.notes.strip(),created,created))
             audit(conn,user["company_id"],user["id"],"customer.created","customer",customer_id,{"name":data.name.strip(),"email":email,"phone":data.phone.strip()})
     except sqlite3.IntegrityError:
         raise HTTPException(409,"Já existe cliente com esse e-mail nesta empresa.")
@@ -1885,7 +1912,7 @@ def create_supplier(data: SupplierIn,conn: DB,user: USER):
     supplier_id,created=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO suppliers VALUES(?,?,?,?,?,?,?,1,?,?)",(supplier_id,user["company_id"],data.name,data.tax_id,data.email,data.phone,data.notes,created,created))
+            conn.execute("INSERT INTO suppliers(id,company_id,name,tax_id,email,phone,notes,active,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)",(supplier_id,user["company_id"],data.name,data.tax_id,data.email,data.phone,data.notes,created,created))
             audit(conn,user["company_id"],user["id"],"supplier.created","supplier",supplier_id,{"name":data.name})
     except sqlite3.IntegrityError:
         raise HTTPException(409,"Já existe um fornecedor com esse nome nesta empresa.")
@@ -1901,10 +1928,10 @@ def create_purchase_order(data: PurchaseCreateIn,conn: DB,user: USER):
         with transaction(conn):
             supplier=conn.execute("SELECT id FROM suppliers WHERE id=? AND company_id=? AND active=1",(data.supplier_id,user["company_id"])).fetchone()
             if not supplier: raise HTTPException(404,"Fornecedor não encontrado nesta empresa.")
-            conn.execute("INSERT INTO purchase_orders VALUES(?,?,?,?,'draft',?,?,?,?)",(order_id,user["company_id"],data.supplier_id,data.order_number.strip(),data.notes.strip(),user["id"],created,created))
+            conn.execute("INSERT INTO purchase_orders(id,company_id,supplier_id,order_number,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,'draft',?,?,?,?)",(order_id,user["company_id"],data.supplier_id,data.order_number.strip(),data.notes.strip(),user["id"],created,created))
             for line in data.items:
                 product=company_product(conn,user["company_id"],line.product_id)
-                conn.execute("INSERT INTO purchase_order_items VALUES(?,?,?,?,?,0,?)",(new_id(),order_id,user["company_id"],product["id"],decimal_milli(line.quantity),decimal_money_cents(line.unit_cost)))
+                conn.execute("INSERT INTO purchase_order_items(id,purchase_order_id,company_id,product_id,ordered_milli,received_milli,unit_cost_cents) VALUES(?,?,?,?,?,0,?)",(new_id(),order_id,user["company_id"],product["id"],decimal_milli(line.quantity),decimal_money_cents(line.unit_cost)))
             audit(conn,user["company_id"],user["id"],"purchase_order.created","purchase_order",order_id,{"supplier_id":data.supplier_id,"order_number":data.order_number,"line_count":len(data.items)})
     except sqlite3.IntegrityError:
         raise HTTPException(409,"Número de pedido já cadastrado ou item inválido.")
@@ -1939,7 +1966,7 @@ def mark_payable_paid(payable_id: str,data: PayablePaidIn,conn: DB,user: USER):
         remaining=row["amount_cents"]-already
         if remaining<=0: raise HTTPException(409,"Conta sem saldo pendente.")
         payment_id=new_id()
-        conn.execute("INSERT INTO payable_payments VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,remaining,date.today().isoformat(),data.payment_note,"legacy-full-"+payment_id,user["id"],paid_at))
+        conn.execute("INSERT INTO payable_payments(id,company_id,payable_id,amount_cents,payment_date,reference,idempotency_key,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,remaining,date.today().isoformat(),data.payment_note,"legacy-full-"+payment_id,user["id"],paid_at))
         conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=?",(paid_at,data.payment_note,payable_id,user["company_id"]))
         audit(conn,user["company_id"],user["id"],"payable.manually_marked_paid","accounts_payable",payable_id,{"amount":cents_to_money(remaining),"payment_note":data.payment_note,"warning":"Baixa declarada manualmente; não confirmada por integração bancária."})
     return {"id":payable_id,"status":"paid","paid_at":paid_at,"note":"Baixa manual registrada; não representa confirmação bancária."}
@@ -1972,7 +1999,7 @@ def record_payable_payment(payable_id: str,data: PayablePartialIn,request: Reque
         remaining=payable["amount_cents"]-already
         if amount_cents>remaining: raise HTTPException(409,"O pagamento supera o saldo restante.")
         payment_id=new_id()
-        conn.execute("INSERT INTO payable_payments VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,amount_cents,data.payment_date.isoformat(),data.reference,idempotency_key,user["id"],created))
+        conn.execute("INSERT INTO payable_payments(id,company_id,payable_id,amount_cents,payment_date,reference,idempotency_key,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,amount_cents,data.payment_date.isoformat(),data.reference,idempotency_key,user["id"],created))
         paid=already+amount_cents
         new_status="paid" if paid==payable["amount_cents"] else "open"
         if new_status=="paid": conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=?",(created,data.reference,payable_id,user["company_id"]))
@@ -2000,12 +2027,12 @@ def create_expense(data: ExpenseIn,conn: DB,user: USER,
             if response is not None: response.status_code=200
             return {"id":prior["payable_id"],"amount":cents_to_money(prior["amount_cents"]),"due_date":prior["due_date"],"status":prior["status"],"cost_center":prior["cost_center"],"note":"Registro já existente; eventuais baixas seguem declaradas manualmente."}
         conn.execute("INSERT INTO accounts_payable(id,company_id,supplier_id,source_receipt_id,description,amount_cents,due_date,status,created_by,created_at) VALUES(?,?,NULL,NULL,?,?,?,'open',?,?)",(payable_id,user["company_id"],data.description.strip(),amount_cents,data.due_date.isoformat(),user["id"],created))
-        conn.execute("INSERT INTO payable_expense_details VALUES(?,?,?,?,?)",(payable_id,user["company_id"],data.cost_center.strip(),idempotency_key,request_hash))
+        conn.execute("INSERT INTO payable_expense_details(payable_id,company_id,cost_center,idempotency_key,request_hash) VALUES(?,?,?,?,?)",(payable_id,user["company_id"],data.cost_center.strip(),idempotency_key,request_hash))
         if data.payment_date:
             if data.payment_date>date.today(): raise HTTPException(422,"Data de pagamento não pode ser futura.")
             if len(data.payment_reference.strip())<3: raise HTTPException(422,"Informe referência/justificativa para baixa manual.")
             payment_id=new_id()
-            conn.execute("INSERT INTO payable_payments VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,amount_cents,data.payment_date.isoformat(),data.payment_reference.strip(),"expense-"+payment_id,user["id"],created))
+            conn.execute("INSERT INTO payable_payments(id,company_id,payable_id,amount_cents,payment_date,reference,idempotency_key,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(payment_id,user["company_id"],payable_id,amount_cents,data.payment_date.isoformat(),data.payment_reference.strip(),"expense-"+payment_id,user["id"],created))
             conn.execute("UPDATE accounts_payable SET status='paid',paid_at=?,payment_note=? WHERE id=? AND company_id=?",(created,data.payment_reference.strip(),payable_id,user["company_id"]))
             audit(conn,user["company_id"],user["id"],"expense.manually_marked_paid","payable_payment",payment_id,{"payable_id":payable_id,"amount":cents_to_money(amount_cents),"cost_center":data.cost_center.strip(),"status":"manual_not_bank_confirmed"})
         audit(conn,user["company_id"],user["id"],"expense.created","accounts_payable",payable_id,{"description":data.description.strip(),"amount":cents_to_money(amount_cents),"due_date":data.due_date.isoformat(),"cost_center":data.cost_center.strip(),"payment_status":"paid_manual" if data.payment_date else "open"})
@@ -2092,13 +2119,13 @@ def receive_purchase(order_id: str,data: PurchaseReceiveIn,request: Request,conn
             if not item: raise HTTPException(404,"Linha do pedido não encontrada.")
             if item["received_milli"]+qty>item["ordered_milli"]: raise HTTPException(409,"Quantidade recebida supera o saldo do pedido.")
             receipt_rows.append((line,item,qty))
-        conn.execute("INSERT INTO purchase_receipts VALUES(?,?,?,?,?,?,?)",(receipt_id,user["company_id"],order_id,user["id"],received_at,idempotency_key,request_hash))
+        conn.execute("INSERT INTO purchase_receipts(id,company_id,purchase_order_id,received_by,received_at,idempotency_key,request_hash) VALUES(?,?,?,?,?,?,?)",(receipt_id,user["company_id"],order_id,user["id"],received_at,idempotency_key,request_hash))
         for line,item,qty in receipt_rows:
             before=item["stock_milli"];after=before+qty
             conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,item["product_id"],user["company_id"]))
             conn.execute("UPDATE purchase_order_items SET received_milli=received_milli+? WHERE id=? AND company_id=?",(qty,line.order_item_id,user["company_id"]))
-            conn.execute("INSERT INTO purchase_receipt_items VALUES(?,?,?,?,?,?)",(new_id(),receipt_id,line.order_item_id,item["product_id"],qty,item["unit_cost_cents"]))
-            conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],item["product_id"],user["id"],"adjustment_in",qty,before,after,"Recebimento de pedido "+order["order_number"],None,received_at))
+            conn.execute("INSERT INTO purchase_receipt_items(id,receipt_id,purchase_order_item_id,product_id,quantity_milli,unit_cost_cents) VALUES(?,?,?,?,?,?)",(new_id(),receipt_id,line.order_item_id,item["product_id"],qty,item["unit_cost_cents"]))
+            conn.execute("INSERT INTO stock_movements(id,company_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],item["product_id"],user["id"],"adjustment_in",qty,before,after,"Recebimento de pedido "+order["order_number"],None,received_at))
         remaining=conn.execute("SELECT COUNT(*) FROM purchase_order_items WHERE purchase_order_id=? AND received_milli<ordered_milli",(order_id,)).fetchone()[0]
         new_status="received" if remaining==0 else "partially_received"
         payable_id=None
@@ -2210,7 +2237,7 @@ def adjust_stock(product_id: str, data: StockAdjustmentIn, conn: DB, user: USER)
         conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?", (after, product_id, user["company_id"]))
         kind = "adjustment_in" if data.direction == "in" else "adjustment_out"
         signed_quantity = quantity if data.direction == "in" else -quantity
-        conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO stock_movements(id,company_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                      (movement_id, user["company_id"], product_id, user["id"], kind, signed_quantity,
                       before, after, data.reason, None, created))
         audit(conn, user["company_id"], user["id"], "stock.adjusted", "product", product_id,
@@ -2281,7 +2308,7 @@ def cash_movement(register_id: str, data: CashMovementIn, conn: DB, user: USER):
         expected = reg["opening_cents"] + sum(m["amount_cents"] for m in movements)
         if expected + amount < 0:
             raise HTTPException(409, "O caixa não tem saldo esperado suficiente para essa retirada.")
-        conn.execute("INSERT INTO cash_movements VALUES(?,?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO cash_movements(id,company_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                      (movement_id, user["company_id"], register_id, user["id"], data.kind, amount, data.reason.strip(), None, created))
         audit(conn, user["company_id"], user["id"], "register.movement", "register", register_id,
               {"kind": data.kind, "amount": cents_to_money(abs(amount)), "reason": data.reason.strip()})
@@ -2371,17 +2398,17 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
             quantity = decimal_milli(line.quantity)
             gross = int((Decimal(product["price_cents"]) * Decimal(quantity) / Decimal(1000)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
             discount = decimal_money_cents(line.discount)
-            conn.execute("INSERT INTO sale_items VALUES(?,?,?,?,?,?,?,?,?)",
+            conn.execute("INSERT INTO sale_items(id,sale_id,product_id,sku,name,quantity_milli,unit_price_cents,discount_cents,line_total_cents) VALUES(?,?,?,?,?,?,?,?,?)",
                          (new_id(), sale_id, product["id"], product["sku"], product["name"], quantity,
                           product["price_cents"], discount, gross - discount))
         for product_id, aggregate in aggregates.items():
             product, quantity = aggregate["product"], aggregate["quantity"]
             before, after = product["stock_milli"], product["stock_milli"] - quantity
             conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?", (after, product_id, user["company_id"]))
-            conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            conn.execute("INSERT INTO stock_movements(id,company_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                          (new_id(), user["company_id"], product_id, user["id"], "sale", -quantity,
                           before, after, "Venda " + sale_id, sale_id, created))
-        conn.execute("INSERT INTO cash_movements VALUES(?,?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO cash_movements(id,company_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                      (new_id(), user["company_id"], register["id"], user["id"], "sale", subtotal, "Venda " + sale_id, sale_id, created))
         audit(conn, user["company_id"], user["id"], "sale.completed", "sale", sale_id,
               {"total": cents_to_money(subtotal), "payment_method": "cash", "register_id": register["id"], "item_count": len(data.items)})
@@ -2410,9 +2437,9 @@ def void_sale(sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
             if not product: raise HTTPException(409,"Produto da venda não existe mais; estorno de estoque interrompido.")
             before=product["stock_milli"];after=before+item["quantity_milli"]
             conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,item["product_id"],user["company_id"]))
-            conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],item["product_id"],user["id"],"reversal",item["quantity_milli"],before,after,"Cancelamento venda "+sale_id+": "+data.reason,sale_id,created))
+            conn.execute("INSERT INTO stock_movements(id,company_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],item["product_id"],user["id"],"reversal",item["quantity_milli"],before,after,"Cancelamento venda "+sale_id+": "+data.reason,sale_id,created))
         conn.execute("UPDATE sales SET status='voided' WHERE id=? AND company_id=?",(sale_id,user["company_id"]))
-        conn.execute("INSERT INTO cash_movements VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],register["id"],user["id"],"withdrawal",-sale["total_cents"],"Estorno venda "+sale_id+": "+data.reason,sale_id,created))
+        conn.execute("INSERT INTO cash_movements(id,company_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],register["id"],user["id"],"withdrawal",-sale["total_cents"],"Estorno venda "+sale_id+": "+data.reason,sale_id,created))
         audit(conn,user["company_id"],user["id"],"sale.voided","sale",sale_id,{"reason":data.reason,"amount":cents_to_money(sale["total_cents"]),"stock_items":len(items),"refund_register_id":register["id"],"refund_method":"cash_manual"})
     return {"id":sale_id,"status":"voided","reason":data.reason,"voided_at":created,"refund_register_id":register["id"],"note":"Estorno registrado no caixa aberto; a entrega do dinheiro ao cliente é manual e não confirmada por provedor."}
 

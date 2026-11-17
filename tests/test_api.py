@@ -721,7 +721,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1085,3 +1085,44 @@ def test_permission_router_inventory_covers_all_authenticated_endpoints():
             for method in getattr(route,"methods",set())-{"HEAD","OPTIONS"}:
                 if main.permission_for_endpoint(method,path) is None: missing.append((method,path))
     assert missing==[]
+
+
+def test_multi_branch_operations_fail_closed_and_never_attribute_legacy_data(world):
+    owner=company(world);headers=auth(owner)
+    first=world.get('/v1/company/branches',headers=headers).json()['items'][0]
+    legacy=product(world,owner,sku='LEGACY-UNASSIGNED')
+    branch=world.post('/v1/company/branches',headers=headers,json={'code':'second','name':'Segunda unidade'})
+    assert branch.status_code==201
+    denied=world.get('/v1/products',headers=headers)
+    assert denied.status_code==409 and 'permanecem sem atribuição' in denied.json()['detail']
+    invalid=world.get('/v1/products',headers={**headers,'X-Branch-Id':'foreign-branch-id'})
+    assert invalid.status_code==403
+    foreign=company(world,'Outra empresa','another','another@example.test')
+    foreign_branch=world.get('/v1/company/branches',headers=auth(foreign)).json()['items'][0]['id']
+    cross=world.get('/v1/products',headers={**headers,'X-Branch-Id':foreign_branch})
+    assert cross.status_code==403
+
+
+def test_branch_scope_migration_preserves_legacy_rows_as_unassigned(world):
+    owner=company(world);headers=auth(owner)
+    legacy=product(world,owner,sku='LEGACY-UNASSIGNED')
+    conn=main.connect_db()
+    try:
+        columns={r[1] for r in conn.execute('PRAGMA table_info(products)').fetchall()}
+        assert 'branch_id' in columns
+        row=conn.execute('SELECT branch_id FROM products WHERE id=? AND company_id=?',(legacy['id'],world.get('/v1/me',headers=headers).json()['company_id'])).fetchone()
+        assert row['branch_id'] is None
+        status=conn.execute("SELECT value FROM deployment_metadata WHERE key='branch_partitioning'").fetchone()
+        assert status[0]=='schema_added_legacy_unassigned'
+    finally: conn.close()
+
+
+def test_branch_membership_cannot_be_forged_across_tenant_and_multi_branch_fails_closed(world):
+    owner=company(world);headers=auth(owner)
+    branches=world.get('/v1/company/branches',headers=headers).json()['items']
+    foreign=company(world,'Different','different','different@example.test')
+    foreign_branch=world.get('/v1/company/branches',headers=auth(foreign)).json()['items'][0]['id']
+    assert world.get('/v1/products',headers={**headers,'X-Branch-Id':foreign_branch}).status_code==403
+    assert world.post('/v1/company/branches',headers=headers,json={'code':'second','name':'Segunda unidade'}).status_code==201
+    assert world.get('/v1/products',headers=headers).status_code==409
+    assert world.get('/v1/products',headers={**headers,'X-Branch-Id':branches[0]['id']}).status_code==409
