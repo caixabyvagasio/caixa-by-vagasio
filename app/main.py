@@ -3011,7 +3011,10 @@ def pay_branch_payable(branch_id: str,payable_id: str,data: PayablePartialIn,con
     if amount<=0:raise HTTPException(422,"Valor deve ser de ao menos R$ 0,01.")
     if data.payment_date>date.today():raise HTTPException(422,"Data de pagamento não pode ser futura.")
     now=now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        payable=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=? AND branch_id=?"+lock_clause,(payable_id,user["company_id"],branch_id)).fetchone()
+        if not payable:raise HTTPException(404,"Conta não encontrada nesta filial.")
         prior=conn.execute("SELECT * FROM payable_payments WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
         if prior:
             if prior["payable_id"]!=payable_id or prior["amount_cents"]!=amount or prior["reference"]!=data.reference or prior["payment_date"]!=data.payment_date.isoformat():raise HTTPException(409,"Chave de idempotência reutilizada com outros dados.")
@@ -3020,8 +3023,6 @@ def pay_branch_payable(branch_id: str,payable_id: str,data: PayablePartialIn,con
             paid=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0]
             if response is not None:response.status_code=200
             return {"id":prior["id"],"branch_id":branch_id,"status":payable["status"],"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,payable["amount_cents"]-paid)),"idempotent":True,"note":"Baixa manual; não confirmada por banco."}
-        payable=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=? AND branch_id=?",(payable_id,user["company_id"],branch_id)).fetchone()
-        if not payable:raise HTTPException(404,"Conta não encontrada nesta filial.")
         if payable["status"]!="open":raise HTTPException(409,"Conta não está em aberto.")
         paid=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0];remaining=payable["amount_cents"]-paid
         if amount>remaining:raise HTTPException(409,"Pagamento supera o saldo restante.")
@@ -3070,8 +3071,8 @@ def mark_payable_paid(payable_id: str,data: PayablePaidIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager")
     require_permission(conn,user,"finance.write")
     paid_at=now_iso()
-    with transaction(conn):
-        row=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=?",(payable_id,user["company_id"])).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        row=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=?"+(" FOR UPDATE" if is_postgres(conn) else ""),(payable_id,user["company_id"])).fetchone()
         if not row: raise HTTPException(404,"Conta a pagar não encontrada nesta empresa.")
         if row["status"]!="open": raise HTTPException(409,"A conta não está em aberto.")
         already=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0]
@@ -3095,7 +3096,10 @@ def record_payable_payment(payable_id: str,data: PayablePartialIn,request: Reque
     if amount_cents<=0: raise HTTPException(422,"Valor deve ser de ao menos R$ 0,01.")
     if data.payment_date>date.today(): raise HTTPException(422,"Data de pagamento não pode ser futura.")
     created=now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        payable=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=?"+lock_clause,(payable_id,user["company_id"])).fetchone()
+        if not payable: raise HTTPException(404,"Conta a pagar não encontrada nesta empresa.")
         prior=conn.execute("SELECT * FROM payable_payments WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
         if prior:
             if prior["payable_id"]!=payable_id or prior["amount_cents"]!=amount_cents or prior["reference"]!=data.reference or prior["payment_date"]!=data.payment_date.isoformat():
@@ -3104,8 +3108,6 @@ def record_payable_payment(payable_id: str,data: PayablePartialIn,request: Reque
             payable=conn.execute("SELECT amount_cents,status FROM accounts_payable WHERE id=? AND company_id=?",(payable_id,user["company_id"])).fetchone()
             paid=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0]
             return {"id":prior["id"],"status":payable["status"],"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,payable["amount_cents"]-paid)),"note":"Baixa manual registrada; não confirmada por banco."}
-        payable=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=?",(payable_id,user["company_id"])).fetchone()
-        if not payable: raise HTTPException(404,"Conta a pagar não encontrada nesta empresa.")
         if payable["status"]!="open": raise HTTPException(409,"Conta não está em aberto.")
         already=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM payable_payments WHERE company_id=? AND payable_id=?",(user["company_id"],payable_id)).fetchone()[0]
         remaining=payable["amount_cents"]-already
