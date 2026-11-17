@@ -1297,6 +1297,13 @@ def permission_for_endpoint(method: str, path: str):
     if path.startswith("/v1/company/branches"):
         return "branches.manage" if "/users" in path or method!="GET" else "branch.read"
     if path=="/v1/branches/stock-transfers": return "stock.adjust"
+    if path.startswith("/v1/branches/") and "/restaurant/" in path:
+        if "/restaurant/menu" in path: return "restaurant.menu" if method not in {"GET","HEAD"} else "products.read"
+        if "/restaurant/payments" in path: return "restaurant.cash"
+        if "/restaurant/production" in path or "/restaurant/order-items/" in path: return "restaurant.production"
+        if "/restaurant/reports/" in path: return "reports.read"
+        if "/restaurant/tabs" in path or "/restaurant/orders" in path or "/restaurant/services/" in path: return "restaurant.orders"
+        return "restaurant.floor"
     if path.startswith("/v1/branches/") and "/registers" in path: return "cash.manage"
     if path.startswith("/v1/branches/") and "/purchase-orders" in path: return "purchases.manage"
     if path.startswith("/v1/branches/") and "/payables" in path: return "finance.write" if method not in {"GET","HEAD"} else "finance.read"
@@ -1992,6 +1999,108 @@ def require_restaurant_floor(conn,user):
     require_permission(conn,user,"restaurant.floor")
     feat=conn.execute("SELECT available FROM feature_catalog WHERE id='restaurant_floor'").fetchone()
     if not feat or not feat["available"]: raise HTTPException(409,"Módulo de salão indisponível.")
+
+def require_restaurant_branch(conn,user,branch_id):
+    require_branch_membership(conn,user,branch_id)
+    require_restaurant_floor(conn,user)
+
+
+@app.get("/v1/branches/{branch_id}/restaurant/areas")
+def branch_restaurant_areas(branch_id: str,conn: DB,user: USER):
+    require_restaurant_branch(conn,user,branch_id)
+    rows=conn.execute("SELECT id,name,active FROM restaurant_areas WHERE company_id=? AND branch_id=? ORDER BY name,id",(user["company_id"],branch_id)).fetchall()
+    return {"branch_id":branch_id,"items":[{"id":r["id"],"name":r["name"],"active":bool(r["active"])} for r in rows]}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/areas",status_code=201)
+def branch_restaurant_create_area(branch_id: str,data: RestaurantAreaIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    rid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO restaurant_areas(id,company_id,name,active,created_by,created_at,branch_id) VALUES(?,?,?,1,?,?,?)",(rid,user["company_id"],data.name.strip(),user["id"],now,branch_id))
+            audit(conn,user["company_id"],user["id"],"restaurant.branch_area_created","restaurant_area",rid,{"branch_id":branch_id,"name":data.name.strip()})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Ambiente já cadastrado.")
+    return {"id":rid,"branch_id":branch_id,"name":data.name.strip(),"active":True}
+
+
+@app.get("/v1/branches/{branch_id}/restaurant/floor")
+def branch_restaurant_floor(branch_id: str,conn: DB,user: USER):
+    require_restaurant_branch(conn,user,branch_id)
+    rows=conn.execute("SELECT t.id,t.label,t.capacity,t.status,a.name AS area,s.id AS service_id FROM restaurant_tables t JOIN restaurant_areas a ON a.id=t.area_id AND a.company_id=t.company_id AND a.branch_id=t.branch_id LEFT JOIN restaurant_services s ON s.table_id=t.id AND s.company_id=t.company_id AND s.branch_id=t.branch_id AND s.status='open' WHERE t.company_id=? AND t.branch_id=? AND t.active=1 ORDER BY a.name,t.label,t.id",(user["company_id"],branch_id)).fetchall()
+    return {"branch_id":branch_id,"items":[dict(r) for r in rows],"total":len(rows)}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/tables",status_code=201)
+def branch_restaurant_create_table(branch_id: str,data: RestaurantTableIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    if not conn.execute("SELECT 1 FROM restaurant_areas WHERE id=? AND company_id=? AND branch_id=? AND active=1",(data.area_id,user["company_id"],branch_id)).fetchone(): raise HTTPException(404,"Ambiente não encontrado nesta filial.")
+    tid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO restaurant_tables(id,company_id,area_id,label,capacity,status,active,created_by,created_at,branch_id) VALUES(?,?,?,?,?,'available',1,?,?,?)",(tid,user["company_id"],data.area_id,data.label.strip(),data.capacity,user["id"],now,branch_id))
+            audit(conn,user["company_id"],user["id"],"restaurant.branch_table_created","restaurant_table",tid,{"branch_id":branch_id,"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Mesa já cadastrada.")
+    return {"id":tid,"branch_id":branch_id,"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity,"status":"available"}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/tables/{table_id}/open")
+def branch_restaurant_open_table(branch_id: str,table_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    sid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            table=conn.execute("SELECT status FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1",(table_id,user["company_id"],branch_id)).fetchone()
+            if not table: raise HTTPException(404,"Mesa não encontrada nesta filial.")
+            if table["status"]!='available': raise HTTPException(409,"Mesa não está livre.")
+            conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at,branch_id) VALUES(?,?,?,'open',?,?,NULL,?)",(sid,user["company_id"],table_id,user["id"],now,branch_id))
+            updated=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND branch_id=? AND status='available'",(table_id,user["company_id"],branch_id))
+            if updated.rowcount!=1: raise HTTPException(409,"Mesa ocupada por outra operação.")
+            audit(conn,user["company_id"],user["id"],"restaurant.branch_service_opened","restaurant_service",sid,{"branch_id":branch_id,"table_id":table_id})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Já existe atendimento para essa mesa.")
+    except Exception as exc:
+        if getattr(exc,"pgcode",None) in {"40001","40P01","23505"} or (isinstance(exc,sqlite3.OperationalError) and "locked" in str(exc).lower()): raise HTTPException(409,"A mesa foi ocupada por outra operação concorrente; atualize o salão.")
+        raise
+    return {"id":sid,"branch_id":branch_id,"table_id":table_id,"status":"open","opened_at":now}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/services/{service_id}/close-empty")
+def branch_restaurant_close_empty_service(branch_id: str,service_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    now=now_iso()
+    with transaction(conn):
+        service=conn.execute("SELECT id,table_id,status FROM restaurant_services WHERE id=? AND company_id=? AND branch_id=?",(service_id,user["company_id"],branch_id)).fetchone()
+        if not service: raise HTTPException(404,"Atendimento não encontrado nesta filial.")
+        if service["status"]!='open': raise HTTPException(409,"Atendimento não está aberto.")
+        if conn.execute("SELECT 1 FROM restaurant_tabs WHERE service_id=? AND company_id=? AND branch_id=?",(service_id,user["company_id"],branch_id)).fetchone(): raise HTTPException(409,"Atendimento com comandas deve ser encerrado pelo fluxo de recebimento da filial.")
+        conn.execute("UPDATE restaurant_services SET status='closed',closed_at=? WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(now,service_id,user["company_id"],branch_id))
+        changed=conn.execute("UPDATE restaurant_tables SET status='available' WHERE id=? AND company_id=? AND branch_id=? AND status='occupied'",(service["table_id"],user["company_id"],branch_id))
+        if changed.rowcount!=1: raise HTTPException(409,"Estado da mesa mudou; atualize o salão.")
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_empty_service_closed","restaurant_service",service_id,{"branch_id":branch_id,"table_id":service["table_id"]})
+    return {"id":service_id,"branch_id":branch_id,"status":"closed","table_id":service["table_id"],"closed_at":now}
+
+
+@app.get("/v1/branches/{branch_id}/restaurant/reservations")
+def branch_restaurant_list_reservations(branch_id: str,conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","all"]="confirmed"):
+    require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    rows=conn.execute("SELECT r.id,r.table_id,t.label AS table_label,a.name AS area,r.customer_name,r.party_size,r.starts_at,r.ends_at,r.status FROM restaurant_reservations r JOIN restaurant_tables t ON t.id=r.table_id AND t.company_id=r.company_id AND t.branch_id=r.branch_id JOIN restaurant_areas a ON a.id=t.area_id AND a.company_id=t.company_id AND a.branch_id=t.branch_id WHERE r.company_id=? AND r.branch_id=? AND (?='all' OR r.status=?) ORDER BY r.starts_at,r.id LIMIT 200",(user["company_id"],branch_id,status_filter,status_filter)).fetchall()
+    return {"branch_id":branch_id,"items":[dict(r) for r in rows]}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/reservations",status_code=201)
+def branch_restaurant_reserve(branch_id: str,data: RestaurantReservationIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    if data.ends_at<=data.starts_at: raise HTTPException(422,"Fim da reserva deve ser depois do início.")
+    table=conn.execute("SELECT capacity FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1",(data.table_id,user["company_id"],branch_id)).fetchone()
+    if not table: raise HTTPException(404,"Mesa não encontrada nesta filial.")
+    if data.party_size>table["capacity"]: raise HTTPException(409,"Grupo excede a capacidade da mesa.")
+    rid,now=new_id(),now_iso()
+    with transaction(conn):
+        if conn.execute("SELECT 1 FROM restaurant_reservations WHERE company_id=? AND branch_id=? AND table_id=? AND status IN ('confirmed','seated') AND starts_at<? AND ends_at>?",(user["company_id"],branch_id,data.table_id,data.ends_at,data.starts_at)).fetchone(): raise HTTPException(409,"Reserva conflitante nesta mesa.")
+        conn.execute("INSERT INTO restaurant_reservations(id,company_id,table_id,customer_name,party_size,starts_at,ends_at,status,created_by,created_at,branch_id) VALUES(?,?,?,?,?,?,?,'confirmed',?,?,?)",(rid,user["company_id"],data.table_id,data.customer_name.strip(),data.party_size,data.starts_at,data.ends_at,user["id"],now,branch_id))
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_reservation_created","restaurant_reservation",rid,{"branch_id":branch_id,"table_id":data.table_id,"starts_at":data.starts_at,"ends_at":data.ends_at})
+    return {"id":rid,"branch_id":branch_id,"table_id":data.table_id,"status":"confirmed","starts_at":data.starts_at,"ends_at":data.ends_at}
+
 
 @app.get("/v1/restaurant/areas")
 def restaurant_areas(conn: DB,user: USER):
