@@ -1845,7 +1845,7 @@ def create_branch_sale(branch_id: str,data: BranchSaleIn,request: Request,conn: 
     if received<total:raise HTTPException(422,"Valor recebido não cobre o total.")
     normalized={"branch_id":branch_id,"items":[{"product_id":x.product_id,"quantity":str(x.quantity),"discount":str(x.discount)} for x in data.items],"received_amount":str(data.received_amount),"customer_id":data.customer_id}
     req_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":")).encode()).hexdigest();sale_id,now=new_id(),now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
         prior=conn.execute("SELECT * FROM branch_sales WHERE company_id=? AND branch_id=? AND idempotency_key=?",(user["company_id"],branch_id,idempotency_key)).fetchone()
         if prior:
             if prior["request_hash"]!=req_hash:raise HTTPException(409,"Chave de idempotência usada com dados diferentes.")
@@ -1854,17 +1854,18 @@ def create_branch_sale(branch_id: str,data: BranchSaleIn,request: Request,conn: 
         register=conn.execute("SELECT * FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open'",(user["company_id"],branch_id)).fetchone()
         if not register:raise HTTPException(409,"Abra o caixa desta filial antes da venda.")
         available={}
-        for product_id,qty in qtys.items():
-            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,product_id)).fetchone()
-            balance=int(row[0]) if row else 0
-            if balance<qty:raise HTTPException(409,"Estoque insuficiente nesta filial.")
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        for product_id in sorted(qtys):
+            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO NOTHING",(user["company_id"],branch_id,product_id,0,now))
+            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?"+lock_clause,(user["company_id"],branch_id,product_id)).fetchone()
+            balance=int(row[0])
+            if balance<qtys[product_id]:raise HTTPException(409,"Estoque insuficiente nesta filial.")
             available[product_id]=balance
         conn.execute("INSERT INTO branch_sales(id,company_id,branch_id,register_id,created_by,idempotency_key,request_hash,status,subtotal_cents,total_cents,payment_method,received_cents,change_cents,created_at,customer_id) VALUES(?,?,?,?,?,?,?,'paid',?,?,'cash',?,?,?,?)",(sale_id,user["company_id"],branch_id,register["id"],user["id"],idempotency_key,req_hash,total,total,received,received-total,now,data.customer_id))
         for prod,q,d,line_total in lines:conn.execute("INSERT INTO branch_sale_items(id,company_id,branch_id,sale_id,product_id,sku,name,quantity_milli,unit_price_cents,discount_cents,line_total_cents) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],branch_id,sale_id,prod["id"],prod["sku"],prod["name"],q,prod["price_cents"],d,line_total))
         for pid,q in qtys.items():
             before=available[pid];after=before-q
             conn.execute("UPDATE branch_product_stock SET quantity_milli=?,updated_at=? WHERE company_id=? AND branch_id=? AND product_id=?",(after,now,user["company_id"],branch_id,pid))
-            if not conn.execute("SELECT 1 FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,pid)).fetchone():conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?)",(user["company_id"],branch_id,pid,after,now))
             conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'sale',?,?,?,?,NULL,?)",(new_id(),user["company_id"],branch_id,pid,user["id"],-q,before,after,"Venda "+sale_id,now))
         conn.execute("INSERT INTO branch_cash_movements(id,company_id,branch_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,'sale',?,?,?,?)",(new_id(),user["company_id"],branch_id,register["id"],user["id"],total,"Venda "+sale_id,sale_id,now))
         audit(conn,user["company_id"],user["id"],"branch_sale.completed","branch_sale",sale_id,{"branch_id":branch_id,"total":cents_to_money(total),"item_count":len(lines),"cash_only":True})
