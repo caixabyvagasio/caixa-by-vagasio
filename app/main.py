@@ -2898,8 +2898,8 @@ def list_branch_purchase_orders(branch_id: str,conn: DB,user: USER,limit: int=Qu
 @app.patch("/v1/branches/{branch_id}/purchase-orders/{order_id}")
 def update_branch_purchase_status(branch_id: str,order_id: str,data: PurchaseStatusIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager");require_permission(conn,user,"purchases.manage");require_branch_membership(conn,user,branch_id)
-    with transaction(conn):
-        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=? AND branch_id=?",(order_id,user["company_id"],branch_id)).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=? AND branch_id=?"+(" FOR UPDATE" if is_postgres(conn) else ""),(order_id,user["company_id"],branch_id)).fetchone()
         if not order:raise HTTPException(404,"Pedido não encontrado nesta filial.")
         if order["status"] not in {"draft","ordered"}:raise HTTPException(409,"Este pedido não pode mudar de estado.")
         if data.status=="cancelled" and conn.execute("SELECT 1 FROM purchase_order_items WHERE purchase_order_id=? AND company_id=? AND branch_id=? AND received_milli>0",(order_id,user["company_id"],branch_id)).fetchone():raise HTTPException(409,"Pedido com recebimento parcial não pode ser cancelado; finalize recebimento primeiro.")
