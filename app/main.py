@@ -449,9 +449,14 @@ def apply_schema_migrations(conn) -> None:
             UNIQUE(company_id,branch_id,product_id),FOREIGN KEY(category_id,company_id,branch_id) REFERENCES branch_restaurant_menu_categories(id,company_id,branch_id))""")
         conn.execute("CREATE INDEX IF NOT EXISTS branch_restaurant_menu_lookup ON branch_restaurant_menu_items(company_id,branch_id,active,category_id)")
     migration(13,"branch_scoped_restaurant_menu",create_branch_restaurant_menu)
+    def add_branch_restaurant_menu_price_snapshot():
+        if is_postgres(conn):
+            conn.execute("ALTER TABLE branch_restaurant_menu_items ADD COLUMN IF NOT EXISTS unit_price_cents BIGINT NOT NULL DEFAULT 0")
+        else:
+            cols={r[1] for r in conn.execute("PRAGMA table_info(branch_restaurant_menu_items)").fetchall()}
+            if "unit_price_cents" not in cols: conn.execute("ALTER TABLE branch_restaurant_menu_items ADD COLUMN unit_price_cents INTEGER NOT NULL DEFAULT 0")
+    migration(14,"branch_restaurant_menu_price_snapshot",add_branch_restaurant_menu_price_snapshot)
     def create_branch_restaurant_order_ledger():
-        conn.execute("ALTER TABLE branch_restaurant_menu_items ADD COLUMN unit_price_cents INTEGER NOT NULL DEFAULT 0") if not is_postgres(conn) and "unit_price_cents" not in {r[1] for r in conn.execute("PRAGMA table_info(branch_restaurant_menu_items)").fetchall()} else None
-        if is_postgres(conn): conn.execute("ALTER TABLE branch_restaurant_menu_items ADD COLUMN IF NOT EXISTS unit_price_cents BIGINT NOT NULL DEFAULT 0")
         conn.execute("""CREATE TABLE IF NOT EXISTS branch_restaurant_tabs(
             id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
             service_id TEXT NOT NULL REFERENCES restaurant_services(id),label TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('open','closed','cancelled')),
@@ -486,7 +491,7 @@ def apply_schema_migrations(conn) -> None:
             for table in ("branch_restaurant_events","branch_restaurant_tab_payments"):
                 conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_immutable_no_update BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT,'append-only record'); END")
                 conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_immutable_no_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'append-only record'); END")
-    migration(14,"branch_restaurant_orders_cash_ledger",create_branch_restaurant_order_ledger)
+    migration(15,"branch_restaurant_orders_cash_ledger",create_branch_restaurant_order_ledger)
 
 
 def init_db() -> None:
