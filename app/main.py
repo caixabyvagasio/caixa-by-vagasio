@@ -3415,8 +3415,9 @@ def cash_movement(register_id: str, data: CashMovementIn, conn: DB, user: USER):
     require_permission(conn,user,"cash.manage")
     movement_id, created = new_id(), now_iso()
     amount = decimal_money_cents(data.amount) * (1 if data.kind == "supply" else -1)
-    with transaction(conn):
-        reg = conn.execute("SELECT * FROM cash_registers WHERE id=? AND company_id=? AND status='open'", (register_id, user["company_id"])).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        reg = conn.execute("SELECT * FROM cash_registers WHERE id=? AND company_id=? AND status='open'"+lock_clause, (register_id, user["company_id"])).fetchone()
         if not reg:
             raise HTTPException(404, "Caixa aberto não encontrado nesta empresa.")
         movements = conn.execute("SELECT amount_cents FROM cash_movements WHERE register_id=?", (register_id,)).fetchall()
@@ -3434,8 +3435,9 @@ def cash_movement(register_id: str, data: CashMovementIn, conn: DB, user: USER):
 def close_register(register_id: str, data: RegisterCloseIn, conn: DB, user: USER):
     require_role(user, "owner", "admin", "manager")
     require_permission(conn,user,"cash.manage")
-    with transaction(conn):
-        reg = conn.execute("SELECT * FROM cash_registers WHERE id=? AND company_id=? AND status='open'", (register_id, user["company_id"])).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        reg = conn.execute("SELECT * FROM cash_registers WHERE id=? AND company_id=? AND status='open'"+lock_clause, (register_id, user["company_id"])).fetchone()
         if not reg:
             raise HTTPException(404, "Caixa aberto não encontrado nesta empresa.")
         movements = conn.execute("SELECT amount_cents FROM cash_movements WHERE register_id=?", (register_id,)).fetchall()
@@ -3465,7 +3467,7 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
                   "payment_method": data.payment_method, "received_amount": str(data.received_amount), "customer_id":data.customer_id}
     request_hash = hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     sale_id, created = new_id(), now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
         prior = conn.execute("SELECT * FROM sales WHERE company_id=? AND idempotency_key=?", (user["company_id"], idempotency_key)).fetchone()
         if prior:
             if prior["request_hash"] != request_hash:
@@ -3476,11 +3478,14 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
         if data.customer_id:
             customer=conn.execute("SELECT id FROM customers WHERE id=? AND company_id=? AND active=1",(data.customer_id,user["company_id"])).fetchone()
             if not customer: raise HTTPException(404,"Cliente não encontrado nesta empresa.")
-        register = conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1", (user["company_id"],)).fetchone()
+        register = conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1"+(" FOR UPDATE" if is_postgres(conn) else ""), (user["company_id"],)).fetchone()
         if not register:
             raise HTTPException(409, "Abra um caixa antes de finalizar uma venda.")
         aggregates: dict[str, dict] = {}
         subtotal = 0
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        for product_id in sorted({line.product_id for line in data.items}):
+            conn.execute("SELECT id FROM products WHERE id=? AND company_id=?"+lock_clause,(product_id,user["company_id"])).fetchone()
         for line in data.items:
             product = company_product(conn, user["company_id"], line.product_id)
             quantity = decimal_milli(line.quantity)
@@ -3537,18 +3542,19 @@ def void_sale(sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager")
     require_permission(conn,user,"sales.void")
     created=now_iso()
-    with transaction(conn):
-        sale=conn.execute("SELECT * FROM sales WHERE id=? AND company_id=?",(sale_id,user["company_id"])).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        sale=conn.execute("SELECT * FROM sales WHERE id=? AND company_id=?"+(" FOR UPDATE" if is_postgres(conn) else ""),(sale_id,user["company_id"])).fetchone()
         if not sale: raise HTTPException(404,"Venda não encontrada nesta empresa.")
         if sale["status"]!="paid": raise HTTPException(409,"Somente venda paga pode ser cancelada.")
-        register=conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1",(user["company_id"],)).fetchone()
+        register=conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1"+(" FOR UPDATE" if is_postgres(conn) else ""),(user["company_id"],)).fetchone()
         if not register: raise HTTPException(409,"Abra um caixa para registrar o estorno em dinheiro.")
         current_movements=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM cash_movements WHERE register_id=?",(register["id"],)).fetchone()[0]
         expected_cash=register["opening_cents"]+current_movements
         if expected_cash<sale["total_cents"]: raise HTTPException(409,"O caixa aberto não tem saldo esperado suficiente para registrar a devolução em dinheiro.")
         items=conn.execute("SELECT * FROM sale_items WHERE sale_id=?",(sale_id,)).fetchall()
-        for item in items:
-            product=conn.execute("SELECT stock_milli FROM products WHERE id=? AND company_id=?",(item["product_id"],user["company_id"])).fetchone()
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        for item in sorted(items,key=lambda x:x["product_id"]):
+            product=conn.execute("SELECT stock_milli FROM products WHERE id=? AND company_id=?"+lock_clause,(item["product_id"],user["company_id"])).fetchone()
             if not product: raise HTTPException(409,"Produto da venda não existe mais; estorno de estoque interrompido.")
             before=product["stock_milli"];after=before+item["quantity_milli"]
             conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,item["product_id"],user["company_id"]))
