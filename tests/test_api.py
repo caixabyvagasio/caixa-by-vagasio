@@ -1646,6 +1646,32 @@ def test_concurrent_legacy_stock_adjustments_preserve_every_update(world):
 
 
 
+
+def test_concurrent_legacy_expense_idempotency_returns_existing_result(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,name="Expense idempotency race",slug="expense-idempotency-race",email="expense-idempotency-race@example.test");headers=auth(owner)
+    payload={'description':'Idempotent QA expense','amount':'18.50','due_date':'2026-12-20','cost_center':'QA'}
+    def create(_):return world.post('/v1/finance/expenses',headers={**headers,'Idempotency-Key':'same-expense-idempotency'},json=payload)
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(create,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==200 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    rows=world.get('/v1/finance/payables?status=all',headers=headers).json()['items']
+    assert len([r for r in rows if r['description']==payload['description']])==1
+
+
+def test_concurrent_branch_expense_idempotency_returns_existing_result(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,name="Branch expense idempotency race",slug="branch-expense-idempotency-race",email="branch-expense-idempotency-race@example.test");headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    payload={'description':'Branch idempotent QA expense','amount':'18.50','due_date':'2026-12-20','cost_center':'QA'}
+    def create(_):return world.post(f'/v1/branches/{branch}/finance/expenses',headers={**headers,'Idempotency-Key':'same-branch-expense-idempotency'},json=payload)
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(create,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==200 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    rows=world.get(f'/v1/branches/{branch}/payables?status=all',headers=headers).json()['items']
+    assert len([r for r in rows if r['description']==payload['description']])==1
+
+
 def test_concurrent_legacy_register_open_returns_conflict_instead_of_server_error(world):
     from concurrent.futures import ThreadPoolExecutor
     owner=company(world,name="Register open race",slug="register-open-race",email="register-open-race@example.test");headers=auth(owner)
