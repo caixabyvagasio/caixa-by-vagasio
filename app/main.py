@@ -1378,10 +1378,11 @@ def permission_for_endpoint(method: str, path: str):
     if path=="/v1/branches/stock-transfers": return "stock.adjust"
     if path.startswith("/v1/branches/") and "/restaurant/" in path:
         if "/restaurant/menu" in path: return "restaurant.menu" if method not in {"GET","HEAD"} else "products.read"
-        if "/restaurant/payments" in path: return "restaurant.cash"
+        if "/restaurant/payments" in path or path.endswith("/payments"): return "restaurant.cash"
         if "/restaurant/production" in path or "/restaurant/order-items/" in path: return "restaurant.production"
         if "/restaurant/reports/" in path: return "reports.read"
-        if "/restaurant/tabs" in path or "/restaurant/orders" in path or "/restaurant/services/" in path: return "restaurant.orders" if not path.endswith("/payments") else "restaurant.cash"
+        if path.endswith("/close-empty"): return "restaurant.floor"
+        if "/restaurant/tabs" in path or "/restaurant/orders" in path or "/restaurant/services/" in path: return "restaurant.orders"
         return "restaurant.floor"
         if "/restaurant/payments" in path: return "restaurant.cash"
         if "/restaurant/production" in path or "/restaurant/order-items/" in path: return "restaurant.production"
@@ -1393,7 +1394,10 @@ def permission_for_endpoint(method: str, path: str):
     if path.startswith("/v1/branches/") and "/payables" in path: return "finance.write" if method not in {"GET","HEAD"} else "finance.read"
     if path.startswith("/v1/branches/") and "/finance" in path: return "finance.write" if method not in {"GET","HEAD"} else "finance.read"
     if path.startswith("/v1/branches/") and ("/dashboard/" in path or "/reports/" in path): return "reports.read"
+    if path.startswith("/v1/branches/") and "/sales/report" in path: return "reports.read"
     if path.startswith("/v1/branches/") and "/sales" in path: return "sales.void" if path.endswith("/void") else "sales.read" if method=="GET" else "sales.create"
+    if path.startswith("/v1/branches/") and "/products" in path:
+        return "stock.adjust" if method not in {"GET","HEAD"} else "products.read"
     if path.startswith("/v1/branches/"):
         return "stock.adjust" if method!="GET" else "inventory.read"
     if path=="/v1/company/commercial": return "finance.read"
@@ -1407,11 +1411,14 @@ def permission_for_endpoint(method: str, path: str):
         if path.endswith("/payments"): return "restaurant.cash"
         if path.endswith("/delivered"): return "restaurant.production"
         return "restaurant.orders"
+    if path=="/v1/restaurant/waiters": return "users.manage"
     if path.startswith("/v1/restaurant/"):
         if "/menu" in path: return "restaurant.menu" if method!="GET" else "products.read"
         if "/payments" in path: return "restaurant.cash"
         if "/production" in path or "/order-items/" in path: return "restaurant.production"
         if "/reports/" in path: return "reports.read"
+        if "/reports/" in path: return "reports.read"
+        if path.endswith("/close-empty"): return "restaurant.floor"
         if "/tabs" in path or "/orders" in path or "/services/" in path: return "restaurant.orders"
         return "restaurant.floor"
     if path.startswith("/v1/products"):
@@ -2725,7 +2732,7 @@ def restaurant_tab_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: 
 
 @app.get("/v1/restaurant/reports/operations")
 def restaurant_operations_report(conn: DB,user: USER):
-    require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
+    require_restaurant_floor(conn,user);require_permission(conn,user,"reports.read")
     open_tabs=conn.execute("SELECT count(*) FROM restaurant_tabs WHERE company_id=? AND status='open'",(user["company_id"],)).fetchone()[0]
     open_tables=conn.execute("SELECT count(*) FROM restaurant_tables WHERE company_id=? AND active=1 AND status='occupied'",(user["company_id"],)).fetchone()[0]
     order_counts={r["status"]:r["n"] for r in conn.execute("SELECT status,count(*) AS n FROM restaurant_orders WHERE company_id=? GROUP BY status",(user["company_id"],)).fetchall()}
