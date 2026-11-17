@@ -467,6 +467,21 @@ def test_restaurant_electronic_payments_are_not_supported(world):
     assert response.status_code==422
 
 
+def test_simultaneous_open_table_requests_only_create_one_service(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Única'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'Única','capacity':2}).json()
+    def open_once(): return world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers)
+    with ThreadPoolExecutor(max_workers=4) as pool: responses=list(pool.map(lambda _:open_once(),range(4)))
+    assert sum(r.status_code==200 for r in responses)==1
+    assert all(r.status_code in (200,409) for r in responses)
+    conn=main.connect_db()
+    try: assert conn.execute("SELECT count(*) FROM restaurant_services WHERE company_id=? AND table_id=? AND status='open'",(world.get('/v1/me',headers=headers).json()['company_id'],table['id'])).fetchone()[0]==1
+    finally: conn.close()
+
+
 def test_restaurant_open_table_rejects_conflicting_occupation(world):
     owner=company(world);headers=auth(owner)
     world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})

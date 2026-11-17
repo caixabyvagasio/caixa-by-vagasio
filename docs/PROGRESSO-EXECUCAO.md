@@ -64,3 +64,8 @@
 - Infraestrutura não encerrada: filiais continuam metadata-only e não filtram operacionalmente vendas/caixa/estoque; permissões granulares ainda não cobrem todos os endpoints/leituras. Não está implementado RBAC management UX nem distribuição por praça/garçom. Schema de planos não tem ciclo pago nem gateway; assinatura pending não concede entitlement.
 - Segmentos grocery, apparel, construction, services e retail geral continuam sem módulos especializados. Restaurante ainda não completo: adicionais, combos, ficha técnica/insumos, delivery de ponta a ponta, reservas listáveis, impressão, e testes de UI ponta a ponta estão abertos. Não marcar qualquer vertical completa nem dizer pronta para homologação.
 - Restrição mantida: desenvolvimento apenas; produção não tocada. Nenhum dado de `vagasio-2026` foi alterado. A integração pagamentos/fiscal continua `false`. Próximo trabalho partir do SHA acima; não refazer o fluxo API já coberto e retomar pelas lacunas listadas.
+
+### Pequeno fechamento da lacuna de reservas/concorrência (estado local após f68dc1c)
+- Adicionado GET `/v1/restaurant/reservations` com filtro e escopo tenant; UI lista reservas confirmadas em salão.
+- Teste concorrente de 4 tentativas de abertura de uma mesa espera uma única resposta 200, demais 409 e uma linha de serviço aberta. Suíte local resultante: 66 passed, 1 skipped. PostgreSQL test deverá ser refeito no CI após commit.
+- Esse ajuste ainda está apenas no worktree desta continuação: pendente commit/CI/deploy. Interface ainda usa prompts para parte dos pedidos e pagamentos. Esta reserva/API melhora a tela, mas não implementa cancelamento/assentamento.

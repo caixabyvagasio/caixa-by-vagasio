@@ -1539,6 +1539,12 @@ def restaurant_open_table(table_id: str,conn: DB,user: USER):
     except sqlite3.IntegrityError: raise HTTPException(409,"Já existe atendimento para essa mesa.")
     return {"id":sid,"table_id":table_id,"status":"open","opened_at":now}
 
+@app.get("/v1/restaurant/reservations")
+def restaurant_list_reservations(conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","all"]="confirmed"):
+    require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor")
+    rows=conn.execute("SELECT r.id,r.table_id,t.label AS table_label,a.name AS area,r.customer_name,r.party_size,r.starts_at,r.ends_at,r.status FROM restaurant_reservations r JOIN restaurant_tables t ON t.id=r.table_id AND t.company_id=r.company_id JOIN restaurant_areas a ON a.id=t.area_id AND a.company_id=t.company_id WHERE r.company_id=? AND (?='all' OR r.status=?) ORDER BY r.starts_at LIMIT 200",(user["company_id"],status_filter,status_filter)).fetchall()
+    return {"items":[dict(r) for r in rows]}
+
 @app.post("/v1/restaurant/reservations",status_code=201)
 def restaurant_reserve(data: RestaurantReservationIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user)
