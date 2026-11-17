@@ -1724,3 +1724,44 @@ def test_concurrent_voids_of_same_branch_sale_refund_once(world):
         assert conn.execute('SELECT COUNT(*) FROM branch_sales_returns WHERE sale_id=?',(sale.json()['id'],)).fetchone()[0]==1
         assert conn.execute("SELECT COUNT(*) FROM branch_stock_events WHERE product_id=? AND kind='reversal'",(p['id'],)).fetchone()[0]==1
     finally: conn.close()
+
+
+def test_branch_cash_movements_consider_sales_and_serialize_withdrawals(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    product_row=product(world,owner,sku='CASH-LOCK',name='Produto caixa',price='30.00')
+    register=world.post(f'/v1/branches/{branch}/registers/open',headers=headers,json={'label':'Caixa concorrência','opening_amount':'50.00'})
+    assert register.status_code==201,register.text
+    assert world.post(f'/v1/branches/{branch}/inventory/{product_row["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'1','reason':'Carga QA'}).status_code==201
+    sale=world.post(f'/v1/branches/{branch}/sales',headers={**headers,'Idempotency-Key':'cash-lock-sale'},json={'items':[{'product_id':product_row['id'],'quantity':'1'}],'payment_method':'cash','received_amount':'30.00'})
+    assert sale.status_code==201,sale.text
+    def withdraw(i):
+        return world.post(f'/v1/branches/{branch}/registers/{register.json()["id"]}/movements',headers=headers,json={'kind':'withdrawal','amount':'60.00','reason':f'Sangria paralela QA {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(withdraw,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    current=world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()
+    assert current['expected_amount']=='20.00'
+    assert world.post(f'/v1/branches/{branch}/registers/{register.json()["id"]}/movements',headers=headers,json={'kind':'withdrawal','amount':'21.00','reason':'Não pode exceder saldo'}).status_code==409
+
+
+def test_branch_register_close_and_cash_movement_are_serialized(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    register=world.post(f'/v1/branches/{branch}/registers/open',headers=headers,json={'label':'Fechamento concorrente','opening_amount':'100.00'}).json()
+    def move():return world.post(f'/v1/branches/{branch}/registers/{register["id"]}/movements',headers=headers,json={'kind':'supply','amount':'25.00','reason':'Suprimento QA'})
+    def close():return world.post(f'/v1/branches/{branch}/registers/{register["id"]}/close',headers=headers,json={'counted_amount':'125.00'})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a=pool.submit(move);b=pool.submit(close);results=[a.result(),b.result()]
+    closed=next((r for r in results if r.status_code==200),None)
+    assert closed is not None,[(r.status_code,r.text) for r in results]
+    assert closed.json()['expected_amount'] in {'100.00','125.00'}
+    movement=next(r for r in results if r is not closed)
+    if closed.json()['expected_amount']=='100.00':
+        assert movement.status_code==404
+    else:
+        assert movement.status_code==201
+    current=world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()
+    assert current['register'] is None
