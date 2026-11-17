@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 14:22 | `aa6add7c72bde83bab775c8e89c3584a9863d91a` | Branch/legacy reservation overlap locks and service close-empty vs tab-open lock; local 110 passed/1 skipped. | CI general/PostgreSQL, then dev deploy. |
+
+## Work log / checkpoints
+
 | 2026-11-17 14:01 | `a9aeec33a0f5cf79bb72afce2204d48918da1a97` | Branch cash lock fix deployed/live, CI green. Restaurant locks for order/production/settlement + concurrent final-payment test local. | Extend table opening lock and CI. |
 | 2026-11-17 14:01 | `a9aeec33a0f5cf79bb72afce2204d48918da1a97` | Restaurant table/service opening now row-lock; waiter test assertion corrected to existing API response contract. Full local 107/1, CI pending. | Run CI general/PostgreSQL; publish dev after both green. |
 
