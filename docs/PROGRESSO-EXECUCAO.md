@@ -255,3 +255,10 @@
 - Restaurante (mesa/ordem/produção/liquidação) validado: full local **107 passed, 1 skipped**; CI general run `44134685207` success e PostgreSQL `44134685170` success no commit/checkpoint `9eb33a0afd3b22cf52054c276c4850e12746002d`; deploy Render dev `dep-dbu8nj61egvs73fr3chg` live nesse commit. `/health`: PostgreSQL, payments/fiscal false. Nenhuma escrita de QA no banco persistente; E2E TestClient local sintético.
 - Novo teste de mesa: oito aberturas concorrentes resultam em uma sessão ativa apenas, HTTP 200 único e conflitos para demais. Novo teste final payment: um settlement (um pagamento/sale/stock/cash effect), repetição com idempotency key continua 200 mesmo depois da tab fechada, demais pedidos simultâneos não cobram. Estado UI autenticada não validado.
 - Checkpoint: backend dev avançou em integridade para branch stock adjust/sale/transfer/receipt/void, branch cash, branch restaurant table open, orders/production/settlement. NÃO significa cobertura concorrente total nem produto completo. Próximo: branch reservation overlap concurrency, table/service close/transfer, legacy single-branch paths, audit failures/retries; então continuar verticais e UI.
+
+
+## Continuação — reservas e ciclo de atendimento (2026-11-17 14:22 BRT)
+- HEAD validado antes da mudança: `aa6add7c72bde83bab775c8e89c3584a9863d91a`; CI geral `44135441105` e PostgreSQL `44135441111` success.
+- Reserva por filial e legado: lock pessimista na linha da mesa antes de verificar intervalos ativos e inserir, em READ COMMITTED; evita duas reservas sobrepostas aceitas simultaneamente.
+- Abertura de comanda agora bloqueia linha do serviço, serializando com `close-empty`; previne comanda pendurada em serviço fechado.
+- Concorrência sintética: branch+legacy 8 chamadas cada (1 aceitação, 7 HTTP 409); ciclo close-empty/open-tab verifica invariantes estado/tabs. Focados 7 pass; full suite **110 passed, 1 skipped**. Aguardando CI e deploy dev.
