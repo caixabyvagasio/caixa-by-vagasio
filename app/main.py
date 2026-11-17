@@ -2012,8 +2012,9 @@ def transfer_branch_stock(data: BranchStockTransferIn,conn: DB,user: USER,idempo
 def void_branch_sale(branch_id: str,sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager");require_permission(conn,user,"sales.void");require_branch_membership(conn,user,branch_id)
     now=now_iso();rid=new_id()
-    with transaction(conn):
-        sale=conn.execute("SELECT * FROM branch_sales WHERE id=? AND company_id=? AND branch_id=?",(sale_id,user["company_id"],branch_id)).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        sale=conn.execute("SELECT * FROM branch_sales WHERE id=? AND company_id=? AND branch_id=?"+lock_clause,(sale_id,user["company_id"],branch_id)).fetchone()
         if not sale:raise HTTPException(404,"Venda não encontrada nesta filial.")
         if sale["status"]!="paid":raise HTTPException(409,"Venda já cancelada ou não paga.")
         events=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,sale["register_id"])).fetchall()
@@ -2022,11 +2023,13 @@ def void_branch_sale(branch_id: str,sale_id: str,data: SaleVoidIn,conn: DB,user:
         if not register:raise HTTPException(409,"É necessário caixa aberto nesta filial para registrar devolução em dinheiro.")
         expected=register["opening_cents"]+sum(x[0] for x in events)+sum(x[0] for x in movements)
         if expected<sale["total_cents"]:raise HTTPException(409,"Saldo insuficiente no caixa desta filial.")
-        lines=conn.execute("SELECT * FROM branch_sale_items WHERE sale_id=? AND company_id=? AND branch_id=?",(sale_id,user["company_id"],branch_id)).fetchall()
+        lines=conn.execute("SELECT * FROM branch_sale_items WHERE sale_id=? AND company_id=? AND branch_id=? ORDER BY product_id",(sale_id,user["company_id"],branch_id)).fetchall()
         for line in lines:
-            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,line["product_id"])).fetchone()
-            before=int(row[0]) if row else 0;after=before+line["quantity_milli"]
-            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO UPDATE SET quantity_milli=excluded.quantity_milli,updated_at=excluded.updated_at",(user["company_id"],branch_id,line["product_id"],after,now))
+            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO NOTHING",(user["company_id"],branch_id,line["product_id"],0,now))
+            stock_lock=" FOR UPDATE" if is_postgres(conn) else ""
+            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?"+stock_lock,(user["company_id"],branch_id,line["product_id"])).fetchone()
+            before=int(row[0]);after=before+line["quantity_milli"]
+            conn.execute("UPDATE branch_product_stock SET quantity_milli=?,updated_at=? WHERE company_id=? AND branch_id=? AND product_id=?",(after,now,user["company_id"],branch_id,line["product_id"]))
             conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'reversal',?,?,?,?,NULL,?)",(new_id(),user["company_id"],branch_id,line["product_id"],user["id"],line["quantity_milli"],before,after,"Cancelamento "+sale_id+": "+data.reason,now))
         conn.execute("UPDATE branch_sales SET status='voided' WHERE id=? AND company_id=? AND branch_id=?",(sale_id,user["company_id"],branch_id))
         conn.execute("INSERT INTO branch_cash_movements(id,company_id,branch_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,'withdrawal',?,?,?,?)",(rid,user["company_id"],branch_id,register["id"],user["id"],-sale["total_cents"],"Estorno "+sale_id+": "+data.reason,sale_id,now))
