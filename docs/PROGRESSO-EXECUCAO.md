@@ -222,3 +222,10 @@
 - Recebimento multi-filial podia ler o pedido/itens e saldo sem serialização, potencialmente duplicar quantidade recebida, ultrapassar encomenda ou perder incremento de estoque. Alteração local: transação READ COMMITTED, `SELECT ... FOR UPDATE` no pedido para serializar recibos; linhas recebidas em ordem determinística; upsert idempotente de saldo em zero e lock de saldo branch antes de atualizar; ledger/receipt/payable/order status/auditoria no mesmo commit atômico. Idempotency-Key continua impedindo replay do mesmo recebimento.
 - Novo teste oito recibos concorrentes de 1 unidade contra pedido de 4 deve produzir 4 sucessos/4 conflitos, sem exceder order item, saldo, ledger nem status. Focados novos + purchase flow existente 2/2; suíte local completa **102 passed, 1 skipped**. A primeira tentativa de suíte expirou e foi refeita com sucesso. Esse lote ainda não foi commitado/CI/deploy; precisa PostgreSQL CI especialmente.
 - Não validar em banco persistente/tenant real; QA é TestClient com SQLite local até os workflows de Postgres isolados.
+
+
+## Continuação — serialização de recebimentos e estornos (2026-11-17 13:30 BRT)
+- Atualização no branch: CI geral e PostgreSQL passaram para o lote dos recebimentos (`44126995893`/`44126995861`); deploy dev `dep-dbu84959fdbs73dvhbvg` live no commit `55378c69368872a01d77ebef13708070cd7a0d23`, health PostgreSQL, pagamentos/fiscal false.
+- Recebimentos: lock de ordem, linhas em ordem determinística e locks dos saldos, toda contabilização em transação; teste 8 contra pedido 4 com 4 sucessos e 4 conflitos, valores e ledger reconciliados.
+- Estornos: teste concorrente do mesmo sale detectou necessidade de lock de sale; agora READ COMMITTED + lock na venda + locks dos produtos ordenados. Somente uma das oito requisições pode estornar; uma reversão de estoque e uma saída de caixa. Estoque/saldo/retorno/auditoria seguem atômicos.
+- Testes focados para estorno concorrente e estorno normal: 2 passed; full local após conjunto novo: **103 passed, 1 skipped**. A parte de estorno ainda não foi commitada/CI. Próximo executar CI geral/Postgres para ambos os patches e somente então deploy dev.
