@@ -1108,7 +1108,7 @@ def test_multi_branch_operations_fail_closed_and_never_attribute_legacy_data(wor
     branch=world.post('/v1/company/branches',headers=headers,json={'code':'second','name':'Segunda unidade'})
     assert branch.status_code==201
     denied=world.get('/v1/products',headers=headers)
-    assert denied.status_code==409 and 'permanecem sem atribuição' in denied.json()['detail']
+    assert denied.status_code==409 and 'escopo operacional de filial' in denied.json()['detail']
     invalid=world.get('/v1/products',headers={**headers,'X-Branch-Id':'foreign-branch-id'})
     assert invalid.status_code==403
     foreign=company(world,'Outra empresa','another','another@example.test')
@@ -1526,3 +1526,22 @@ def test_waiter_portal_stays_blocked_for_multi_branch_company(world):
     assert world.post('/v1/company/branches',headers=headers,json={'name':'Filial 2','code':'branch-2'}).status_code==201
     response=world.post('/v1/restaurant/waiters',headers=headers,json={'full_name':'Garçom multi','email':'waiter-multi@example.test','password':'strong-waiter-password-789'})
     assert response.status_code==409 and 'multi-filial' in response.text
+
+
+
+def test_multi_branch_blocks_every_legacy_operational_read_even_with_branch_header(world):
+    owner=company(world);headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    assert world.post('/v1/company/branches',headers=headers,json={'code':'other','name':'Outra filial'}).status_code==201
+    scoped={**headers,'X-Branch-Id':branch}
+    probes=[
+        ('GET','/v1/products'),('GET','/v1/stock-movements'),('GET','/v1/sales'),
+        ('GET','/v1/purchase-orders'),('GET','/v1/finance/summary'),('GET','/v1/finance/cashflow?start_date=2026-11-01&end_date=2026-11-30'),
+        ('GET','/v1/dashboard/summary'),('GET','/v1/reports/sales?start_date=2026-11-01&end_date=2026-11-30'),
+        ('GET','/v1/restaurant/floor'),('GET','/v1/restaurant/tabs'),('GET','/v1/restaurant/reports/operations'),
+    ]
+    for method,path in probes:
+        response=world.request(method,path,headers=scoped)
+        assert response.status_code==409,(method,path,response.status_code,response.text)
+    # The dedicated branch-scoped stock view remains available to a member.
+    assert world.get(f'/v1/branches/{branch}/inventory',headers=headers).status_code==200
