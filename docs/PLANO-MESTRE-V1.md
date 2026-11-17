@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 14:49 | `a42548a9fd56771e79396752312f7d400a1a746d` | Legacy sales/cash/void and payable-row concurrency fixes local; 114 passed/1 skipped. Prior state on this commit is deployed/live. | CI general/Postgres; dev deploy on green. |
+
+## Work log / checkpoints
+
 | 2026-11-17 14:31 | `f2c649321749350cb57b598896b3edee7956007c` | Legacy restaurant table/tab/order/production/payment locks deployed/live, CI green. Legacy retail sale/cash movement/close/void concurrency locks local; 113/1 tests. | CI general/PostgreSQL; deploy after green. |
 
 ## Work log / checkpoints
