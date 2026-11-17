@@ -1545,3 +1545,68 @@ def test_multi_branch_blocks_every_legacy_operational_read_even_with_branch_head
         assert response.status_code==409,(method,path,response.status_code,response.text)
     # The dedicated branch-scoped stock view remains available to a member.
     assert world.get(f'/v1/branches/{branch}/inventory',headers=headers).status_code==200
+
+
+def test_permission_router_maps_semantic_permissions_for_branch_and_restaurant_routes():
+    cases={
+        ('GET','/v1/branches/b1/sales/report'):'reports.read',
+        ('GET','/v1/branches/b1/products'):'products.read',
+        ('GET','/v1/branches/b1/inventory'):'inventory.read',
+        ('POST','/v1/branches/b1/restaurant/tabs/t1/payments'):'restaurant.cash',
+        ('POST','/v1/branches/b1/restaurant/services/s1/close-empty'):'restaurant.floor',
+        ('POST','/v1/restaurant/waiters'):'users.manage',
+        ('GET','/v1/restaurant/reports/operations'):'reports.read',
+    }
+    for (method,path),expected in cases.items():
+        assert main.permission_for_endpoint(method,path)==expected,(method,path,main.permission_for_endpoint(method,path))
+
+
+def test_custom_permissions_use_same_branch_route_policy_as_handler(world):
+    owner=company(world);headers=auth(owner)
+    first=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    second=world.post('/v1/company/branches',headers=headers,json={'code':'branch-permissions','name':'Filial permissões'}).json()['id']
+    created=world.post('/v1/users',headers=headers,json={'full_name':'Operadora QA','email':'permission-test@example.test','password':'strong-permission-password-123','role':'operator'})
+    assert created.status_code==201,created.text
+    uid=created.json()['id']
+    assert world.put(f'/v1/company/branches/{first}/users',headers=headers,json={'user_ids':[uid]}).status_code==200
+    assert world.put(f'/v1/company/branches/{second}/users',headers=headers,json={'user_ids':[uid]}).status_code==200
+    login=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'permission-test@example.test','password':'strong-permission-password-123'})
+    assert login.status_code==200
+    operator=auth(login.json()['access_token'])
+    assert world.put('/v1/company/permissions/role',headers=headers,json={'role':'operator','permission':'products.read','allowed':False}).status_code==200
+    assert world.put('/v1/company/permissions/role',headers=headers,json={'role':'operator','permission':'inventory.read','allowed':True}).status_code==200
+    assert world.get(f'/v1/branches/{first}/products',headers=operator).status_code==403
+    assert world.get(f'/v1/branches/{first}/inventory',headers=operator).status_code==200
+    assert world.put('/v1/company/permissions/role',headers=headers,json={'role':'operator','permission':'products.read','allowed':True}).status_code==200
+    assert world.get(f'/v1/branches/{first}/products',headers=operator).status_code==200
+    assert world.put('/v1/company/permissions/role',headers=headers,json={'role':'operator','permission':'reports.read','allowed':False}).status_code==200
+    assert world.put('/v1/company/permissions/role',headers=headers,json={'role':'operator','permission':'sales.read','allowed':True}).status_code==200
+    report=world.get(f'/v1/branches/{first}/sales/report?start_date=2026-11-01&end_date=2026-11-30',headers=operator)
+    assert report.status_code==403
+    assert world.put('/v1/company/permissions/role',headers=headers,json={'role':'operator','permission':'reports.read','allowed':True}).status_code==200
+    assert world.get(f'/v1/branches/{first}/sales/report?start_date=2026-11-01&end_date=2026-11-30',headers=operator).status_code==200
+
+
+def test_middleware_permission_matches_local_handler_permission_checks():
+    import ast
+    import inspect
+    mismatches=[]
+    for route in main.app.routes:
+        path=getattr(route,'path','')
+        if not path.startswith('/v1/') or path.startswith('/v1/master/'):
+            continue
+        endpoint=getattr(route,'endpoint',None)
+        if endpoint is None:
+            continue
+        try: tree=ast.parse(inspect.getsource(endpoint))
+        except (OSError,TypeError,IndentationError,SyntaxError): continue
+        local={node.args[2].value for node in ast.walk(tree)
+               if isinstance(node,ast.Call) and isinstance(node.func,ast.Name)
+               and node.func.id=='require_permission' and len(node.args)>2
+               and isinstance(node.args[2],ast.Constant) and isinstance(node.args[2].value,str)}
+        if not local: continue
+        for method in getattr(route,'methods',set())-{'HEAD','OPTIONS'}:
+            expected=main.permission_for_endpoint(method,path)
+            if expected is not None and expected not in local:
+                mismatches.append((method,path,expected,sorted(local)))
+    assert mismatches==[]
