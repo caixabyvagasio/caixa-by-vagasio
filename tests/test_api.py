@@ -1906,3 +1906,34 @@ def test_concurrent_legacy_restaurant_final_payments_close_once_and_debit_stock_
         assert conn.execute('SELECT COUNT(*) FROM sales WHERE idempotency_key=?',('restaurant-tab:'+tab['id'],)).fetchone()[0]==1
         assert conn.execute('SELECT COUNT(*) FROM restaurant_tab_payments WHERE tab_id=?',(tab['id'],)).fetchone()[0]==1
     finally: conn.close()
+
+
+def test_concurrent_legacy_sales_do_not_oversell_inventory_or_cash(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,'Retail concurrency','retail-concurrency','retail-concurrency@example.test');headers=auth(owner)
+    prod=product(world,owner,sku='RETAIL-LOCK',name='Produto limitado',price='20.00')
+    assert world.post(f'/v1/products/{prod["id"]}/stock-adjustments',headers=headers,json={'direction':'in','quantity':'4','reason':'Carga QA concorrência'}).status_code==201
+    assert world.post('/v1/registers/open',headers=headers,json={'label':'Varejo concorrência','opening_amount':'0'}).status_code==201
+    def sell(i):
+        return world.post('/v1/sales',headers={**headers,'Idempotency-Key':f'retail-concurrent-sale-{i}'},json={'items':[{'product_id':prod['id'],'quantity':'1','discount':'0'}],'payment_method':'cash','received_amount':'20.00'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(sell,range(8)))
+    assert sum(r.status_code==201 for r in responses)==4,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==4,[(r.status_code,r.text) for r in responses]
+    assert world.get('/v1/products',headers=headers).json()['items'][0]['stock']=='0'
+    assert world.get('/v1/registers/current',headers=headers).json()['expected_amount']=='80.00'
+    assert len(world.get('/v1/sales',headers=headers).json()['items'])==4
+
+
+def test_concurrent_legacy_register_withdrawals_respect_balance_and_close_lock(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,'Cash concurrency','cash-concurrency','cash-concurrency@example.test');headers=auth(owner)
+    register=world.post('/v1/registers/open',headers=headers,json={'label':'Sangria concorrente','opening_amount':'100.00'});assert register.status_code==201,register.text
+    rid=register.json()['id']
+    def withdraw(i):return world.post(f'/v1/registers/{rid}/movements',headers=headers,json={'kind':'withdrawal','amount':'60.00','reason':f'Sangria QA concorrente {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(withdraw,range(8)))
+    assert sum(r.status_code==201 for r in responses)==1,[(r.status_code,r.text) for r in responses]
+    assert sum(r.status_code==409 for r in responses)==7,[(r.status_code,r.text) for r in responses]
+    assert world.get('/v1/registers/current',headers=headers).json()['expected_amount']=='40.00'
+    closed=world.post(f'/v1/registers/{rid}/close',headers=headers,json={'counted_amount':'40.00'})
+    assert closed.status_code==200,closed.text
+    assert world.post(f'/v1/registers/{rid}/movements',headers=headers,json={'kind':'supply','amount':'5.00','reason':'After close'}).status_code==404
