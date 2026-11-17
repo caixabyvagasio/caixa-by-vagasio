@@ -81,6 +81,7 @@ def test_frontend_is_served_from_same_app(world):
     assert "Entrar na sua empresa" in world.get("/").text
     assert "Acessar demonstração fictícia" in world.get("/").text
     assert world.get("/static/app.js").status_code == 200
+    assert 'id="loginForm" method="post" action="/"' in world.get("/").text
     assert world.get("/static/app.css").status_code == 200
 
 
