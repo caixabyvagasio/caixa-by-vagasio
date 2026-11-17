@@ -1630,6 +1630,21 @@ def test_branch_inventory_concurrent_increments_preserve_ledger_and_balance(worl
     assert {m['after'] for m in movements['items']}=={str(i) for i in range(1,9)}
 
 
+
+def test_concurrent_legacy_stock_adjustments_preserve_every_update(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world,name="Legacy stock concurrency",slug="legacy-stock-concurrency",email="legacy-stock-concurrency@example.test");headers=auth(owner)
+    p=product(world,owner,sku='LEGACY-ADJUST-CONCURRENCY')
+    def adjust(i):
+        return world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=headers,json={'direction':'in','quantity':'1','reason':f'Concurrent legacy QA {i}'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(adjust,range(8)))
+    assert all(r.status_code==201 for r in responses),[(r.status_code,r.text) for r in responses]
+    listed=next(row for row in world.get('/v1/products',headers=headers).json()['items'] if row['id']==p['id'])
+    assert listed['stock']=='8'
+    events=world.get(f"/v1/stock-movements?product_id={p['id']}",headers=headers).json()['items']
+    assert len(events)==8 and {e['after'] for e in events}=={'1','2','3','4','5','6','7','8'}
+
+
 def test_branch_concurrent_sales_lock_stock_and_record_all_cash_events(world):
     from concurrent.futures import ThreadPoolExecutor
     owner=company(world);headers=auth(owner)
