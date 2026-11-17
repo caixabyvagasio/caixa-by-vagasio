@@ -82,7 +82,8 @@
 
 ## Work log / checkpoints
 
-| 2026-11-17 12:49 | `c2389d1088c7dca5a6ec858f74db25274418768f` | Revisão AST comparou permission_for_endpoint e require_permission em todos os handlers (finding inicial 5 divergências); alinhei sales report, branch product reads, close-empty, waiter management, restaurant operations report e branch restaurant payment. CI anterior ao lote estava verde. | Suíte local, teste de consistência AST, CI general/Postgres e deploy dev. |
+| 2026-11-17 12:49 | `c2389d1088c7dca5a6ec858f74db25274418768f` | Revisão AST comparou permission_for_endpoint e require_permission em todos os handlers (finding inicial 5 divergências); alinhei sales report, branch product reads, close-empty, waiter management, restaurant operations report e branch restaurant payment. CI geral/Postgres posterior verde; Render dev live no commit da ordem. Full local 96/1. | Continuar teste PostgreSQL de concorrência de saldo. |
+| 2026-11-17 12:57 | `d1167d484a1462e2347f0c4d3b06526a7cdbadd9` | Deploy verificado live. Novo teste concorrente com 8 ajustes no mesmo saldo passou SQLite; full local 98 passed/1 skipped. CI PostgreSQL run `44121112420` falhou com SerializationFailure em concorrência. Correção por saldo row-lock/READ COMMITTED preparada local, ainda aguardando PostgreSQL CI. | Reexecutar CI Postgres e corrigir até passar antes de publicar. |
 
 ## Work log / checkpoints
 
