@@ -1982,18 +1982,23 @@ def transfer_branch_stock(data: BranchStockTransferIn,conn: DB,user: USER,idempo
     qty=decimal_milli(data.quantity);transfer_id,now=new_id(),now_iso()
     body={"from_branch_id":data.from_branch_id,"to_branch_id":data.to_branch_id,"product_id":data.product_id,"quantity_milli":qty,"reason":data.reason}
     request_hash=hashlib.sha256(json.dumps(body,sort_keys=True,separators=(",",":")).encode()).hexdigest()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
         prior=conn.execute("SELECT * FROM branch_stock_transfers WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
         if prior:
             if prior["request_hash"]!=request_hash: raise HTTPException(409,"Idempotency-Key já foi usada com dados diferentes.")
             if response is not None: response.status_code=200
             return {"transfer_id":prior["id"],"product_id":prior["product_id"],"quantity":milli_to_decimal(prior["quantity_milli"]),"from_branch_id":prior["from_branch_id"],"to_branch_id":prior["to_branch_id"],"status":"completed","idempotent":True}
         if not conn.execute("SELECT 1 FROM products WHERE id=? AND company_id=? AND active=1",(data.product_id,user["company_id"])).fetchone(): raise HTTPException(404,"Produto não encontrado nesta empresa.")
-        src=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],data.from_branch_id,data.product_id)).fetchone()
-        source_before=int(src[0]) if src else 0
+        for bid in sorted((data.from_branch_id,data.to_branch_id)):
+            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO NOTHING",(user["company_id"],bid,data.product_id,0,now))
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        locked={}
+        for bid in sorted((data.from_branch_id,data.to_branch_id)):
+            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?"+lock_clause,(user["company_id"],bid,data.product_id)).fetchone()
+            locked[bid]=int(row[0])
+        source_before=locked[data.from_branch_id]
         if source_before<qty: raise HTTPException(409,"Saldo insuficiente na filial de origem.")
-        dst=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],data.to_branch_id,data.product_id)).fetchone()
-        dest_before=int(dst[0]) if dst else 0
+        dest_before=locked[data.to_branch_id]
         source_after=source_before-qty;dest_after=dest_before+qty
         for bid,bal in ((data.from_branch_id,source_after),(data.to_branch_id,dest_after)):
             conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO UPDATE SET quantity_milli=excluded.quantity_milli,updated_at=excluded.updated_at",(user["company_id"],bid,data.product_id,bal,now))
