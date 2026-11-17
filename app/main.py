@@ -351,6 +351,24 @@ def apply_schema_migrations(conn) -> None:
         # multi-branch operational data; no destructive update/backfill is done.
         conn.execute("INSERT INTO deployment_metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("branch_partitioning","schema_added_legacy_unassigned"))
     migration(7,"nullable_branch_scope_no_legacy_backfill",add_nullable_branch_scope)
+    def create_branch_stock_ledger():
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_product_stock(
+            company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
+            product_id TEXT NOT NULL REFERENCES products(id),quantity_milli INTEGER NOT NULL CHECK(quantity_milli>=0),
+            updated_at TEXT NOT NULL,PRIMARY KEY(company_id,branch_id,product_id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_stock_events(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
+            product_id TEXT NOT NULL REFERENCES products(id),actor_id TEXT NOT NULL REFERENCES users(id),
+            kind TEXT NOT NULL CHECK(kind IN ('adjustment_in','adjustment_out','transfer_in','transfer_out')),
+            quantity_milli INTEGER NOT NULL,before_milli INTEGER NOT NULL,after_milli INTEGER NOT NULL,
+            reason TEXT NOT NULL,transfer_id TEXT,created_at TEXT NOT NULL)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS branch_stock_events_lookup ON branch_stock_events(company_id,branch_id,product_id,created_at)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_stock_transfers(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),product_id TEXT NOT NULL REFERENCES products(id),
+            from_branch_id TEXT NOT NULL REFERENCES branches(id),to_branch_id TEXT NOT NULL REFERENCES branches(id),
+            quantity_milli INTEGER NOT NULL CHECK(quantity_milli>0),reason TEXT NOT NULL,actor_id TEXT NOT NULL REFERENCES users(id),
+            idempotency_key TEXT NOT NULL,request_hash TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(company_id,idempotency_key))""")
+    migration(8,"branch_scoped_stock_ledger",create_branch_stock_ledger)
 
 
 def init_db() -> None:
@@ -790,6 +808,16 @@ class BranchCreateIn(StrictModel):
     code: str = Field(min_length=1,max_length=24,pattern=r"^[A-Za-z0-9_-]+$")
     name: str = Field(min_length=2,max_length=120)
 
+class BranchUsersIn(StrictModel):
+    user_ids: list[str] = Field(max_length=500)
+
+class BranchStockTransferIn(StrictModel):
+    from_branch_id: str
+    to_branch_id: str
+    product_id: str
+    quantity: Decimal = Field(gt=0, max_digits=15, decimal_places=3)
+    reason: str = Field(min_length=3,max_length=240)
+
 class RestaurantAreaIn(StrictModel):
     name: str = Field(min_length=2,max_length=80)
 class RestaurantTableIn(StrictModel):
@@ -1103,7 +1131,7 @@ USER = Annotated[dict, Depends(current_user)]
 
 
 PERMISSION_CATALOG={"products.read":"Consultar produtos","products.write":"Gerenciar produtos","stock.adjust":"Ajustar estoque","sales.create":"Registrar vendas","sales.void":"Cancelar vendas","cash.manage":"Operar caixa","customers.read":"Consultar clientes","customers.write":"Gerenciar clientes","purchases.manage":"Gerenciar compras","finance.read":"Consultar financeiro","finance.write":"Gerenciar financeiro","users.manage":"Gerenciar acessos","profile.manage":"Configurar perfil","branches.manage":"Gerenciar filiais","modules.manage":"Gerenciar módulos","restaurant.floor":"Operar ambientes, mesas e reservas","reports.read":"Consultar relatórios","restaurant.menu":"Gerenciar cardápio","restaurant.orders":"Criar e distribuir pedidos","restaurant.production":"Atualizar produção e entrega","restaurant.cash":"Receber e encerrar comandas","sales.read":"Consultar vendas e relatórios","inventory.read":"Consultar estoque","audit.read":"Consultar auditoria","branch.read":"Consultar filiais","users.read":"Consultar equipe"}
-ROLE_PERMISSIONS={"owner":set(PERMISSION_CATALOG),"admin":set(PERMISSION_CATALOG)-{"branches.manage","modules.manage"},"manager":set(PERMISSION_CATALOG)-{"users.manage","branches.manage","modules.manage"},"operator":{"products.read","products.write","sales.create","sales.read","sales.void","cash.manage","inventory.read","customers.read","customers.write","restaurant.floor","restaurant.orders","restaurant.production","restaurant.cash","reports.read"},"stock":{"products.read","products.write","stock.adjust","purchases.manage"}}
+ROLE_PERMISSIONS={"owner":set(PERMISSION_CATALOG),"admin":set(PERMISSION_CATALOG)-{"branches.manage","modules.manage"},"manager":set(PERMISSION_CATALOG)-{"users.manage","branches.manage","modules.manage"},"operator":{"products.read","products.write","sales.create","sales.read","sales.void","cash.manage","inventory.read","customers.read","customers.write","restaurant.floor","restaurant.orders","restaurant.production","restaurant.cash","reports.read","branch.read"},"stock":{"products.read","products.write","stock.adjust","purchases.manage","inventory.read","branch.read"}}
 MODULE_STATUSES={"sales":"ENABLED","inventory":"ENABLED","purchasing":"ENABLED","customers":"ENABLED","finance":"ENABLED","reports":"ENABLED","staff":"ENABLED","profile_setup":"ENABLED","restaurant_floor":"AVAILABLE","barcode":"NOT_IMPLEMENTED","weighed_items":"NOT_IMPLEMENTED","expiry_control":"NOT_IMPLEMENTED","tables_tabs":"NOT_IMPLEMENTED","delivery":"NOT_IMPLEMENTED","kitchen":"NOT_IMPLEMENTED","variants":"NOT_IMPLEMENTED","returns":"NOT_IMPLEMENTED","commissions":"NOT_IMPLEMENTED","appointments":"NOT_IMPLEMENTED","measurement_sales":"NOT_IMPLEMENTED","restaurant_floor":"AVAILABLE"}
 
 def require_role(user: dict, *roles: str) -> None:
@@ -1176,7 +1204,10 @@ def permission_for_endpoint(method: str, path: str):
     if path=="/v1/me": return None
     if path.startswith("/v1/master/"): return None  # separately protected by bootstrap secret
     if path.startswith("/v1/company/branches"):
-        return "branches.manage" if method=="POST" else "branch.read"
+        return "branches.manage" if "/users" in path or method!="GET" else "branch.read"
+    if path=="/v1/branches/stock-transfers": return "stock.adjust"
+    if path.startswith("/v1/branches/"):
+        return "stock.adjust" if method!="GET" else "inventory.read"
     if path=="/v1/company/commercial": return "finance.read"
     if path=="/v1/permissions/effective": return None
     if path.startswith("/v1/company/permissions") or path.startswith("/v1/users/") and path.endswith("/permissions"):
@@ -1228,17 +1259,23 @@ async def granular_permission_guard(request: Request, call_next):
                         raise HTTPException(401,"Sessão inválida ou usuário inativo.")
                     require_permission(conn,dict(row),permission)
                     company_user=dict(row)
-                    branch_exempt=(request.url.path in {"/v1/me","/v1/configuration/catalog","/v1/company/branches","/v1/company/commercial","/v1/permissions/effective"} or request.url.path.startswith(("/v1/company/profile","/v1/company/modules","/v1/company/permissions","/v1/permissions/","/v1/users")))
+                    branch_exempt=(request.url.path in {"/v1/me","/v1/configuration/catalog","/v1/company/branches","/v1/company/commercial","/v1/permissions/effective","/v1/audit-events"} or request.url.path.startswith(("/v1/company/profile","/v1/company/modules","/v1/company/permissions","/v1/company/branches/","/v1/permissions/","/v1/users")))
                     if not branch_exempt and request.url.path.startswith("/v1/"):
                         active_branches=conn.execute("SELECT id FROM branches WHERE company_id=? AND status='active' ORDER BY created_at,id",(company_user["company_id"],)).fetchall()
                         requested_branch=request.headers.get("X-Branch-Id")
                         if requested_branch:
                             authorized=conn.execute("SELECT 1 FROM branch_users bu JOIN branches b ON b.id=bu.branch_id AND b.company_id=bu.company_id WHERE bu.company_id=? AND bu.user_id=? AND bu.branch_id=? AND b.status='active'",(company_user["company_id"],company_user["id"],requested_branch)).fetchone()
                             if not authorized: raise HTTPException(403,"Filial inexistente ou não autorizada para este usuário.")
-                            if len(active_branches)>1:
-                                raise HTTPException(409,"Particionamento operacional por filial ainda não foi ativado; a seleção não altera nem filtra dados até os fluxos serem migrados.")
-                        elif len(active_branches)>1:
+                            if len(active_branches)>1 and not request.url.path.startswith("/v1/branches/"):
+                                raise HTTPException(409,"Particionamento operacional por filial ainda não foi ativado; esta operação não altera nem filtra dados até os fluxos serem migrados.")
+                            request.state.branch_id=requested_branch
+                        elif len(active_branches)>1 and not request.url.path.startswith("/v1/branches/") and request.url.path!="/v1/branches/stock-transfers":
                             raise HTTPException(409,"Operações multi-filial ainda não estão particionadas. Os dados históricos permanecem sem atribuição e nenhuma filial foi selecionada automaticamente.")
+                        elif request.url.path.startswith("/v1/branches/"):
+                            match=re.match(r"^/v1/branches/([^/]+)(?:/|$)",request.url.path)
+                            if match and match.group(1)!="stock-transfers":
+                                authorized=conn.execute("SELECT 1 FROM branch_users bu JOIN branches b ON b.id=bu.branch_id AND b.company_id=bu.company_id WHERE bu.company_id=? AND bu.user_id=? AND bu.branch_id=? AND b.status='active'",(company_user["company_id"],company_user["id"],match.group(1))).fetchone()
+                                if not authorized: raise HTTPException(403,"Filial inexistente ou não autorizada para este usuário.")
                         elif active_branches:
                             authorized=conn.execute("SELECT 1 FROM branch_users WHERE company_id=? AND user_id=? AND branch_id=?",(company_user["company_id"],company_user["id"],active_branches[0]["id"])).fetchone()
                             if not authorized: raise HTTPException(403,"Este usuário não tem acesso à filial principal.")
@@ -1504,6 +1541,105 @@ def create_branch(data: BranchCreateIn,conn: DB,user: USER):
             audit(conn,user["company_id"],user["id"],"branch.created","branch",branch_id,{"code":data.code.lower(),"name":data.name.strip()})
     except sqlite3.IntegrityError: raise HTTPException(409,"Já existe uma filial com esse código.")
     return {"id":branch_id,"code":data.code.lower(),"name":data.name.strip(),"status":"active","operational_scope":"metadata_only"}
+
+@app.get("/v1/company/branches/{branch_id}/users")
+def list_branch_users(branch_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin")
+    require_permission(conn,user,"branches.manage")
+    branch=conn.execute("SELECT id,code,name,status FROM branches WHERE id=? AND company_id=?",(branch_id,user["company_id"])).fetchone()
+    if not branch: raise HTTPException(404,"Filial não encontrada nesta empresa.")
+    rows=conn.execute("SELECT u.id,u.full_name,u.email,u.role,u.active FROM branch_users bu JOIN users u ON u.id=bu.user_id AND u.company_id=bu.company_id WHERE bu.company_id=? AND bu.branch_id=? ORDER BY u.full_name",(user["company_id"],branch_id)).fetchall()
+    return {"branch":dict(branch),"users":[dict(r) for r in rows]}
+
+@app.put("/v1/company/branches/{branch_id}/users")
+def replace_branch_users(branch_id: str,data: BranchUsersIn,conn: DB,user: USER):
+    require_role(user,"owner","admin")
+    require_permission(conn,user,"branches.manage")
+    requested=list(dict.fromkeys(data.user_ids))
+    with transaction(conn):
+        branch=conn.execute("SELECT id FROM branches WHERE id=? AND company_id=? AND status='active'",(branch_id,user["company_id"])).fetchone()
+        if not branch: raise HTTPException(404,"Filial não encontrada ou inativa nesta empresa.")
+        if requested:
+            marks=",".join("?" for _ in requested)
+            found=conn.execute(f"SELECT id FROM users WHERE company_id=? AND active=1 AND id IN ({marks})",(user["company_id"],*requested)).fetchall()
+            if {r["id"] for r in found}!=set(requested): raise HTTPException(422,"Todos os usuários precisam estar ativos e pertencer à mesma empresa.")
+        before=[r[0] for r in conn.execute("SELECT user_id FROM branch_users WHERE company_id=? AND branch_id=? ORDER BY user_id",(user["company_id"],branch_id)).fetchall()]
+        conn.execute("DELETE FROM branch_users WHERE company_id=? AND branch_id=?",(user["company_id"],branch_id))
+        for uid in requested: conn.execute("INSERT INTO branch_users(company_id,branch_id,user_id) VALUES(?,?,?)",(user["company_id"],branch_id,uid))
+        audit(conn,user["company_id"],user["id"],"branch.users_replaced","branch",branch_id,{"before_user_ids":before,"after_user_ids":requested})
+    return {"branch_id":branch_id,"user_ids":requested,"updated_at":now_iso()}
+
+def require_branch_membership(conn,user,branch_id):
+    branch=conn.execute("SELECT id FROM branches WHERE id=? AND company_id=? AND status='active'",(branch_id,user["company_id"])).fetchone()
+    if not branch: raise HTTPException(404,"Filial não encontrada ou inativa nesta empresa.")
+    member=conn.execute("SELECT 1 FROM branch_users WHERE company_id=? AND branch_id=? AND user_id=?",(user["company_id"],branch_id,user["id"])).fetchone()
+    if not member: raise HTTPException(403,"Usuário sem acesso a esta filial.")
+    return branch
+
+@app.get("/v1/branches/{branch_id}/inventory")
+def list_branch_inventory(branch_id: str,conn: DB,user: USER,search: str=Query(default="",max_length=100)):
+    require_permission(conn,user,"inventory.read");require_branch_membership(conn,user,branch_id)
+    if not conn.execute("SELECT 1 FROM branches WHERE company_id=? AND id=?",(user["company_id"],branch_id)).fetchone(): raise HTTPException(404,"Filial não encontrada.")
+    term="%"+search.strip().replace("%","\%").replace("_","\_")+"%"
+    rows=conn.execute("""SELECT p.id,p.sku,p.name,p.unit,p.price_cents,p.cost_cents,p.category,p.barcode,
+        COALESCE(bps.quantity_milli,0) AS quantity_milli,bps.updated_at
+        FROM products p LEFT JOIN branch_product_stock bps ON bps.product_id=p.id AND bps.company_id=p.company_id AND bps.branch_id=?
+        WHERE p.company_id=? AND p.active=1 AND (?='' OR p.name LIKE ? ESCAPE '\' OR p.sku LIKE ? ESCAPE '\' OR COALESCE(p.barcode,'') LIKE ? ESCAPE '\')
+        ORDER BY p.name""",(branch_id,user["company_id"],search.strip(),term,term,term)).fetchall()
+    return {"branch_id":branch_id,"items":[{"product_id":r["id"],"sku":r["sku"],"name":r["name"],"unit":r["unit"],"category":r["category"],"barcode":r["barcode"],"quantity":milli_to_decimal(r["quantity_milli"]),"updated_at":r["updated_at"]} for r in rows],"legacy_unassigned_excluded":True}
+
+@app.post("/v1/branches/{branch_id}/inventory/{product_id}/adjustments",status_code=201)
+def adjust_branch_stock(branch_id: str,product_id: str,data: StockAdjustmentIn,conn: DB,user: USER):
+    require_permission(conn,user,"stock.adjust");require_branch_membership(conn,user,branch_id)
+    movement_id,now=new_id(),now_iso();qty=decimal_milli(data.quantity)
+    with transaction(conn):
+        product=conn.execute("SELECT id FROM products WHERE id=? AND company_id=? AND active=1",(product_id,user["company_id"])).fetchone()
+        if not product: raise HTTPException(404,"Produto não encontrado nesta empresa.")
+        row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,product_id)).fetchone()
+        before=int(row[0]) if row else 0;after=before+qty if data.direction=="in" else before-qty
+        if after<0: raise HTTPException(409,"Saldo insuficiente nesta filial.")
+        conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO UPDATE SET quantity_milli=excluded.quantity_milli,updated_at=excluded.updated_at",(user["company_id"],branch_id,product_id,after,now))
+        conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,?)",(movement_id,user["company_id"],branch_id,product_id,user["id"],"adjustment_in" if data.direction=="in" else "adjustment_out",qty if data.direction=="in" else -qty,before,after,data.reason,now))
+        audit(conn,user["company_id"],user["id"],"branch_stock.adjusted","branch_product_stock",branch_id+":"+product_id,{"movement_id":movement_id,"direction":data.direction,"before":milli_to_decimal(before),"after":milli_to_decimal(after),"reason":data.reason})
+    return {"movement_id":movement_id,"branch_id":branch_id,"product_id":product_id,"before":milli_to_decimal(before),"after":milli_to_decimal(after)}
+
+@app.get("/v1/branches/{branch_id}/stock-movements")
+def list_branch_stock_events(branch_id: str,conn: DB,user: USER,product_id: str|None=None,limit: int=Query(default=100,ge=1,le=200)):
+    require_permission(conn,user,"inventory.read");require_branch_membership(conn,user,branch_id)
+    clauses=["company_id=?","branch_id=?"];params=[user["company_id"],branch_id]
+    if product_id: clauses.append("product_id=?");params.append(product_id)
+    rows=conn.execute(f"SELECT * FROM branch_stock_events WHERE {' AND '.join(clauses)} ORDER BY created_at DESC,id DESC LIMIT ?",(*params,limit)).fetchall()
+    return {"branch_id":branch_id,"items":[{"id":r["id"],"product_id":r["product_id"],"kind":r["kind"],"quantity":milli_to_decimal(abs(r["quantity_milli"])),"before":milli_to_decimal(r["before_milli"]),"after":milli_to_decimal(r["after_milli"]),"reason":r["reason"],"transfer_id":r["transfer_id"],"created_at":r["created_at"]} for r in rows]}
+
+@app.post("/v1/branches/stock-transfers",status_code=201)
+def transfer_branch_stock(data: BranchStockTransferIn,conn: DB,user: USER,idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
+    require_permission(conn,user,"stock.adjust")
+    if not idempotency_key or len(idempotency_key)>128: raise HTTPException(400,"Envie Idempotency-Key para evitar transferências duplicadas.")
+    if data.from_branch_id==data.to_branch_id: raise HTTPException(422,"Escolha duas filiais diferentes.")
+    require_branch_membership(conn,user,data.from_branch_id);require_branch_membership(conn,user,data.to_branch_id)
+    qty=decimal_milli(data.quantity);transfer_id,now=new_id(),now_iso()
+    body={"from_branch_id":data.from_branch_id,"to_branch_id":data.to_branch_id,"product_id":data.product_id,"quantity_milli":qty,"reason":data.reason}
+    request_hash=hashlib.sha256(json.dumps(body,sort_keys=True,separators=(",",":")).encode()).hexdigest()
+    with transaction(conn):
+        prior=conn.execute("SELECT * FROM branch_stock_transfers WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
+        if prior:
+            if prior["request_hash"]!=request_hash: raise HTTPException(409,"Idempotency-Key já foi usada com dados diferentes.")
+            if response is not None: response.status_code=200
+            return {"transfer_id":prior["id"],"product_id":prior["product_id"],"quantity":milli_to_decimal(prior["quantity_milli"]),"from_branch_id":prior["from_branch_id"],"to_branch_id":prior["to_branch_id"],"status":"completed","idempotent":True}
+        if not conn.execute("SELECT 1 FROM products WHERE id=? AND company_id=? AND active=1",(data.product_id,user["company_id"])).fetchone(): raise HTTPException(404,"Produto não encontrado nesta empresa.")
+        src=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],data.from_branch_id,data.product_id)).fetchone()
+        source_before=int(src[0]) if src else 0
+        if source_before<qty: raise HTTPException(409,"Saldo insuficiente na filial de origem.")
+        dst=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],data.to_branch_id,data.product_id)).fetchone()
+        dest_before=int(dst[0]) if dst else 0
+        source_after=source_before-qty;dest_after=dest_before+qty
+        for bid,bal in ((data.from_branch_id,source_after),(data.to_branch_id,dest_after)):
+            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO UPDATE SET quantity_milli=excluded.quantity_milli,updated_at=excluded.updated_at",(user["company_id"],bid,data.product_id,bal,now))
+        conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'transfer_out',?,?,?,?,?,?)",(new_id(),user["company_id"],data.from_branch_id,data.product_id,user["id"],-qty,source_before,source_after,data.reason,transfer_id,now))
+        conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'transfer_in',?,?,?,?,?,?)",(new_id(),user["company_id"],data.to_branch_id,data.product_id,user["id"],qty,dest_before,dest_after,data.reason,transfer_id,now))
+        conn.execute("INSERT INTO branch_stock_transfers(id,company_id,product_id,from_branch_id,to_branch_id,quantity_milli,reason,actor_id,idempotency_key,request_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(transfer_id,user["company_id"],data.product_id,data.from_branch_id,data.to_branch_id,qty,data.reason,user["id"],idempotency_key,request_hash,now))
+        audit(conn,user["company_id"],user["id"],"branch_stock.transferred","branch_stock_transfer",transfer_id,{"product_id":data.product_id,"from_branch_id":data.from_branch_id,"to_branch_id":data.to_branch_id,"quantity":milli_to_decimal(qty),"reason":data.reason})
+    return {"transfer_id":transfer_id,"product_id":data.product_id,"quantity":milli_to_decimal(qty),"from_branch_id":data.from_branch_id,"to_branch_id":data.to_branch_id,"status":"completed","idempotent":False}
 
 @app.get("/v1/company/permissions")
 def list_permissions(conn: DB,user: USER):

@@ -721,7 +721,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1126,3 +1126,46 @@ def test_branch_membership_cannot_be_forged_across_tenant_and_multi_branch_fails
     assert world.post('/v1/company/branches',headers=headers,json={'code':'second','name':'Segunda unidade'}).status_code==201
     assert world.get('/v1/products',headers=headers).status_code==409
     assert world.get('/v1/products',headers={**headers,'X-Branch-Id':branches[0]['id']}).status_code==409
+
+
+def test_branch_membership_administration_is_tenant_scoped_and_audited(world):
+    owner=company(world);headers=auth(owner)
+    branch=world.post('/v1/company/branches',headers=headers,json={'code':'west','name':'Unidade Oeste'}).json()
+    created=world.post('/v1/users',headers=headers,json={'full_name':'Vendedora','email':'branch-user@example.test','password':'secure-password-123','role':'operator'})
+    assert created.status_code==201,created.text
+    uid=created.json()['id']
+    assigned=world.put(f"/v1/company/branches/{branch['id']}/users",headers=headers,json={'user_ids':[uid, world.get('/v1/me',headers=headers).json()['id']]})
+    assert assigned.status_code==200,assigned.text
+    assert {u['id'] for u in world.get(f"/v1/company/branches/{branch['id']}/users",headers=headers).json()['users']}=={uid,world.get('/v1/me',headers=headers).json()['id']}
+    events=world.get('/v1/audit-events',headers=headers).json()['items']
+    assert any(e['action']=='branch.users_replaced' and e['entity_id']==branch['id'] for e in events)
+    foreign_token=company(world,'Unrelated','unrelated','unrelated@example.test')
+    foreign_branch=world.get('/v1/company/branches',headers=auth(foreign_token)).json()['items'][0]['id']
+    assert world.put(f"/v1/company/branches/{foreign_branch}/users",headers=headers,json={'user_ids':[uid]}).status_code==404
+    assert world.put(f"/v1/company/branches/{branch['id']}/users",headers=headers,json={'user_ids':['nonexistent-foreign-user']}).status_code==422
+
+
+def test_branch_inventory_adjustment_history_transfer_and_cross_branch_denial(world):
+    owner=company(world);headers=auth(owner)
+    branches=world.get('/v1/company/branches',headers=headers).json()['items']
+    first=branches[0]['id']
+    p=product(world,owner,sku='BRANCH-LEDGER')
+    second=world.post('/v1/company/branches',headers=headers,json={'code':'north','name':'Norte'}).json()['id']
+    # Branch ledger is independent from legacy company stock; no silent import.
+    assert world.get(f'/v1/branches/{first}/inventory',headers=headers).json()['items'][0]['quantity']=='0'
+    add=world.post(f'/v1/branches/{first}/inventory/{p["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'12','reason':'Recebimento fictício'});assert add.status_code==201,add.text
+    assert world.get(f'/v1/branches/{second}/inventory',headers=headers).json()['items'][0]['quantity']=='0'
+    assert world.post(f'/v1/branches/{first}/inventory/{p["id"]}/adjustments',headers=headers,json={'direction':'out','quantity':'13','reason':'Saída inválida'}).status_code==409
+    transfer=world.post('/v1/branches/stock-transfers',headers={**headers,'Idempotency-Key':'transfer-test-1'},json={'from_branch_id':first,'to_branch_id':second,'product_id':p['id'],'quantity':'5','reason':'Transferência fictícia'});assert transfer.status_code==201,transfer.text
+    replay=world.post('/v1/branches/stock-transfers',headers={**headers,'Idempotency-Key':'transfer-test-1'},json={'from_branch_id':first,'to_branch_id':second,'product_id':p['id'],'quantity':'5','reason':'Transferência fictícia'});assert replay.status_code==200 and replay.json()['idempotent'] is True
+    conflict=world.post('/v1/branches/stock-transfers',headers={**headers,'Idempotency-Key':'transfer-test-1'},json={'from_branch_id':first,'to_branch_id':second,'product_id':p['id'],'quantity':'4','reason':'Transferência fictícia'});assert conflict.status_code==409
+    inv1=world.get(f'/v1/branches/{first}/inventory',headers=headers).json()['items'][0]['quantity']
+    inv2=world.get(f'/v1/branches/{second}/inventory',headers=headers).json()['items'][0]['quantity']
+    assert (inv1,inv2)==('7','5')
+    assert len(world.get(f'/v1/branches/{first}/stock-movements',headers=headers).json()['items'])==2
+    other_token=company(world,'Different','different','different@example.test')
+    assert world.get(f'/v1/branches/{first}/inventory',headers=auth(other_token)).status_code==403
+    # Unauthorized branch operator is rejected, even if tenant ID is correct.
+    op_resp=world.post('/v1/users',headers=headers,json={'full_name':'Operador limitado','email':'branch-limited@example.test','password':'secure-password-123','role':'operator'});assert op_resp.status_code==201
+    op_token=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'branch-limited@example.test','password':'secure-password-123'}).json()['access_token']
+    assert world.get(f'/v1/branches/{second}/inventory',headers=auth(op_token)).status_code==403

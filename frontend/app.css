@@ -60,3 +60,4 @@ input,select{transition:border-color .15s,box-shadow .15s}
 @media(max-width:500px){.signup-segment-grid,.signup-questions{grid-template-columns:1fr}.login-card{padding:27px 22px}}
 
 .module-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.module-card{border:1px solid var(--line);border-radius:9px;padding:12px;min-width:0}.module-card b{display:block;font-size:11px}.module-card small,.module-card p{font-size:10px;color:var(--muted)}
+.branch-picker{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);white-space:nowrap}.branch-picker select{max-width:180px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--text)}@media(max-width:600px){.branch-picker select{max-width:120px}.topright{gap:8px}}
