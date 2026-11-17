@@ -1628,3 +1628,22 @@ def test_branch_inventory_concurrent_increments_preserve_ledger_and_balance(worl
     movements=world.get(f'/v1/branches/{branch}/stock-movements?product_id={p["id"]}',headers=headers).json()
     assert len(movements['items'])==8
     assert {m['after'] for m in movements['items']}=={str(i) for i in range(1,9)}
+
+
+def test_branch_concurrent_sales_lock_stock_and_record_all_cash_events(world):
+    from concurrent.futures import ThreadPoolExecutor
+    owner=company(world);headers=auth(owner)
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    p=product(world,owner,sku='CONCURRENT-SALE',name='Venda Concorrente',price='4.50')
+    assert world.post(f'/v1/branches/{branch}/registers/open',headers=headers,json={'label':'Turno QA','opening_amount':'0'}).status_code==201
+    assert world.post(f'/v1/branches/{branch}/inventory/{p["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'8','reason':'Carga QA concorrência'}).status_code==201
+    def sell(i):
+        return world.post(f'/v1/branches/{branch}/sales',headers={**headers,'Idempotency-Key':f'concurrent-sale-{i}'},json={'items':[{'product_id':p['id'],'quantity':'1'}],'payment_method':'cash','received_amount':'5.00'})
+    with ThreadPoolExecutor(max_workers=8) as pool: responses=list(pool.map(sell,range(8)))
+    assert all(r.status_code==201 for r in responses),[(r.status_code,r.text) for r in responses]
+    inv=world.get(f'/v1/branches/{branch}/inventory',headers=headers).json()['items'][0]
+    assert inv['quantity']=='0'
+    sales=world.get(f'/v1/branches/{branch}/sales',headers=headers).json()['items']
+    assert len(sales)==8 and all(x['status']=='paid' for x in sales)
+    register=world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()
+    assert register['expected_amount']=='36.00'
