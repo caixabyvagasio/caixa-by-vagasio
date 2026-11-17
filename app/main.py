@@ -1804,11 +1804,13 @@ def get_branch_register(branch_id: str,conn: DB,user: USER):
 def branch_register_movement(branch_id: str,register_id: str,data: BranchCashMovementIn,conn: DB,user: USER):
     require_permission(conn,user,"cash.manage");require_branch_membership(conn,user,branch_id)
     now=now_iso();delta=decimal_money_cents(data.amount)*(1 if data.kind=="supply" else -1)
-    with transaction(conn):
-        r=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(register_id,user["company_id"],branch_id)).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        r=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'"+lock_clause,(register_id,user["company_id"],branch_id)).fetchone()
         if not r:raise HTTPException(404,"Caixa aberto não encontrado nesta filial.")
         prior=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register_id)).fetchall()
-        if r["opening_cents"]+sum(x[0] for x in prior)+delta<0:raise HTTPException(409,"Saldo insuficiente no caixa desta filial.")
+        business=conn.execute("SELECT amount_cents FROM branch_cash_movements WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register_id)).fetchall()
+        if r["opening_cents"]+sum(x[0] for x in prior)+sum(x[0] for x in business)+delta<0:raise HTTPException(409,"Saldo insuficiente no caixa desta filial.")
         mid=new_id();conn.execute("INSERT INTO branch_cash_events(id,company_id,branch_id,register_id,actor_id,kind,amount_cents,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(mid,user["company_id"],branch_id,register_id,user["id"],data.kind,delta,data.reason.strip(),now))
         audit(conn,user["company_id"],user["id"],"branch_register.movement","branch_cash_register",register_id,{"branch_id":branch_id,"kind":data.kind,"amount":cents_to_money(abs(delta)),"reason":data.reason.strip()})
     return {"movement_id":mid,"branch_id":branch_id,"kind":data.kind,"amount":cents_to_money(abs(delta))}
@@ -1816,8 +1818,9 @@ def branch_register_movement(branch_id: str,register_id: str,data: BranchCashMov
 @app.post("/v1/branches/{branch_id}/registers/{register_id}/close")
 def close_branch_register(branch_id: str,register_id: str,data: BranchRegisterCloseIn,conn: DB,user: USER):
     require_permission(conn,user,"cash.manage");require_branch_membership(conn,user,branch_id)
-    with transaction(conn):
-        r=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(register_id,user["company_id"],branch_id)).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        r=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'"+lock_clause,(register_id,user["company_id"],branch_id)).fetchone()
         if not r:raise HTTPException(404,"Caixa aberto não encontrado nesta filial.")
         ev=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register_id)).fetchall()
         sales_and_returns=conn.execute("SELECT amount_cents FROM branch_cash_movements WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register_id)).fetchall()
@@ -1851,7 +1854,7 @@ def create_branch_sale(branch_id: str,data: BranchSaleIn,request: Request,conn: 
             if prior["request_hash"]!=req_hash:raise HTTPException(409,"Chave de idempotência usada com dados diferentes.")
             if response is not None:response.status_code=200
             return {"id":prior["id"],"branch_id":branch_id,"status":prior["status"],"total":cents_to_money(prior["total_cents"]),"idempotent":True}
-        register=conn.execute("SELECT * FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open'",(user["company_id"],branch_id)).fetchone()
+        register=conn.execute("SELECT * FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1"+(" FOR UPDATE" if is_postgres(conn) else ""),(user["company_id"],branch_id)).fetchone()
         if not register:raise HTTPException(409,"Abra o caixa desta filial antes da venda.")
         available={}
         lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
@@ -2019,7 +2022,7 @@ def void_branch_sale(branch_id: str,sale_id: str,data: SaleVoidIn,conn: DB,user:
         if sale["status"]!="paid":raise HTTPException(409,"Venda já cancelada ou não paga.")
         events=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,sale["register_id"])).fetchall()
         movements=conn.execute("SELECT amount_cents FROM branch_cash_movements WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,sale["register_id"])).fetchall()
-        register=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(sale["register_id"],user["company_id"],branch_id)).fetchone()
+        register=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'"+(" FOR UPDATE" if is_postgres(conn) else ""),(sale["register_id"],user["company_id"],branch_id)).fetchone()
         if not register:raise HTTPException(409,"É necessário caixa aberto nesta filial para registrar devolução em dinheiro.")
         expected=register["opening_cents"]+sum(x[0] for x in events)+sum(x[0] for x in movements)
         if expected<sale["total_cents"]:raise HTTPException(409,"Saldo insuficiente no caixa desta filial.")
