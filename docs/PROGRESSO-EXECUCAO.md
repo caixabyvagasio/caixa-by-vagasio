@@ -208,3 +208,10 @@
 - O CI PostgreSQL falhou antes da correção (`44121112420`) pela corrida real; após correção, commits `69c7bbdcb357` e `9301a720aa5e` passaram CI geral e PostgreSQL (`44123451590`/`44123451658`; checkpoint final `44123478043`/`44123477766`). Full local no snapshot atualizado: **99 passed, 1 skipped**.
 - Deploy dev `dep-dbu7rl0m7kps73b8hbig` live no commit `9301a720aa5e811ee3abd50667b6aa3729a183d3`; health aponta PostgreSQL, landing 200, payments/fiscal false. Sem acesso autenticado ao tenant de empresa persistente; sem dados alterados pela validação de QA local.
 - Escopo remanescente: lock coverage para ajustes, vendas, transfers, compras/recebimento, reversals e ciclos de restaurante precisa ser auditada e testada no Postgres; não assumir que as duas rotas cobrem tudo.
+
+
+## Continuação — transferências de estoque concorrentes (2026-11-17 13:21 BRT)
+- HEAD confirmado antes da alteração: `fb28c5551a87d2139a0763069525127f59a4f867`; CI anterior geral/Postgres verdes.
+- `transfer_branch_stock` também podia ler saldo sem locks e sobrescrever concorrência. Alteração local: READ COMMITTED, criar linha de saldo ausente idempotentemente para origem/destino, adquirir `FOR UPDATE` em ordem determinística por branch id, validar source saldo e atualizar os dois saldos + eventos + transferência + auditoria na mesma transação.
+- Testes adicionados: oito transferências paralelas com oito unidades preservam balanços/eventos; oito saídas paralelas contra quatro unidades resultam exatamente quatro sucessos/quatro 409, saldo de origem zero e destino quatro. Focados 2 passed; suite SQLite **101 passed, 1 skipped**. PostgreSQL CI ainda não executado.
+- Ainda não publicado. Concorrência e retries idempotentes de estornos, compras/recebimentos, restaurantes e retries após falha de conexão permanecem para próxima análise.
