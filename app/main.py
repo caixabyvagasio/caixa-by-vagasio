@@ -359,7 +359,7 @@ def apply_schema_migrations(conn) -> None:
         conn.execute("""CREATE TABLE IF NOT EXISTS branch_stock_events(
             id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
             product_id TEXT NOT NULL REFERENCES products(id),actor_id TEXT NOT NULL REFERENCES users(id),
-            kind TEXT NOT NULL CHECK(kind IN ('adjustment_in','adjustment_out','transfer_in','transfer_out')),
+            kind TEXT NOT NULL CHECK(kind IN ('adjustment_in','adjustment_out','transfer_in','transfer_out','sale','reversal')),
             quantity_milli INTEGER NOT NULL,before_milli INTEGER NOT NULL,after_milli INTEGER NOT NULL,
             reason TEXT NOT NULL,transfer_id TEXT,created_at TEXT NOT NULL)""")
         conn.execute("CREATE INDEX IF NOT EXISTS branch_stock_events_lookup ON branch_stock_events(company_id,branch_id,product_id,created_at)")
@@ -369,6 +369,36 @@ def apply_schema_migrations(conn) -> None:
             quantity_milli INTEGER NOT NULL CHECK(quantity_milli>0),reason TEXT NOT NULL,actor_id TEXT NOT NULL REFERENCES users(id),
             idempotency_key TEXT NOT NULL,request_hash TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(company_id,idempotency_key))""")
     migration(8,"branch_scoped_stock_ledger",create_branch_stock_ledger)
+    def create_branch_cash_ledger():
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_cash_registers(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
+            label TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('open','closed')),opening_cents INTEGER NOT NULL CHECK(opening_cents>=0),
+            opened_by TEXT NOT NULL REFERENCES users(id),opened_at TEXT NOT NULL,closed_by TEXT REFERENCES users(id),closed_at TEXT,
+            counted_cents INTEGER,expected_cents INTEGER,difference_cents INTEGER)""")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS branch_one_open_register ON branch_cash_registers(company_id,branch_id) WHERE status='open'")
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_sales(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
+            register_id TEXT NOT NULL REFERENCES branch_cash_registers(id),created_by TEXT NOT NULL REFERENCES users(id),
+            idempotency_key TEXT NOT NULL,request_hash TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('paid','voided')),
+            subtotal_cents INTEGER NOT NULL,total_cents INTEGER NOT NULL,payment_method TEXT NOT NULL CHECK(payment_method='cash'),
+            received_cents INTEGER NOT NULL,change_cents INTEGER NOT NULL,created_at TEXT NOT NULL,customer_id TEXT,
+            UNIQUE(company_id,branch_id,idempotency_key))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_sale_items(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL,branch_id TEXT NOT NULL,sale_id TEXT NOT NULL REFERENCES branch_sales(id),
+            product_id TEXT NOT NULL REFERENCES products(id),sku TEXT NOT NULL,name TEXT NOT NULL,quantity_milli INTEGER NOT NULL,
+            unit_price_cents INTEGER NOT NULL,discount_cents INTEGER NOT NULL,line_total_cents INTEGER NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_cash_movements(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL,branch_id TEXT NOT NULL,register_id TEXT NOT NULL REFERENCES branch_cash_registers(id),
+            actor_id TEXT NOT NULL REFERENCES users(id),kind TEXT NOT NULL CHECK(kind IN ('sale','supply','withdrawal')),
+            amount_cents INTEGER NOT NULL,reason TEXT NOT NULL,sale_id TEXT,created_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_sales_returns(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL,branch_id TEXT NOT NULL,sale_id TEXT NOT NULL REFERENCES branch_sales(id),
+            actor_id TEXT NOT NULL,amount_cents INTEGER NOT NULL,reason TEXT NOT NULL,created_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS branch_cash_events(
+            id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),
+            register_id TEXT NOT NULL REFERENCES branch_cash_registers(id),actor_id TEXT NOT NULL REFERENCES users(id),
+            kind TEXT NOT NULL CHECK(kind IN ('supply','withdrawal')),amount_cents INTEGER NOT NULL,reason TEXT NOT NULL,created_at TEXT NOT NULL)""")
+    migration(9,"branch_scoped_cash_registers",create_branch_cash_ledger)
 
 
 def init_db() -> None:
@@ -818,6 +848,29 @@ class BranchStockTransferIn(StrictModel):
     quantity: Decimal = Field(gt=0, max_digits=15, decimal_places=3)
     reason: str = Field(min_length=3,max_length=240)
 
+class BranchRegisterOpenIn(StrictModel):
+    label: str = Field(min_length=1,max_length=60)
+    opening_amount: Decimal = Field(ge=0,max_digits=12,decimal_places=2)
+
+class BranchRegisterCloseIn(StrictModel):
+    counted_amount: Decimal = Field(ge=0,max_digits=12,decimal_places=2)
+
+class BranchCashMovementIn(StrictModel):
+    kind: Literal["supply","withdrawal"]
+    amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
+    reason: str = Field(min_length=3,max_length=240)
+
+class BranchSaleLineIn(StrictModel):
+    product_id: str
+    quantity: Decimal = Field(gt=0,max_digits=15,decimal_places=3)
+    discount: Decimal = Field(default=Decimal("0"),ge=0,max_digits=12,decimal_places=2)
+
+class BranchSaleIn(StrictModel):
+    items: list[BranchSaleLineIn] = Field(min_length=1,max_length=100)
+    payment_method: Literal["cash"]
+    received_amount: Decimal = Field(ge=0,max_digits=12,decimal_places=2)
+    customer_id: str|None=None
+
 class RestaurantAreaIn(StrictModel):
     name: str = Field(min_length=2,max_length=80)
 class RestaurantTableIn(StrictModel):
@@ -1206,6 +1259,8 @@ def permission_for_endpoint(method: str, path: str):
     if path.startswith("/v1/company/branches"):
         return "branches.manage" if "/users" in path or method!="GET" else "branch.read"
     if path=="/v1/branches/stock-transfers": return "stock.adjust"
+    if path.startswith("/v1/branches/") and "/registers" in path: return "cash.manage"
+    if path.startswith("/v1/branches/") and "/sales" in path: return "sales.void" if path.endswith("/void") else "sales.read" if method=="GET" else "sales.create"
     if path.startswith("/v1/branches/"):
         return "stock.adjust" if method!="GET" else "inventory.read"
     if path=="/v1/company/commercial": return "finance.read"
@@ -1569,6 +1624,97 @@ def replace_branch_users(branch_id: str,data: BranchUsersIn,conn: DB,user: USER)
         audit(conn,user["company_id"],user["id"],"branch.users_replaced","branch",branch_id,{"before_user_ids":before,"after_user_ids":requested})
     return {"branch_id":branch_id,"user_ids":requested,"updated_at":now_iso()}
 
+@app.post("/v1/branches/{branch_id}/registers/open",status_code=201)
+def open_branch_register(branch_id: str,data: BranchRegisterOpenIn,conn: DB,user: USER):
+    require_permission(conn,user,"cash.manage");require_branch_membership(conn,user,branch_id)
+    register_id,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            if conn.execute("SELECT 1 FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open'",(user["company_id"],branch_id)).fetchone(): raise HTTPException(409,"Já existe caixa aberto nesta filial.")
+            conn.execute("INSERT INTO branch_cash_registers(id,company_id,branch_id,label,status,opening_cents,opened_by,opened_at) VALUES(?,?,?,?,'open',?,?,?)",(register_id,user["company_id"],branch_id,data.label.strip(),decimal_money_cents(data.opening_amount),user["id"],now))
+            audit(conn,user["company_id"],user["id"],"branch_register.opened","branch_cash_register",register_id,{"branch_id":branch_id,"label":data.label.strip()})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Já existe caixa aberto nesta filial.")
+    return {"id":register_id,"branch_id":branch_id,"label":data.label.strip(),"status":"open","opening_amount":cents_to_money(decimal_money_cents(data.opening_amount)),"opened_at":now}
+
+@app.get("/v1/branches/{branch_id}/registers/current")
+def get_branch_register(branch_id: str,conn: DB,user: USER):
+    require_permission(conn,user,"cash.manage");require_branch_membership(conn,user,branch_id)
+    r=conn.execute("SELECT * FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1",(user["company_id"],branch_id)).fetchone()
+    if not r:return {"branch_id":branch_id,"register":None}
+    rows=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,r["id"])).fetchall()
+    sales_cash=conn.execute("SELECT amount_cents FROM branch_cash_movements WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,r["id"])).fetchall()
+    expected=r["opening_cents"]+sum(x["amount_cents"] for x in rows)+sum(x["amount_cents"] for x in sales_cash)
+    return {"branch_id":branch_id,"register":{"id":r["id"],"label":r["label"],"status":r["status"],"opening_amount":cents_to_money(r["opening_cents"]),"opened_at":r["opened_at"]},"expected_amount":cents_to_money(expected)}
+
+@app.post("/v1/branches/{branch_id}/registers/{register_id}/movements",status_code=201)
+def branch_register_movement(branch_id: str,register_id: str,data: BranchCashMovementIn,conn: DB,user: USER):
+    require_permission(conn,user,"cash.manage");require_branch_membership(conn,user,branch_id)
+    now=now_iso();delta=decimal_money_cents(data.amount)*(1 if data.kind=="supply" else -1)
+    with transaction(conn):
+        r=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(register_id,user["company_id"],branch_id)).fetchone()
+        if not r:raise HTTPException(404,"Caixa aberto não encontrado nesta filial.")
+        prior=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register_id)).fetchall()
+        if r["opening_cents"]+sum(x[0] for x in prior)+delta<0:raise HTTPException(409,"Saldo insuficiente no caixa desta filial.")
+        mid=new_id();conn.execute("INSERT INTO branch_cash_events(id,company_id,branch_id,register_id,actor_id,kind,amount_cents,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(mid,user["company_id"],branch_id,register_id,user["id"],data.kind,delta,data.reason.strip(),now))
+        audit(conn,user["company_id"],user["id"],"branch_register.movement","branch_cash_register",register_id,{"branch_id":branch_id,"kind":data.kind,"amount":cents_to_money(abs(delta)),"reason":data.reason.strip()})
+    return {"movement_id":mid,"branch_id":branch_id,"kind":data.kind,"amount":cents_to_money(abs(delta))}
+
+@app.post("/v1/branches/{branch_id}/registers/{register_id}/close")
+def close_branch_register(branch_id: str,register_id: str,data: BranchRegisterCloseIn,conn: DB,user: USER):
+    require_permission(conn,user,"cash.manage");require_branch_membership(conn,user,branch_id)
+    with transaction(conn):
+        r=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(register_id,user["company_id"],branch_id)).fetchone()
+        if not r:raise HTTPException(404,"Caixa aberto não encontrado nesta filial.")
+        ev=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,register_id)).fetchall()
+        expected=r["opening_cents"]+sum(x[0] for x in ev);counted=decimal_money_cents(data.counted_amount);now=now_iso()
+        conn.execute("UPDATE branch_cash_registers SET status='closed',closed_by=?,closed_at=?,counted_cents=?,expected_cents=?,difference_cents=? WHERE id=? AND company_id=? AND branch_id=?",(user["id"],now,counted,expected,counted-expected,register_id,user["company_id"],branch_id))
+        audit(conn,user["company_id"],user["id"],"branch_register.closed","branch_cash_register",register_id,{"branch_id":branch_id,"expected":cents_to_money(expected),"counted":cents_to_money(counted)})
+    return {"id":register_id,"branch_id":branch_id,"status":"closed","expected_amount":cents_to_money(expected),"counted_amount":cents_to_money(counted),"difference":cents_to_money(counted-expected),"closed_at":now}
+
+@app.post("/v1/branches/{branch_id}/sales",status_code=201)
+def create_branch_sale(branch_id: str,data: BranchSaleIn,request: Request,conn: DB,user: USER,
+                      idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
+    require_permission(conn,user,"sales.create");require_branch_membership(conn,user,branch_id)
+    if not idempotency_key or len(idempotency_key)>128:raise HTTPException(400,"Envie Idempotency-Key para evitar venda duplicada.")
+    if any(x.discount>0 for x in data.items) and user["role"] not in {"owner","admin","manager"}:raise HTTPException(403,"Descontos exigem gerente.")
+    qtys={};lines=[];total=0
+    for item in data.items:
+        q=decimal_milli(item.quantity);d=decimal_money_cents(item.discount)
+        product=conn.execute("SELECT id,sku,name,price_cents,unit FROM products WHERE id=? AND company_id=? AND active=1",(item.product_id,user["company_id"])).fetchone()
+        if not product:raise HTTPException(404,"Produto não encontrado nesta empresa.")
+        gross=int((Decimal(product["price_cents"])*Decimal(q)/Decimal(1000)).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+        if d>gross:raise HTTPException(422,"Desconto não pode superar o valor do item.")
+        qtys[item.product_id]=qtys.get(item.product_id,0)+q;line_total=gross-d;total+=line_total;lines.append((product,q,d,line_total))
+    if data.customer_id and not conn.execute("SELECT 1 FROM customers WHERE id=? AND company_id=? AND active=1",(data.customer_id,user["company_id"])).fetchone():raise HTTPException(404,"Cliente não encontrado nesta empresa.")
+    received=decimal_money_cents(data.received_amount)
+    if received<total:raise HTTPException(422,"Valor recebido não cobre o total.")
+    normalized={"branch_id":branch_id,"items":[{"product_id":x.product_id,"quantity":str(x.quantity),"discount":str(x.discount)} for x in data.items],"received_amount":str(data.received_amount),"customer_id":data.customer_id}
+    req_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":")).encode()).hexdigest();sale_id,now=new_id(),now_iso()
+    with transaction(conn):
+        prior=conn.execute("SELECT * FROM branch_sales WHERE company_id=? AND branch_id=? AND idempotency_key=?",(user["company_id"],branch_id,idempotency_key)).fetchone()
+        if prior:
+            if prior["request_hash"]!=req_hash:raise HTTPException(409,"Chave de idempotência usada com dados diferentes.")
+            if response is not None:response.status_code=200
+            return {"id":prior["id"],"branch_id":branch_id,"status":prior["status"],"total":cents_to_money(prior["total_cents"]),"idempotent":True}
+        register=conn.execute("SELECT * FROM branch_cash_registers WHERE company_id=? AND branch_id=? AND status='open'",(user["company_id"],branch_id)).fetchone()
+        if not register:raise HTTPException(409,"Abra o caixa desta filial antes da venda.")
+        available={}
+        for product_id,qty in qtys.items():
+            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,product_id)).fetchone()
+            balance=int(row[0]) if row else 0
+            if balance<qty:raise HTTPException(409,"Estoque insuficiente nesta filial.")
+            available[product_id]=balance
+        conn.execute("INSERT INTO branch_sales(id,company_id,branch_id,register_id,created_by,idempotency_key,request_hash,status,subtotal_cents,total_cents,payment_method,received_cents,change_cents,created_at,customer_id) VALUES(?,?,?,?,?,?,?,'paid',?,?,'cash',?,?,?,?)",(sale_id,user["company_id"],branch_id,register["id"],user["id"],idempotency_key,req_hash,total,total,received,received-total,now,data.customer_id))
+        for prod,q,d,line_total in lines:conn.execute("INSERT INTO branch_sale_items(id,company_id,branch_id,sale_id,product_id,sku,name,quantity_milli,unit_price_cents,discount_cents,line_total_cents) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],branch_id,sale_id,prod["id"],prod["sku"],prod["name"],q,prod["price_cents"],d,line_total))
+        for pid,q in qtys.items():
+            before=available[pid];after=before-q
+            conn.execute("UPDATE branch_product_stock SET quantity_milli=?,updated_at=? WHERE company_id=? AND branch_id=? AND product_id=?",(after,now,user["company_id"],branch_id,pid))
+            if not conn.execute("SELECT 1 FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,pid)).fetchone():conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?)",(user["company_id"],branch_id,pid,after,now))
+            conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'sale',?,?,?,?,NULL,?)",(new_id(),user["company_id"],branch_id,pid,user["id"],-q,before,after,"Venda "+sale_id,now))
+        conn.execute("INSERT INTO branch_cash_movements(id,company_id,branch_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,'sale',?,?,?,?)",(new_id(),user["company_id"],branch_id,register["id"],user["id"],total,"Venda "+sale_id,sale_id,now))
+        audit(conn,user["company_id"],user["id"],"branch_sale.completed","branch_sale",sale_id,{"branch_id":branch_id,"total":cents_to_money(total),"item_count":len(lines),"cash_only":True})
+    return {"id":sale_id,"branch_id":branch_id,"status":"paid","total":cents_to_money(total),"payment_method":"cash","change":cents_to_money(received-total),"idempotent":False}
+
 def require_branch_membership(conn,user,branch_id):
     branch=conn.execute("SELECT id FROM branches WHERE id=? AND company_id=? AND status='active'",(branch_id,user["company_id"])).fetchone()
     if not branch: raise HTTPException(404,"Filial não encontrada ou inativa nesta empresa.")
@@ -1640,6 +1786,32 @@ def transfer_branch_stock(data: BranchStockTransferIn,conn: DB,user: USER,idempo
         conn.execute("INSERT INTO branch_stock_transfers(id,company_id,product_id,from_branch_id,to_branch_id,quantity_milli,reason,actor_id,idempotency_key,request_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(transfer_id,user["company_id"],data.product_id,data.from_branch_id,data.to_branch_id,qty,data.reason,user["id"],idempotency_key,request_hash,now))
         audit(conn,user["company_id"],user["id"],"branch_stock.transferred","branch_stock_transfer",transfer_id,{"product_id":data.product_id,"from_branch_id":data.from_branch_id,"to_branch_id":data.to_branch_id,"quantity":milli_to_decimal(qty),"reason":data.reason})
     return {"transfer_id":transfer_id,"product_id":data.product_id,"quantity":milli_to_decimal(qty),"from_branch_id":data.from_branch_id,"to_branch_id":data.to_branch_id,"status":"completed","idempotent":False}
+
+@app.post("/v1/branches/{branch_id}/sales/{sale_id}/void")
+def void_branch_sale(branch_id: str,sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_permission(conn,user,"sales.void");require_branch_membership(conn,user,branch_id)
+    now=now_iso();rid=new_id()
+    with transaction(conn):
+        sale=conn.execute("SELECT * FROM branch_sales WHERE id=? AND company_id=? AND branch_id=?",(sale_id,user["company_id"],branch_id)).fetchone()
+        if not sale:raise HTTPException(404,"Venda não encontrada nesta filial.")
+        if sale["status"]!="paid":raise HTTPException(409,"Venda já cancelada ou não paga.")
+        events=conn.execute("SELECT amount_cents FROM branch_cash_events WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,sale["register_id"])).fetchall()
+        movements=conn.execute("SELECT amount_cents FROM branch_cash_movements WHERE company_id=? AND branch_id=? AND register_id=?",(user["company_id"],branch_id,sale["register_id"])).fetchall()
+        register=conn.execute("SELECT * FROM branch_cash_registers WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(sale["register_id"],user["company_id"],branch_id)).fetchone()
+        if not register:raise HTTPException(409,"É necessário caixa aberto nesta filial para registrar devolução em dinheiro.")
+        expected=register["opening_cents"]+sum(x[0] for x in events)+sum(x[0] for x in movements)
+        if expected<sale["total_cents"]:raise HTTPException(409,"Saldo insuficiente no caixa desta filial.")
+        lines=conn.execute("SELECT * FROM branch_sale_items WHERE sale_id=? AND company_id=? AND branch_id=?",(sale_id,user["company_id"],branch_id)).fetchall()
+        for line in lines:
+            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,line["product_id"])).fetchone()
+            before=int(row[0]) if row else 0;after=before+line["quantity_milli"]
+            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO UPDATE SET quantity_milli=excluded.quantity_milli,updated_at=excluded.updated_at",(user["company_id"],branch_id,line["product_id"],after,now))
+            conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'reversal',?,?,?,?,NULL,?)",(new_id(),user["company_id"],branch_id,line["product_id"],user["id"],line["quantity_milli"],before,after,"Cancelamento "+sale_id+": "+data.reason,now))
+        conn.execute("UPDATE branch_sales SET status='voided' WHERE id=? AND company_id=? AND branch_id=?",(sale_id,user["company_id"],branch_id))
+        conn.execute("INSERT INTO branch_cash_movements(id,company_id,branch_id,register_id,actor_id,kind,amount_cents,reason,sale_id,created_at) VALUES(?,?,?,?,?,'withdrawal',?,?,?,?)",(rid,user["company_id"],branch_id,register["id"],user["id"],-sale["total_cents"],"Estorno "+sale_id+": "+data.reason,sale_id,now))
+        conn.execute("INSERT INTO branch_sales_returns(id,company_id,branch_id,sale_id,actor_id,amount_cents,reason,created_at) VALUES(?,?,?,?,?,?,?,?)",(rid,user["company_id"],branch_id,sale_id,user["id"],sale["total_cents"],data.reason,now))
+        audit(conn,user["company_id"],user["id"],"branch_sale.voided","branch_sale",sale_id,{"branch_id":branch_id,"return_id":rid,"reason":data.reason,"amount":cents_to_money(sale["total_cents"])})
+    return {"id":sale_id,"branch_id":branch_id,"status":"voided","return_id":rid,"amount":cents_to_money(sale["total_cents"]),"refund_method":"cash_recorded_manual","note":"Devolução contabilizada no caixa da filial; entrega física do dinheiro é manual."}
 
 @app.get("/v1/company/permissions")
 def list_permissions(conn: DB,user: USER):
