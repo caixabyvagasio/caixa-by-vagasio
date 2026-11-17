@@ -339,6 +339,80 @@ def test_login_rate_limits_repeated_wrong_passwords(world, monkeypatch):
     assert statuses[8] == 429
 
 
+def test_branches_and_role_permissions_are_tenant_scoped_and_enforced(world):
+    owner=company(world);headers=auth(owner)
+    assert len(world.get('/v1/company/branches',headers=headers).json()['items'])==1
+    branch=world.post('/v1/company/branches',headers=headers,json={'code':'north','name':'Unidade Norte'})
+    assert branch.status_code==201
+    world.post('/v1/users',headers=headers,json={'full_name':'Operator','email':'operator@example.test','password':'secure-password-123','role':'operator'})
+    op=auth(world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'operator@example.test','password':'secure-password-123'}).json()['access_token'])
+    assert world.get('/v1/permissions/effective?permission=cash.manage',headers=op).json()['allowed'] is True
+    denied=world.put('/v1/company/permissions/role',headers=headers,json={'role':'operator','permission':'cash.manage','allowed':False})
+    assert denied.status_code==200
+    assert world.get('/v1/permissions/effective?permission=cash.manage',headers=op).json()['allowed'] is False
+    assert world.post('/v1/registers/open',headers=op,json={'label':'Caixa','opening_amount':'0'}).status_code==403
+    other=company(world,'Other','other','other@example.test')
+    assert len(world.get('/v1/company/branches',headers=auth(other)).json()['items'])==1
+
+
+def test_plans_pending_subscriptions_do_not_grant_entitlements(world,monkeypatch):
+    owner=company(world);monkeypatch.setattr(main,'BOOTSTRAP_SECRET','test-only-provisioning-secret-123456');h={'X-Bootstrap-Key':'test-only-provisioning-secret-123456'}
+    plan=world.post('/v1/master/plans',headers=h,json={'id':'core','name':'Core','included_modules':['sales','inventory'],'price':'0','billing_period':'monthly'})
+    assert plan.status_code==201,plan.text
+    company_id=world.get('/v1/me',headers=auth(owner)).json()['company_id']
+    assigned=world.post(f'/v1/master/companies/{company_id}/subscription',headers=h,json={'plan_id':'core'})
+    assert assigned.status_code==200 and assigned.json()['entitlements_enabled'] is False
+    current=world.get('/v1/company/commercial',headers=auth(owner)).json()
+    assert current['subscription']['status']=='pending' and current['entitlements']==[]
+    assert world.post('/v1/master/plans',headers=h,json={'id':'future','name':'Future','included_modules':['tables_tabs']}).status_code==422
+
+
+def test_restaurant_areas_tables_and_reservations_are_isolated_and_conflict_safe(world):
+    owner=company(world);headers=auth(owner)
+    saved=world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    assert saved.status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Salão'});assert area.status_code==201,area.text
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area.json()['id'],'label':'Mesa 1','capacity':4});assert table.status_code==201,table.text
+    reservation={'table_id':table.json()['id'],'customer_name':'Ana','party_size':3,'starts_at':'2026-11-20T19:00:00-03:00','ends_at':'2026-11-20T20:00:00-03:00'}
+    assert world.post('/v1/restaurant/reservations',headers=headers,json=reservation).status_code==201
+    assert world.post('/v1/restaurant/reservations',headers=headers,json={**reservation,'starts_at':'2026-11-20T19:30:00-03:00','ends_at':'2026-11-20T20:30:00-03:00'}).status_code==409
+    assert world.post('/v1/restaurant/reservations',headers=headers,json={**reservation,'party_size':5,'starts_at':'2026-11-20T21:00:00-03:00','ends_at':'2026-11-20T22:00:00-03:00'}).status_code==409
+    floor=world.get('/v1/restaurant/floor',headers=headers)
+    assert floor.status_code==200 and floor.json()['items'][0]['status']=='available'
+    other=company(world,'Other','other','other@example.test')
+    assert world.get('/v1/restaurant/floor',headers=auth(other)).status_code==409
+
+
+def test_restaurant_open_table_rejects_conflicting_occupation(world):
+    owner=company(world);headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Salão'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'Mesa 1','capacity':4}).json()
+    opened=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers)
+    assert opened.status_code==200
+    assert world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).status_code==409
+    assert world.get('/v1/restaurant/floor',headers=headers).json()['items'][0]['status']=='occupied'
+
+
+def test_partial_restaurant_floor_cannot_be_activated_as_complete_module(world):
+    owner=company(world);headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    assert world.post('/v1/company/modules/restaurant_floor/activate',headers=headers,json={'confirmed':True}).status_code==409
+
+
+def test_unimplemented_segment_module_is_never_activated(world):
+    owner=company(world);headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    response=world.post('/v1/company/modules/tables_tabs/activate',headers=headers,json={'confirmed':True})
+    assert response.status_code==409
+    state={x['id']:x for x in world.get('/v1/configuration/catalog',headers=headers).json()['features']}
+    assert state['tables_tabs']['status']=='NOT_IMPLEMENTED'
+
+
+def test_master_plans_require_bootstrap_secret(world):
+    assert world.get('/v1/master/plans').status_code==403
+
+
 def test_feature_catalog_marks_only_implemented_features_available(world):
     owner=company(world)
     catalog=world.get('/v1/configuration/catalog',headers=auth(owner)).json()
@@ -346,8 +420,9 @@ def test_feature_catalog_marks_only_implemented_features_available(world):
     assert {'sales','inventory','purchasing','customers','finance','reports','staff','profile_setup'} <= set(by_id)
     assert all(by_id[item]['available'] for item in main.IMPLEMENTED_FEATURES)
     assert all(by_id[item]['enabled'] for item in main.IMPLEMENTED_FEATURES)
-    assert by_id['barcode']['available'] and not by_id['barcode']['enabled']
+    assert not by_id['barcode']['available'] and not by_id['barcode']['enabled']
     assert by_id['tables_tabs']['status']=='NOT_IMPLEMENTED'
+    assert by_id['restaurant_floor']['available'] and not by_id['restaurant_floor']['enabled']
 
 
 def test_barcode_feature_auto_enables_only_when_requested_on_compatible_segment(world):
@@ -355,10 +430,10 @@ def test_barcode_feature_auto_enables_only_when_requested_on_compatible_segment(
     headers=auth(owner)
     world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
     restaurant={x['id']:x for x in world.get('/v1/configuration/catalog',headers=headers).json()['features']}
-    assert restaurant['barcode']['status']=='DISABLED' and restaurant['barcode']['enabled'] is False
+    assert restaurant['barcode']['status']=='NOT_IMPLEMENTED' and restaurant['barcode']['enabled'] is False
     world.put('/v1/company/profile',headers=headers,json={'primary_segment':'grocery','answers':{'barcode':True}})
     grocery={x['id']:x for x in world.get('/v1/configuration/catalog',headers=headers).json()['features']}
-    assert grocery['barcode']['status']=='REQUIRES_CONFIGURATION' and grocery['barcode']['enabled'] is False
+    assert grocery['barcode']['status']=='NOT_IMPLEMENTED' and grocery['barcode']['enabled'] is False
 
 
 def test_segment_catalog_and_profile_configuration_are_tenant_scoped_and_audited(world):
@@ -549,7 +624,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):

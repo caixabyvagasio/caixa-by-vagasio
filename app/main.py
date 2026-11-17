@@ -211,7 +211,8 @@ FEATURES = [
     ("barcode", "Leitura de código de barras", "Busca de produtos por código; hardware requer validação", "operations", ["grocery","retail"], []),
     ("weighed_items", "Produtos pesáveis", "Cadastro e venda por quantidade fracionada; balança não integrada", "operations", ["grocery"], []),
     ("expiry_control", "Validade e perecíveis", "Estrutura inicial para controle de validade", "inventory", ["grocery"], ["inventory"]),
-    ("tables_tabs", "Mesas e comandas", "Organização de atendimento; fluxo operacional ainda não incluído", "restaurant", ["restaurant"], ["sales"]),
+    ("tables_tabs", "Mesas e comandas", "Comandas, pedidos e divisão de contas ainda em implementação", "restaurant", ["restaurant"], ["sales"]),
+    ("restaurant_floor", "Ambientes, mesas e reservas", "Organize áreas e mesas, acompanhe ocupação e registre reservas com validação de capacidade e conflito", "restaurant", ["restaurant"], ["sales"]),
     ("delivery", "Delivery e retirada", "Opção de atendimento; integração externa não configurada", "restaurant", ["restaurant"], ["sales"]),
     ("kitchen", "Pedidos de preparo", "Preparação e cozinha; integração com impressoras pendente", "restaurant", ["restaurant"], ["sales"]),
     ("variants", "Tamanhos e cores", "Variações de produto; cadastro especializado ainda não incluído", "catalog", ["apparel"], ["inventory"]),
@@ -228,7 +229,7 @@ FEATURES = [
 ]
 
 IMPLEMENTED_FEATURES = {"sales", "inventory", "purchasing", "customers", "finance", "reports", "staff", "profile_setup"}
-AVAILABLE_FEATURES = IMPLEMENTED_FEATURES | {"barcode"}
+AVAILABLE_FEATURES = IMPLEMENTED_FEATURES | {"restaurant_floor"}
 
 def now_iso() -> str:
     # Keep deterministic ordering for sequential audit/profile events created within one second.
@@ -330,6 +331,7 @@ def apply_schema_migrations(conn) -> None:
     migration(2,"product_metadata",add_product_metadata)
     migration(3,"company_barcode_unique_index",add_barcode_index)
     migration(4,"backfill_legacy_paid_payables",backfill_paid_payables)
+    migration(5,"plans_branches_entitlements_permissions",lambda: None)
 
 
 def init_db() -> None:
@@ -480,6 +482,75 @@ def init_db() -> None:
             company_id TEXT PRIMARY KEY REFERENCES companies(id), primary_segment TEXT NOT NULL,
             secondary_segments_json TEXT NOT NULL, answers_json TEXT NOT NULL, modules_json TEXT NOT NULL,
             updated_by TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS branches (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), code TEXT NOT NULL, name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('active','inactive')), created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+            UNIQUE(company_id,code)
+        );
+        CREATE TABLE IF NOT EXISTS branch_users (
+            company_id TEXT NOT NULL REFERENCES companies(id), branch_id TEXT NOT NULL REFERENCES branches(id), user_id TEXT NOT NULL REFERENCES users(id),
+            PRIMARY KEY(company_id,branch_id,user_id)
+        );
+        CREATE TABLE IF NOT EXISTS plans (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('draft','active','retired')),
+            price_cents INTEGER, billing_period TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS plan_entitlements (
+            plan_id TEXT NOT NULL REFERENCES plans(id), module_id TEXT NOT NULL, included INTEGER NOT NULL CHECK(included IN (0,1)),
+            PRIMARY KEY(plan_id,module_id)
+        );
+        CREATE TABLE IF NOT EXISTS company_subscriptions (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), plan_id TEXT NOT NULL REFERENCES plans(id),
+            status TEXT NOT NULL CHECK(status IN ('pending','active','past_due','suspended','cancelled')), starts_at TEXT, ends_at TEXT,
+            created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS company_module_entitlements (
+            company_id TEXT NOT NULL REFERENCES companies(id), module_id TEXT NOT NULL,
+            source TEXT NOT NULL CHECK(source IN ('plan','addon','admin')), status TEXT NOT NULL CHECK(status IN ('granted','revoked')),
+            granted_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, PRIMARY KEY(company_id,module_id,source)
+        );
+        CREATE TABLE IF NOT EXISTS company_module_activations (
+            company_id TEXT NOT NULL REFERENCES companies(id), module_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('ENABLED','DISABLED','SUSPENDED')), activated_by TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL,
+            PRIMARY KEY(company_id,module_id)
+        );
+        CREATE TABLE IF NOT EXISTS role_permissions (
+            company_id TEXT NOT NULL REFERENCES companies(id), role TEXT NOT NULL, permission TEXT NOT NULL,
+            allowed INTEGER NOT NULL CHECK(allowed IN (0,1)), updated_by TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL,
+            PRIMARY KEY(company_id,role,permission)
+        );
+        CREATE TABLE IF NOT EXISTS user_permissions (
+            company_id TEXT NOT NULL REFERENCES companies(id), user_id TEXT NOT NULL REFERENCES users(id), permission TEXT NOT NULL,
+            allowed INTEGER NOT NULL CHECK(allowed IN (0,1)), updated_by TEXT NOT NULL REFERENCES users(id), updated_at TEXT NOT NULL,
+            PRIMARY KEY(company_id,user_id,permission)
+        );
+        CREATE TABLE IF NOT EXISTS module_events (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), module_id TEXT NOT NULL, status TEXT NOT NULL,
+            actor_id TEXT NOT NULL REFERENCES users(id), details_json TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_areas (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, UNIQUE(company_id,name)
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_tables (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), area_id TEXT NOT NULL REFERENCES restaurant_areas(id),
+            label TEXT NOT NULL, capacity INTEGER NOT NULL CHECK(capacity BETWEEN 1 AND 100),
+            status TEXT NOT NULL CHECK(status IN ('available','occupied','reserved','awaiting_payment')),
+            active INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, UNIQUE(company_id,label)
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_reservations (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), table_id TEXT NOT NULL REFERENCES restaurant_tables(id),
+            customer_name TEXT NOT NULL, party_size INTEGER NOT NULL CHECK(party_size BETWEEN 1 AND 100), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('confirmed','seated','cancelled','completed')),
+            created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, CHECK(ends_at>starts_at)
+        );
+        CREATE INDEX IF NOT EXISTS restaurant_reservation_overlap ON restaurant_reservations(company_id,table_id,status,starts_at,ends_at);
+        CREATE TABLE IF NOT EXISTS restaurant_services (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), table_id TEXT NOT NULL REFERENCES restaurant_tables(id),
+            status TEXT NOT NULL CHECK(status IN ('open','awaiting_payment','closed','cancelled')),
+            opened_by TEXT NOT NULL REFERENCES users(id), opened_at TEXT NOT NULL, closed_at TEXT,
+            UNIQUE(company_id,table_id,status)
         );
         CREATE TABLE IF NOT EXISTS company_profile_versions (
             id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
@@ -648,6 +719,42 @@ class CompanyProfileIn(StrictModel):
     primary_segment: str = Field(min_length=2, max_length=40)
     secondary_segments: list[str] = Field(default_factory=list, max_length=5)
     answers: dict[str, bool] = Field(default_factory=dict)
+
+
+class BranchCreateIn(StrictModel):
+    code: str = Field(min_length=1,max_length=24,pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2,max_length=120)
+
+class RestaurantAreaIn(StrictModel):
+    name: str = Field(min_length=2,max_length=80)
+class RestaurantTableIn(StrictModel):
+    area_id: str
+    label: str = Field(min_length=1,max_length=30)
+    capacity: int = Field(ge=1,le=100)
+class RestaurantReservationIn(StrictModel):
+    table_id: str
+    customer_name: str = Field(min_length=2,max_length=120)
+    party_size: int = Field(ge=1,le=100)
+    starts_at: str = Field(min_length=10,max_length=40)
+    ends_at: str = Field(min_length=10,max_length=40)
+class RolePermissionIn(StrictModel):
+    role: Literal["admin","manager","operator","stock"]
+    permission: str = Field(min_length=3,max_length=80)
+    allowed: bool
+class UserPermissionIn(StrictModel):
+    permission: str = Field(min_length=3,max_length=80)
+    allowed: bool
+class PlanCreateIn(StrictModel):
+    id: str = Field(min_length=2,max_length=40,pattern=r"^[a-z0-9_-]+$")
+    name: str = Field(min_length=2,max_length=100)
+    included_modules: list[str] = Field(default_factory=list,max_length=50)
+    price: Decimal | None = Field(default=None,ge=0,max_digits=12,decimal_places=2)
+    billing_period: Literal["monthly","annual"] | None = None
+class SubscriptionAssignIn(StrictModel):
+    plan_id: str
+    status: Literal["pending"] = "pending"
+    starts_at: str | None = None
+    ends_at: str | None = None
 
 
 class LoginIn(StrictModel):
@@ -910,9 +1017,24 @@ def current_user(credentials: Annotated[HTTPAuthorizationCredentials | None, Dep
 USER = Annotated[dict, Depends(current_user)]
 
 
+PERMISSION_CATALOG={"products.read":"Consultar produtos","products.write":"Gerenciar produtos","stock.adjust":"Ajustar estoque","sales.create":"Registrar vendas","sales.void":"Cancelar vendas","cash.manage":"Operar caixa","customers.read":"Consultar clientes","customers.write":"Gerenciar clientes","purchases.manage":"Gerenciar compras","finance.read":"Consultar financeiro","finance.write":"Gerenciar financeiro","users.manage":"Gerenciar acessos","profile.manage":"Configurar perfil","branches.manage":"Gerenciar filiais","modules.manage":"Gerenciar módulos","restaurant.floor":"Operar ambientes, mesas e reservas"}
+ROLE_PERMISSIONS={"owner":set(PERMISSION_CATALOG),"admin":set(PERMISSION_CATALOG)-{"branches.manage","modules.manage"},"manager":set(PERMISSION_CATALOG)-{"users.manage","branches.manage","modules.manage"},"operator":{"products.read","sales.create","cash.manage","customers.read","restaurant.floor"},"stock":{"products.read","products.write","stock.adjust","purchases.manage"}}
+MODULE_STATUSES={"sales":"ENABLED","inventory":"ENABLED","purchasing":"ENABLED","customers":"ENABLED","finance":"ENABLED","reports":"ENABLED","staff":"ENABLED","profile_setup":"ENABLED","restaurant_floor":"AVAILABLE","barcode":"NOT_IMPLEMENTED","weighed_items":"NOT_IMPLEMENTED","expiry_control":"NOT_IMPLEMENTED","tables_tabs":"NOT_IMPLEMENTED","delivery":"NOT_IMPLEMENTED","kitchen":"NOT_IMPLEMENTED","variants":"NOT_IMPLEMENTED","returns":"NOT_IMPLEMENTED","commissions":"NOT_IMPLEMENTED","appointments":"NOT_IMPLEMENTED","measurement_sales":"NOT_IMPLEMENTED","restaurant_floor":"AVAILABLE"}
+
 def require_role(user: dict, *roles: str) -> None:
     if user["role"] not in roles:
         raise HTTPException(403, "Seu perfil não permite esta operação.")
+
+
+def require_permission(conn,user,permission):
+    if permission not in PERMISSION_CATALOG: raise HTTPException(500,"Permissão não cadastrada.")
+    override=conn.execute("SELECT allowed FROM user_permissions WHERE company_id=? AND user_id=? AND permission=?",(user["company_id"],user["id"],permission)).fetchone()
+    if override is not None:
+        if not override[0]: raise HTTPException(403,"Seu acesso não permite esta ação.")
+        return
+    role=conn.execute("SELECT allowed FROM role_permissions WHERE company_id=? AND role=? AND permission=?",(user["company_id"],user["role"],permission)).fetchone()
+    allowed=bool(role[0]) if role is not None else permission in ROLE_PERMISSIONS.get(user["role"],set())
+    if not allowed: raise HTTPException(403,"Seu perfil não permite esta ação.")
 
 
 def company_product(conn: sqlite3.Connection, company_id: str, product_id: str) -> sqlite3.Row:
@@ -1038,6 +1160,9 @@ def register_company(data: BootstrapIn, request: Request, conn: DB):
                          (company_id, data.company_name.strip(), data.company_slug, created))
             conn.execute("INSERT INTO users VALUES(?,?,?,?,?,'owner',1,?)",
                          (user_id, company_id, data.email, data.owner_name.strip(), password_hash(data.password), created))
+            branch_id=new_id()
+            conn.execute("INSERT INTO branches(id,company_id,code,name,status,created_by,created_at) VALUES(?,?,'main','Matriz','active',?,?)",(branch_id,company_id,user_id,created))
+            conn.execute("INSERT INTO branch_users(company_id,branch_id,user_id) VALUES(?,?,?)",(company_id,branch_id,user_id))
             audit(conn, company_id, user_id, "company.self_registered", "company", company_id,
                   {"company_slug": data.company_slug, "actor_email": data.email})
             if profile:
@@ -1072,6 +1197,9 @@ def bootstrap(data: BootstrapIn, request: Request, conn: DB,
             conn.execute("INSERT INTO companies VALUES(?,?,?,'active',?)", (company_id, data.company_name.strip(), data.company_slug, created))
             conn.execute("INSERT INTO users VALUES(?,?,?,?,?,'owner',1,?)",
                          (user_id, company_id, data.email, data.owner_name.strip(), password_hash(data.password), created))
+            branch_id=new_id()
+            conn.execute("INSERT INTO branches(id,company_id,code,name,status,created_by,created_at) VALUES(?,?,'main','Matriz','active',?,?)",(branch_id,company_id,user_id,created))
+            conn.execute("INSERT INTO branch_users(company_id,branch_id,user_id) VALUES(?,?,?)",(company_id,branch_id,user_id))
             audit(conn, company_id, user_id, "company.bootstrap", "company", company_id,
                   {"company_slug": data.company_slug, "actor_email": data.email})
     except sqlite3.IntegrityError:
@@ -1099,24 +1227,54 @@ def login(data: LoginIn, request: Request, conn: DB):
 
 
 @app.get("/v1/configuration/catalog")
-def configuration_catalog(conn: DB, user: USER):
-    segments = conn.execute("SELECT * FROM segment_catalog WHERE active=1 ORDER BY name").fetchall()
-    all_features = conn.execute("SELECT * FROM feature_catalog ORDER BY category,name").fetchall()
-    profile = conn.execute("SELECT * FROM company_profiles WHERE company_id=?", (user["company_id"],)).fetchone()
-    selected_segments = ([profile["primary_segment"], *json.loads(profile["secondary_segments_json"])] if profile else [])
-    feature_rows = all_features
-    active_modules = set(json.loads(profile["modules_json"])) if profile else IMPLEMENTED_FEATURES
-    return {"segments": [{"id":r["id"],"name":r["name"],"questions":json.loads(r["questions_json"])} for r in segments],
-            "features": [{"id":r["id"],"name":r["name"],"description":r["description"],"category":r["category"],
-                          "recommended_segments":json.loads(r["recommended_segments_json"]),"dependencies":json.loads(r["dependencies_json"]),
-                          "available":bool(r["available"]),"enabled":bool(r["available"] and r["id"] in active_modules and ("*" in json.loads(r["recommended_segments_json"]) or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected_segments))),
-                          "status":("NOT_IMPLEMENTED" if not r["available"] else "ENABLED" if r["id"] in active_modules and ("*" in json.loads(r["recommended_segments_json"]) or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected_segments)) else "DISABLED" if selected_segments and not ("*" in json.loads(r["recommended_segments_json"]) or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected_segments)) else "REQUIRES_CONFIGURATION" if r["id"]=="barcode" else "AVAILABLE"),
-                          "required_plan":None,"plan_eligible":None if r["id"]=="barcode" else True} for r in feature_rows],
-            "profile": ({"primary_segment":profile["primary_segment"],
-                         "secondary_segments":json.loads(profile["secondary_segments_json"]),
-                         "answers":json.loads(profile["answers_json"]),"modules":json.loads(profile["modules_json"]),
-                         "updated_at":profile["updated_at"]} if profile else None),
-            "plan_entitlements": "not_configured", "activation_note": "Somente ferramentas disponíveis são ativadas; itens indisponíveis não aparecem no menu."}
+def configuration_catalog(conn: DB,user: USER):
+    segments=conn.execute("SELECT * FROM segment_catalog WHERE active=1 ORDER BY name").fetchall()
+    rows=conn.execute("SELECT * FROM feature_catalog ORDER BY category,name").fetchall()
+    profile=conn.execute("SELECT * FROM company_profiles WHERE company_id=?",(user["company_id"],)).fetchone()
+    selected=[profile["primary_segment"],*json.loads(profile["secondary_segments_json"])] if profile else []
+    profile_modules=set(json.loads(profile["modules_json"])) if profile else IMPLEMENTED_FEATURES
+    features=[]
+    for r in rows:
+        mid=r["id"];compatible="*" in json.loads(r["recommended_segments_json"]) or any(seg in json.loads(r["recommended_segments_json"]) for seg in selected)
+        enabled=bool(r["available"] and mid in profile_modules and compatible)
+        status="NOT_IMPLEMENTED" if not r["available"] else "ENABLED" if enabled else "DISABLED" if selected and not compatible else "REQUIRES_CONFIGURATION" if not selected else "AVAILABLE"
+        features.append({"id":mid,"name":r["name"],"description":r["description"],"category":r["category"],"recommended_segments":json.loads(r["recommended_segments_json"]),"dependencies":json.loads(r["dependencies_json"]),"available":bool(r["available"]),"enabled":enabled,"status":status,"required_plan":None,"plan_eligible":None})
+    return {"segments":[{"id":r["id"],"name":r["name"],"questions":json.loads(r["questions_json"])} for r in segments],"features":features,
+      "profile":{"primary_segment":profile["primary_segment"],"secondary_segments":json.loads(profile["secondary_segments_json"]),"answers":json.loads(profile["answers_json"]),"modules":json.loads(profile["modules_json"]),"updated_at":profile["updated_at"]} if profile else None,
+      "plan_entitlements":"configured" if conn.execute("SELECT 1 FROM company_subscriptions WHERE company_id=? LIMIT 1",(user["company_id"],)).fetchone() else "not_configured",
+      "activation_note":"Recursos sem implementação validada permanecem indisponíveis; assinaturas pendentes não concedem acesso."}
+
+class ModuleActivationIn(StrictModel):
+    confirmed: bool
+
+@app.post("/v1/company/modules/{module_id}/activate")
+def activate_module(module_id: str,data: ModuleActivationIn,conn: DB,user: USER):
+    require_role(user,"owner","admin")
+    if not data.confirmed: raise HTTPException(422,"Confirme a proposta de ativação.")
+    feature=conn.execute("SELECT * FROM feature_catalog WHERE id=?",(module_id,)).fetchone()
+    if not feature: raise HTTPException(404,"Módulo não encontrado.")
+    if not feature["available"] or MODULE_STATUSES.get(module_id)=="NOT_IMPLEMENTED": raise HTTPException(409,"Módulo ainda não está implementado.")
+    if module_id not in IMPLEMENTED_FEATURES: raise HTTPException(409,"Este módulo tem funcionalidades operacionais parciais e não é ativável para operação completa.")
+    profile=conn.execute("SELECT primary_segment,secondary_segments_json FROM company_profiles WHERE company_id=?",(user["company_id"],)).fetchone()
+    if not profile: raise HTTPException(409,"Configure o perfil do negócio primeiro.")
+    segments=[profile["primary_segment"],*json.loads(profile["secondary_segments_json"])]
+    recommended=json.loads(feature["recommended_segments_json"])
+    if "*" not in recommended and not any(x in recommended for x in segments): raise HTTPException(409,"Módulo incompatível com as atividades selecionadas.")
+    for dep in json.loads(feature["dependencies_json"]):
+        dep_row=conn.execute("SELECT available FROM feature_catalog WHERE id=?",(dep,)).fetchone()
+        if not dep_row or not dep_row["available"]: raise HTTPException(409,"Dependência técnica indisponível.")
+    sub=conn.execute("SELECT id,plan_id,status FROM company_subscriptions WHERE company_id=? ORDER BY created_at DESC LIMIT 1",(user["company_id"],)).fetchone()
+    entitlement=conn.execute("SELECT 1 FROM company_module_entitlements WHERE company_id=? AND module_id=? AND status='granted'",(user["company_id"],module_id)).fetchone()
+    plan_ok=bool(sub and sub["status"]=="active" and conn.execute("SELECT 1 FROM plan_entitlements WHERE plan_id=? AND module_id=? AND included=1",(sub["plan_id"],module_id)).fetchone())
+    if not entitlement and not plan_ok: raise HTTPException(402,"Plano ou adicional sem entitlement para este módulo.")
+    now=now_iso()
+    with transaction(conn):
+        prior=conn.execute("SELECT status FROM company_module_activations WHERE company_id=? AND module_id=?",(user["company_id"],module_id)).fetchone()
+        if prior and prior["status"]=="ENABLED": return {"module_id":module_id,"status":"ENABLED","idempotent":True}
+        conn.execute("INSERT INTO company_module_activations(company_id,module_id,status,activated_by,updated_at) VALUES(?,?,'ENABLED',?,?) ON CONFLICT(company_id,module_id) DO UPDATE SET status='ENABLED',activated_by=excluded.activated_by,updated_at=excluded.updated_at",(user["company_id"],module_id,user["id"],now))
+        conn.execute("INSERT INTO module_events VALUES(?,?,?,?,?,?,?)",(new_id(),user["company_id"],module_id,"ENABLED",user["id"],json.dumps({"confirmed":True,"segments":segments},sort_keys=True),now))
+        audit(conn,user["company_id"],user["id"],"module.activated","company_module",module_id,{"status":"ENABLED","subscription_id":sub["id"] if sub else None})
+    return {"module_id":module_id,"status":"ENABLED","updated_at":now,"idempotent":False}
 
 
 @app.get("/v1/company/profile/history")
@@ -1163,6 +1321,170 @@ def me(user: USER):
     return {"id": user["id"], "company_id": user["company_id"], "email": user["email"],
             "name": user["full_name"], "role": user["role"]}
 
+
+@app.get("/v1/company/branches")
+def list_branches(conn: DB,user: USER):
+    rows=conn.execute("SELECT b.id,b.code,b.name,b.status FROM branches b JOIN branch_users bu ON bu.branch_id=b.id AND bu.company_id=b.company_id WHERE b.company_id=? AND bu.user_id=? ORDER BY b.created_at",(user["company_id"],user["id"])).fetchall()
+    return {"items":[dict(r) for r in rows],"operational_data_partitioning":"not_implemented"}
+
+@app.post("/v1/company/branches",status_code=201)
+def create_branch(data: BranchCreateIn,conn: DB,user: USER):
+    require_role(user,"owner","admin")
+    branch_id,created=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO branches(id,company_id,code,name,status,created_by,created_at) VALUES(?,?,?,?,'active',?,?)",(branch_id,user["company_id"],data.code.lower(),data.name.strip(),user["id"],created))
+            conn.execute("INSERT INTO branch_users(company_id,branch_id,user_id) VALUES(?,?,?)",(user["company_id"],branch_id,user["id"]))
+            audit(conn,user["company_id"],user["id"],"branch.created","branch",branch_id,{"code":data.code.lower(),"name":data.name.strip()})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Já existe uma filial com esse código.")
+    return {"id":branch_id,"code":data.code.lower(),"name":data.name.strip(),"status":"active","operational_scope":"metadata_only"}
+
+@app.get("/v1/company/permissions")
+def list_permissions(conn: DB,user: USER):
+    require_role(user,"owner","admin")
+    rows=conn.execute("SELECT role,permission,allowed FROM role_permissions WHERE company_id=?",(user["company_id"],)).fetchall()
+    overrides={(r["role"],r["permission"]):bool(r["allowed"]) for r in rows}
+    return {"catalog":[{"id":k,"name":v} for k,v in PERMISSION_CATALOG.items()],"roles":{role:{perm:overrides.get((role,perm),perm in ROLE_PERMISSIONS.get(role,set())) for perm in PERMISSION_CATALOG} for role in sorted(ROLES)}}
+
+@app.get("/v1/permissions/effective")
+def effective_permission(conn: DB,user: USER,permission: str=Query(min_length=3,max_length=80)):
+    if permission not in PERMISSION_CATALOG: raise HTTPException(404,"Permissão desconhecida.")
+    override=conn.execute("SELECT allowed FROM user_permissions WHERE company_id=? AND user_id=? AND permission=?",(user["company_id"],user["id"],permission)).fetchone()
+    role=conn.execute("SELECT allowed FROM role_permissions WHERE company_id=? AND role=? AND permission=?",(user["company_id"],user["role"],permission)).fetchone()
+    allowed=bool(override[0]) if override is not None else bool(role[0]) if role is not None else permission in ROLE_PERMISSIONS.get(user["role"],set())
+    return {"permission":permission,"allowed":allowed,"source":"user" if override is not None else "role" if role is not None else "default"}
+
+@app.put("/v1/company/permissions/role")
+def set_role_permission(data: RolePermissionIn,conn: DB,user: USER):
+    require_role(user,"owner")
+    if data.permission not in PERMISSION_CATALOG: raise HTTPException(404,"Permissão desconhecida.")
+    now=now_iso()
+    with transaction(conn):
+        conn.execute("INSERT INTO role_permissions(company_id,role,permission,allowed,updated_by,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(company_id,role,permission) DO UPDATE SET allowed=excluded.allowed,updated_by=excluded.updated_by,updated_at=excluded.updated_at",(user["company_id"],data.role,data.permission,int(data.allowed),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"permission.role_updated","role_permission",data.role,{"permission":data.permission,"allowed":data.allowed})
+    return {"role":data.role,"permission":data.permission,"allowed":data.allowed,"updated_at":now}
+
+@app.put("/v1/users/{user_id}/permissions")
+def set_user_permission(user_id: str,data: UserPermissionIn,conn: DB,user: USER):
+    require_role(user,"owner")
+    if data.permission not in PERMISSION_CATALOG: raise HTTPException(404,"Permissão desconhecida.")
+    target=conn.execute("SELECT id,role FROM users WHERE id=? AND company_id=? AND active=1",(user_id,user["company_id"])).fetchone()
+    if not target: raise HTTPException(404,"Usuário não encontrado nesta empresa.")
+    if target["role"]=="owner": raise HTTPException(409,"Permissões do titular não podem ser sobrescritas.")
+    if data.allowed and data.permission not in ROLE_PERMISSIONS.get(target["role"],set()): raise HTTPException(409,"Permissão fora do perfil-base.")
+    now=now_iso()
+    with transaction(conn):
+        conn.execute("INSERT INTO user_permissions(company_id,user_id,permission,allowed,updated_by,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(company_id,user_id,permission) DO UPDATE SET allowed=excluded.allowed,updated_by=excluded.updated_by,updated_at=excluded.updated_at",(user["company_id"],user_id,data.permission,int(data.allowed),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"permission.user_updated","user_permission",user_id,{"permission":data.permission,"allowed":data.allowed})
+    return {"user_id":user_id,"permission":data.permission,"allowed":data.allowed,"updated_at":now}
+
+@app.get("/v1/master/plans")
+def master_list_plans(conn: DB,bootstrap_key: Annotated[str | None,Header(alias="X-Bootstrap-Key")]=None):
+    if not BOOTSTRAP_SECRET or not bootstrap_key or not hmac.compare_digest(bootstrap_key,BOOTSTRAP_SECRET): raise HTTPException(403,"Acesso administrativo não autorizado.")
+    rows=conn.execute("SELECT * FROM plans ORDER BY name").fetchall()
+    return {"items":[{"id":r["id"],"name":r["name"],"status":r["status"],"price":cents_to_money(r["price_cents"]) if r["price_cents"] is not None else None,"billing_period":r["billing_period"],"included_modules":[x[0] for x in conn.execute("SELECT module_id FROM plan_entitlements WHERE plan_id=? AND included=1",(r["id"],)).fetchall()]} for r in rows]}
+
+@app.post("/v1/master/plans",status_code=201)
+def master_create_plan(data: PlanCreateIn,conn: DB,bootstrap_key: Annotated[str | None,Header(alias="X-Bootstrap-Key")]=None):
+    if not BOOTSTRAP_SECRET or not bootstrap_key or not hmac.compare_digest(bootstrap_key,BOOTSTRAP_SECRET): raise HTTPException(403,"Acesso administrativo não autorizado.")
+    if any(m not in IMPLEMENTED_FEATURES for m in data.included_modules): raise HTTPException(422,"Plano não pode incluir módulos não implementados.")
+    now=now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO plans(id,name,status,price_cents,billing_period,created_at) VALUES(?,?,'active',?,?,?)",(data.id,data.name.strip(),decimal_money_cents(data.price) if data.price is not None else None,data.billing_period,now))
+            for mid in sorted(set(data.included_modules)): conn.execute("INSERT INTO plan_entitlements(plan_id,module_id,included) VALUES(?,?,1)",(data.id,mid))
+    except sqlite3.IntegrityError: raise HTTPException(409,"Plano já existe.")
+    return {"id":data.id,"name":data.name.strip(),"status":"active","included_modules":sorted(set(data.included_modules))}
+
+@app.post("/v1/master/companies/{company_id}/subscription")
+def master_assign_subscription(company_id: str,data: SubscriptionAssignIn,conn: DB,bootstrap_key: Annotated[str | None,Header(alias="X-Bootstrap-Key")]=None):
+    if not BOOTSTRAP_SECRET or not bootstrap_key or not hmac.compare_digest(bootstrap_key,BOOTSTRAP_SECRET): raise HTTPException(403,"Acesso administrativo não autorizado.")
+    if not conn.execute("SELECT 1 FROM companies WHERE id=?",(company_id,)).fetchone(): raise HTTPException(404,"Empresa não encontrada.")
+    if not conn.execute("SELECT 1 FROM plans WHERE id=? AND status='active'",(data.plan_id,)).fetchone(): raise HTTPException(404,"Plano ativo não encontrado.")
+    owner=conn.execute("SELECT id FROM users WHERE company_id=? AND role='owner' ORDER BY created_at LIMIT 1",(company_id,)).fetchone();sid,now=new_id(),now_iso()
+    with transaction(conn):
+        conn.execute("INSERT INTO company_subscriptions VALUES(?,?,?,?,?,?,?,?)",(sid,company_id,data.plan_id,"pending",data.starts_at,data.ends_at,owner["id"],now))
+        audit(conn,company_id,owner["id"],"subscription.pending","subscription",sid,{"plan_id":data.plan_id})
+    return {"id":sid,"plan_id":data.plan_id,"status":"pending","entitlements_enabled":False}
+
+def require_restaurant_floor(conn,user):
+    profile=conn.execute("SELECT primary_segment,secondary_segments_json FROM company_profiles WHERE company_id=?",(user["company_id"],)).fetchone()
+    if not profile or "restaurant" not in [profile["primary_segment"],*json.loads(profile["secondary_segments_json"])]:
+        raise HTTPException(409,"Inclua Restaurantes e lanchonetes no perfil do negócio.")
+    require_permission(conn,user,"restaurant.floor")
+    feat=conn.execute("SELECT available FROM feature_catalog WHERE id='restaurant_floor'").fetchone()
+    if not feat or not feat["available"]: raise HTTPException(409,"Módulo de salão indisponível.")
+
+@app.get("/v1/restaurant/areas")
+def restaurant_areas(conn: DB,user: USER):
+    require_restaurant_floor(conn,user)
+    rows=conn.execute("SELECT id,name,active FROM restaurant_areas WHERE company_id=? ORDER BY name",(user["company_id"],)).fetchall()
+    return {"items":[{"id":r["id"],"name":r["name"],"active":bool(r["active"])} for r in rows]}
+
+@app.get("/v1/restaurant/floor")
+def restaurant_floor(conn: DB,user: USER):
+    require_restaurant_floor(conn,user)
+    rows=conn.execute("SELECT t.id,t.label,t.capacity,t.status,a.name AS area FROM restaurant_tables t JOIN restaurant_areas a ON a.id=t.area_id WHERE t.company_id=? AND t.active=1 ORDER BY a.name,t.label",(user["company_id"],)).fetchall()
+    return {"items":[dict(r) for r in rows],"total":len(rows)}
+
+@app.post("/v1/restaurant/areas",status_code=201)
+def restaurant_create_area(data: RestaurantAreaIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user)
+    rid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO restaurant_areas VALUES(?,?,?,1,?,?)",(rid,user["company_id"],data.name.strip(),user["id"],now))
+            audit(conn,user["company_id"],user["id"],"restaurant.area_created","restaurant_area",rid,{"name":data.name.strip()})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Ambiente já cadastrado.")
+    return {"id":rid,"name":data.name.strip(),"active":True}
+
+@app.post("/v1/restaurant/tables",status_code=201)
+def restaurant_create_table(data: RestaurantTableIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user)
+    if not conn.execute("SELECT 1 FROM restaurant_areas WHERE id=? AND company_id=? AND active=1",(data.area_id,user["company_id"])).fetchone(): raise HTTPException(404,"Ambiente não encontrado.")
+    tid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO restaurant_tables VALUES(?,?,?,?,?,'available',1,?,?)",(tid,user["company_id"],data.area_id,data.label.strip(),data.capacity,user["id"],now))
+            audit(conn,user["company_id"],user["id"],"restaurant.table_created","restaurant_table",tid,{"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Mesa já cadastrada.")
+    return {"id":tid,"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity,"status":"available"}
+
+@app.post("/v1/restaurant/tables/{table_id}/open")
+def restaurant_open_table(table_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user)
+    sid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            table=conn.execute("SELECT status FROM restaurant_tables WHERE id=? AND company_id=? AND active=1",(table_id,user["company_id"])).fetchone()
+            if not table: raise HTTPException(404,"Mesa não encontrada.")
+            if table["status"]!='available': raise HTTPException(409,"Mesa não está livre.")
+            conn.execute("INSERT INTO restaurant_services VALUES(?,?,?,'open',?,?,NULL)",(sid,user["company_id"],table_id,user["id"],now))
+            updated=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND status='available'",(table_id,user["company_id"]))
+            if updated.rowcount!=1: raise HTTPException(409,"Mesa ocupada por outra operação.")
+            audit(conn,user["company_id"],user["id"],"restaurant.service_opened","restaurant_service",sid,{"table_id":table_id})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Já existe atendimento para essa mesa.")
+    return {"id":sid,"table_id":table_id,"status":"open","opened_at":now}
+
+@app.post("/v1/restaurant/reservations",status_code=201)
+def restaurant_reserve(data: RestaurantReservationIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user)
+    if data.ends_at<=data.starts_at: raise HTTPException(422,"Fim da reserva deve ser depois do início.")
+    table=conn.execute("SELECT capacity FROM restaurant_tables WHERE id=? AND company_id=? AND active=1",(data.table_id,user["company_id"])).fetchone()
+    if not table: raise HTTPException(404,"Mesa não encontrada.")
+    if data.party_size>table["capacity"]: raise HTTPException(409,"Grupo excede a capacidade da mesa.")
+    if conn.execute("SELECT 1 FROM restaurant_reservations WHERE company_id=? AND table_id=? AND status IN ('confirmed','seated') AND starts_at<? AND ends_at>?",(user["company_id"],data.table_id,data.ends_at,data.starts_at)).fetchone(): raise HTTPException(409,"Reserva conflitante.")
+    rid,now=new_id(),now_iso()
+    with transaction(conn):
+        conn.execute("INSERT INTO restaurant_reservations VALUES(?,?,?,?,?,?,?,'confirmed',?,?)",(rid,user["company_id"],data.table_id,data.customer_name.strip(),data.party_size,data.starts_at,data.ends_at,user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.reservation_created","restaurant_reservation",rid,{"table_id":data.table_id,"starts_at":data.starts_at,"ends_at":data.ends_at})
+    return {"id":rid,"table_id":data.table_id,"status":"confirmed","starts_at":data.starts_at,"ends_at":data.ends_at}
+
+@app.get("/v1/company/commercial")
+def company_commercial(conn: DB,user: USER):
+    sub=conn.execute("SELECT s.id,s.plan_id,s.status,s.starts_at,s.ends_at,p.name AS plan_name FROM company_subscriptions s JOIN plans p ON p.id=s.plan_id WHERE s.company_id=? ORDER BY s.created_at DESC LIMIT 1",(user["company_id"],)).fetchone()
+    rows=conn.execute("SELECT module_id,source,status FROM company_module_entitlements WHERE company_id=? ORDER BY module_id,source",(user["company_id"],)).fetchall()
+    return {"subscription":dict(sub) if sub else None,"entitlements":[dict(r) for r in rows],"commercial_configuration":"unassigned" if not sub else "assigned"}
 
 @app.get("/v1/users")
 def list_users(conn: DB, user: USER):
@@ -1213,6 +1535,7 @@ def customer_detail(customer_id: str,conn: DB,user: USER):
 @app.post("/v1/customers",status_code=201)
 def create_customer(data: CustomerIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator")
+    if user["role"]!="operator": require_permission(conn,user,"customers.write")
     if user["role"]=="operator" and any((data.email.strip(),data.phone.strip(),(data.tax_id or "").strip(),data.notes.strip())):
         raise HTTPException(403,"Operador pode cadastrar apenas o nome do cliente nesta versão.")
     customer_id,created=new_id(),now_iso()
@@ -1238,6 +1561,7 @@ def list_suppliers(conn: DB,user: USER,active: bool=True):
 @app.post("/v1/suppliers",status_code=201)
 def create_supplier(data: SupplierIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","stock")
+    require_permission(conn,user,"purchases.manage")
     supplier_id,created=new_id(),now_iso()
     try:
         with transaction(conn):
@@ -1251,6 +1575,7 @@ def create_supplier(data: SupplierIn,conn: DB,user: USER):
 @app.post("/v1/purchase-orders",status_code=201)
 def create_purchase_order(data: PurchaseCreateIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","stock")
+    require_permission(conn,user,"purchases.manage")
     order_id,created=new_id(),now_iso()
     try:
         with transaction(conn):
@@ -1336,6 +1661,7 @@ def record_payable_payment(payable_id: str,data: PayablePartialIn,request: Reque
 def create_expense(data: ExpenseIn,conn: DB,user: USER,
                    idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"finance.write")
     if not idempotency_key or not 1<=len(idempotency_key)<=128:
         raise HTTPException(400,"Envie Idempotency-Key para evitar duplicidade.")
     amount_cents=decimal_money_cents(data.amount)
@@ -1464,6 +1790,7 @@ def receive_purchase(order_id: str,data: PurchaseReceiveIn,request: Request,conn
 @app.post("/v1/products", status_code=201)
 def create_product(data: ProductIn, conn: DB, user: USER):
     require_role(user, "owner", "admin", "manager")
+    require_permission(conn,user,"products.write")
     product_id, created = new_id(), now_iso()
     try:
         with transaction(conn):
@@ -1542,6 +1869,7 @@ def low_stock_products(conn: DB, user: USER, limit: int = Query(default=100, ge=
 @app.post("/v1/products/{product_id}/stock-adjustments", status_code=201)
 def adjust_stock(product_id: str, data: StockAdjustmentIn, conn: DB, user: USER):
     require_role(user, "owner", "admin", "manager", "stock")
+    require_permission(conn,user,"stock.adjust")
     quantity = decimal_milli(data.quantity)
     movement_id, created = new_id(), now_iso()
     with transaction(conn):
@@ -1585,6 +1913,7 @@ def list_stock_movements(conn: DB, user: USER, limit: int = Query(default=100, g
 @app.post("/v1/registers/open", status_code=201)
 def open_register(data: RegisterOpenIn, conn: DB, user: USER):
     require_role(user, "owner", "admin", "manager", "operator")
+    require_permission(conn,user,"cash.manage")
     register_id, opened_at = new_id(), now_iso()
     try:
         with transaction(conn):
@@ -1654,6 +1983,7 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
                 idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
                 response: Response = None):
     require_role(user, "owner", "admin", "manager", "operator")
+    require_permission(conn,user,"sales.create")
     if not idempotency_key or len(idempotency_key) > 128:
         raise HTTPException(400, "Envie um Idempotency-Key único para evitar vendas duplicadas.")
     if any(line.discount > 0 for line in data.items) and user["role"] not in {"owner", "admin", "manager"}:
@@ -1732,6 +2062,7 @@ def create_sale(data: SaleIn, request: Request, conn: DB, user: USER,
 @app.post("/v1/sales/{sale_id}/void")
 def void_sale(sale_id: str,data: SaleVoidIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"sales.void")
     created=now_iso()
     with transaction(conn):
         sale=conn.execute("SELECT * FROM sales WHERE id=? AND company_id=?",(sale_id,user["company_id"])).fetchone()
