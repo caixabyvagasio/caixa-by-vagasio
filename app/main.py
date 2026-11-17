@@ -492,6 +492,17 @@ def apply_schema_migrations(conn) -> None:
                 conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_immutable_no_update BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT,'append-only record'); END")
                 conn.execute(f"CREATE TRIGGER IF NOT EXISTS {table}_immutable_no_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT,'append-only record'); END")
     migration(15,"branch_restaurant_orders_cash_ledger",create_branch_restaurant_order_ledger)
+    def create_waiter_portal():
+        # Separate job profile leaves the existing account role constraint untouched;
+        # middleware restricts these accounts to the dedicated waiter API only.
+        conn.execute("CREATE TABLE IF NOT EXISTS waiter_profiles(user_id TEXT PRIMARY KEY REFERENCES users(id),company_id TEXT NOT NULL REFERENCES companies(id),active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),created_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL)")
+        for table in ("restaurant_tables","restaurant_services","restaurant_tabs"):
+            cols={r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "waiter_id" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN waiter_id TEXT REFERENCES users(id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS restaurant_waiter_tables ON restaurant_tables(company_id,waiter_id,status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS restaurant_waiter_tabs ON restaurant_tabs(company_id,waiter_id,status,opened_at)")
+    migration(16,"restaurant_waiter_portal_and_assignments",create_waiter_portal)
 
 
 def init_db() -> None:
@@ -984,6 +995,19 @@ class RestaurantMenuItemIn(StrictModel):
     station: Literal["kitchen","bar","counter"] = "kitchen"
 class RestaurantTabIn(StrictModel):
     label: str = Field(min_length=1,max_length=40)
+class WaiterCreateIn(StrictModel):
+    full_name: str = Field(min_length=2,max_length=120)
+    email: str = Field(min_length=3,max_length=254)
+    password: str = Field(min_length=12,max_length=200)
+    @field_validator("email")
+    @classmethod
+    def normalize_waiter_email(cls,value):
+        value=value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",value): raise ValueError("Informe um e-mail válido")
+        return value
+class WaiterAssignIn(StrictModel):
+    waiter_id: str | None
+
 class RestaurantOrderLineIn(StrictModel):
     menu_item_id: str
     quantity: Decimal = Field(gt=0,max_digits=12,decimal_places=3)
@@ -1378,6 +1402,11 @@ def permission_for_endpoint(method: str, path: str):
         return "users.manage"
     if path.startswith("/v1/company/modules") or path.startswith("/v1/company/profile"):
         return "modules.manage" if "/modules/" in path else "profile.manage"
+    if path.startswith("/v1/waiter/"):
+        if path.endswith("/me"): return "restaurant.orders"
+        if path.endswith("/payments"): return "restaurant.cash"
+        if path.endswith("/delivered"): return "restaurant.production"
+        return "restaurant.orders"
     if path.startswith("/v1/restaurant/"):
         if "/menu" in path: return "restaurant.menu" if method!="GET" else "products.read"
         if "/payments" in path: return "restaurant.cash"
@@ -1423,7 +1452,10 @@ async def granular_permission_guard(request: Request, call_next):
                         raise HTTPException(401,"Sessão inválida ou usuário inativo.")
                     require_permission(conn,dict(row),permission)
                     company_user=dict(row)
-                    branch_exempt=(request.url.path in {"/v1/me","/v1/configuration/catalog","/v1/company/branches","/v1/company/commercial","/v1/permissions/effective","/v1/audit-events"} or request.url.path.startswith(("/v1/company/profile","/v1/company/modules","/v1/company/permissions","/v1/company/branches/","/v1/permissions/","/v1/users")))
+                    waiter_profile=conn.execute("SELECT active FROM waiter_profiles WHERE user_id=? AND company_id=?",(company_user["id"],company_user["company_id"])).fetchone()
+                    if waiter_profile and waiter_profile["active"] and request.url.path not in {"/v1/me"} and not request.url.path.startswith("/v1/waiter/"):
+                        raise HTTPException(403,"Este acesso está restrito ao portal do garçom.")
+                    branch_exempt=(request.url.path in {"/v1/me","/v1/configuration/catalog","/v1/company/branches","/v1/company/commercial","/v1/permissions/effective","/v1/audit-events"} or request.url.path.startswith(("/v1/company/profile","/v1/company/modules","/v1/company/permissions","/v1/company/branches/","/v1/permissions/","/v1/users","/v1/waiter/")))
                     if not branch_exempt and request.url.path.startswith("/v1/"):
                         active_branches=conn.execute("SELECT id FROM branches WHERE company_id=? AND status='active' ORDER BY created_at,id",(company_user["company_id"],)).fetchall()
                         requested_branch=request.headers.get("X-Branch-Id")
@@ -2348,6 +2380,112 @@ def branch_restaurant_reserve(branch_id: str,data: RestaurantReservationIn,conn:
     return {"id":rid,"branch_id":branch_id,"table_id":data.table_id,"status":"confirmed","starts_at":data.starts_at,"ends_at":data.ends_at}
 
 
+def require_waiter_single_branch(conn,user):
+    count=conn.execute("SELECT count(*) FROM branches WHERE company_id=? AND status='active'",(user["company_id"],)).fetchone()[0]
+    if count>1: raise HTTPException(409,"Cadastro e operação de garçons por filial ainda não estão particionados. Multi-filial permanece bloqueado.")
+
+def waiter_account(conn,user):
+    row=conn.execute("SELECT active FROM waiter_profiles WHERE user_id=? AND company_id=?",(user["id"],user["company_id"])).fetchone()
+    if not row or not row["active"]: raise HTTPException(403,"Este acesso não está configurado como garçom.")
+    require_restaurant_floor(conn,user)
+    require_waiter_single_branch(conn,user)
+
+def require_assigned_tab(conn,user,tab_id):
+    tab=conn.execute("SELECT t.id,t.service_id,t.label,t.status FROM restaurant_tabs t WHERE t.id=? AND t.company_id=? AND t.waiter_id=?",(tab_id,user["company_id"],user["id"])).fetchone()
+    if not tab: raise HTTPException(404,"Comanda não atribuída a este garçom.")
+    return tab
+
+@app.get("/v1/restaurant/waiters")
+def restaurant_waiters(conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_waiter_single_branch(conn,user)
+    rows=conn.execute("SELECT u.id,u.full_name,u.email,u.active FROM waiter_profiles w JOIN users u ON u.id=w.user_id AND u.company_id=w.company_id WHERE w.company_id=? AND w.active=1 AND u.active=1 ORDER BY u.full_name",(user["company_id"],)).fetchall()
+    return {"items":[{"id":r["id"],"name":r["full_name"],"email":r["email"],"active":bool(r["active"])} for r in rows]}
+
+@app.post("/v1/restaurant/waiters",status_code=201)
+def restaurant_create_waiter(data: WaiterCreateIn,conn: DB,user: USER):
+    require_role(user,"owner","admin");require_permission(conn,user,"users.manage");require_restaurant_floor(conn,user);require_waiter_single_branch(conn,user)
+    uid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO users(id,company_id,email,full_name,password_hash,role,active,created_at) VALUES(?,?,?,?,?,'operator',1,?)",(uid,user["company_id"],data.email,data.full_name.strip(),password_hash(data.password),now))
+            conn.execute("INSERT INTO waiter_profiles(user_id,company_id,active,created_by,created_at) VALUES(?,?,1,?,?)",(uid,user["company_id"],user["id"],now))
+            branch=conn.execute("SELECT id FROM branches WHERE company_id=? AND code='main' AND status='active'",(user["company_id"],)).fetchone()
+            if branch: conn.execute("INSERT INTO branch_users(company_id,branch_id,user_id) VALUES(?,?,?)",(user["company_id"],branch["id"],uid))
+            audit(conn,user["company_id"],user["id"],"restaurant.waiter_created","user",uid,{"role":"waiter","email":data.email})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Já existe um usuário com esse e-mail nesta empresa.")
+    return {"id":uid,"name":data.full_name.strip(),"email":data.email,"position":"waiter","active":True,"login_role":"operator"}
+
+@app.put("/v1/restaurant/tables/{table_id}/waiter")
+def restaurant_assign_table_waiter(table_id: str,data: WaiterAssignIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_waiter_single_branch(conn,user)
+    if data.waiter_id and not conn.execute("SELECT 1 FROM waiter_profiles w JOIN users u ON u.id=w.user_id AND u.company_id=w.company_id WHERE w.company_id=? AND w.user_id=? AND w.active=1 AND u.active=1",(user["company_id"],data.waiter_id)).fetchone(): raise HTTPException(404,"Garçom ativo não encontrado nesta empresa.")
+    with transaction(conn):
+        table=conn.execute("SELECT id FROM restaurant_tables WHERE id=? AND company_id=? AND active=1",(table_id,user["company_id"])).fetchone()
+        if not table: raise HTTPException(404,"Mesa não encontrada.")
+        conn.execute("UPDATE restaurant_tables SET waiter_id=? WHERE id=? AND company_id=?",(data.waiter_id,table_id,user["company_id"]))
+        conn.execute("UPDATE restaurant_services SET waiter_id=? WHERE table_id=? AND company_id=? AND status='open'",(data.waiter_id,table_id,user["company_id"]))
+        conn.execute("UPDATE restaurant_tabs SET waiter_id=? WHERE service_id IN (SELECT id FROM restaurant_services WHERE table_id=? AND company_id=? AND status='open') AND company_id=? AND status='open'",(data.waiter_id,table_id,user["company_id"],user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"restaurant.table_waiter_assigned","restaurant_table",table_id,{"waiter_id":data.waiter_id})
+    return {"table_id":table_id,"waiter_id":data.waiter_id}
+
+@app.get("/v1/waiter/me")
+def waiter_me(conn: DB,user: USER):
+    waiter_account(conn,user)
+    return {"waiter":True,"user_id":user["id"],"name":user["full_name"],"company_id":user["company_id"]}
+
+@app.get("/v1/waiter/floor")
+def waiter_floor(conn: DB,user: USER):
+    waiter_account(conn,user)
+    rows=conn.execute("SELECT t.id,t.label,t.capacity,t.status,t.waiter_id,a.name AS area,s.id AS service_id FROM restaurant_tables t JOIN restaurant_areas a ON a.id=t.area_id AND a.company_id=t.company_id LEFT JOIN restaurant_services s ON s.table_id=t.id AND s.company_id=t.company_id AND s.status='open' WHERE t.company_id=? AND t.active=1 AND t.waiter_id=? ORDER BY a.name,t.label",(user["company_id"],user["id"])).fetchall()
+    tabs=conn.execute("SELECT t.id,t.label,t.status,t.opened_at,s.table_id,rt.label AS table_label,a.name AS area FROM restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id JOIN restaurant_tables rt ON rt.id=s.table_id AND rt.company_id=s.company_id JOIN restaurant_areas a ON a.id=rt.area_id AND a.company_id=rt.company_id WHERE t.company_id=? AND t.waiter_id=? AND t.status='open' ORDER BY t.opened_at DESC",(user["company_id"],user["id"])).fetchall()
+    return {"tables":[dict(r) for r in rows],"tabs":[dict(r) for r in tabs]}
+
+@app.get("/v1/waiter/menu")
+def waiter_menu(conn: DB,user: USER):
+    waiter_account(conn,user);return restaurant_menu(conn,user)
+
+@app.post("/v1/waiter/tabs/{tab_id}/payments",status_code=201)
+def waiter_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: DB,user: USER,response: Response):
+    waiter_account(conn,user);require_assigned_tab(conn,user,tab_id)
+    return restaurant_tab_cash_payment(tab_id,data,conn,user)
+
+@app.get("/v1/waiter/tabs/{tab_id}")
+def waiter_tab_detail(tab_id: str,conn: DB,user: USER):
+    waiter_account(conn,user);require_assigned_tab(conn,user,tab_id);return restaurant_tab_detail(tab_id,conn,user)
+
+@app.post("/v1/waiter/tables/{table_id}/open")
+def waiter_open_table(table_id: str,conn: DB,user: USER):
+    waiter_account(conn,user)
+    if not conn.execute("SELECT 1 FROM restaurant_tables WHERE id=? AND company_id=? AND waiter_id=? AND status='available' AND active=1",(table_id,user["company_id"],user["id"])).fetchone(): raise HTTPException(409,"Mesa livre e atribuída a você não encontrada.")
+    return restaurant_open_table(table_id,conn,user)
+
+@app.post("/v1/waiter/services/{service_id}/tabs",status_code=201)
+def waiter_open_tab(service_id: str,conn: DB,user: USER):
+    waiter_account(conn,user)
+    service=conn.execute("SELECT s.id,t.label FROM restaurant_services s JOIN restaurant_tables t ON t.id=s.table_id AND t.company_id=s.company_id WHERE s.id=? AND s.company_id=? AND s.waiter_id=? AND s.status='open'",(service_id,user["company_id"],user["id"])).fetchone()
+    if not service: raise HTTPException(404,"Atendimento não atribuído a você.")
+    label=f"{service['label']} · {service['id'][:6]}"
+    return restaurant_create_tab(service_id,RestaurantTabIn(label=label),conn,user)
+
+@app.post("/v1/waiter/tabs/{tab_id}/orders",status_code=201)
+def waiter_create_order(tab_id: str,data: RestaurantOrderIn,conn: DB,user: USER):
+    waiter_account(conn,user);require_assigned_tab(conn,user,tab_id)
+    return restaurant_create_order(tab_id,data,conn,user)
+
+@app.patch("/v1/waiter/order-items/{item_id}/delivered")
+def waiter_deliver_item(item_id: str,conn: DB,user: USER):
+    waiter_account(conn,user)
+    row=conn.execute("SELECT i.id FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE i.id=? AND i.company_id=? AND t.waiter_id=?",(item_id,user["company_id"],user["id"])).fetchone()
+    if not row: raise HTTPException(404,"Item não pertence às suas comandas.")
+    return restaurant_update_item(item_id,RestaurantItemStatusIn(status="delivered"),conn,user)
+
+@app.post("/v1/waiter/orders/{order_id}/send")
+def waiter_send_order(order_id: str,conn: DB,user: USER):
+    waiter_account(conn,user)
+    order=conn.execute("SELECT o.tab_id FROM restaurant_orders o JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE o.id=? AND o.company_id=? AND t.waiter_id=?",(order_id,user["company_id"],user["id"])).fetchone()
+    if not order: raise HTTPException(404,"Pedido não atribuído a você.")
+    return restaurant_send_order(order_id,conn,user)
+
 @app.get("/v1/restaurant/areas")
 def restaurant_areas(conn: DB,user: USER):
     require_restaurant_floor(conn,user)
@@ -2392,7 +2530,7 @@ def restaurant_open_table(table_id: str,conn: DB,user: USER):
             table=conn.execute("SELECT status FROM restaurant_tables WHERE id=? AND company_id=? AND active=1",(table_id,user["company_id"])).fetchone()
             if not table: raise HTTPException(404,"Mesa não encontrada.")
             if table["status"]!='available': raise HTTPException(409,"Mesa não está livre.")
-            conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at) VALUES(?,?,?,'open',?,?,NULL)",(sid,user["company_id"],table_id,user["id"],now))
+            conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at,waiter_id) SELECT ?,company_id,id,'open',?,?,NULL,waiter_id FROM restaurant_tables WHERE id=? AND company_id=?",(sid,user["id"],now,table_id,user["company_id"]))
             updated=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND status='available'",(table_id,user["company_id"]))
             if updated.rowcount!=1: raise HTTPException(409,"Mesa ocupada por outra operação.")
             audit(conn,user["company_id"],user["id"],"restaurant.service_opened","restaurant_service",sid,{"table_id":table_id})
@@ -2462,7 +2600,7 @@ def restaurant_create_tab(service_id: str,data: RestaurantTabIn,conn: DB,user: U
     tid,now=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO restaurant_tabs(id,company_id,service_id,label,status,opened_by,opened_at,closed_at) VALUES(?,?,?,?,'open',?,?,NULL)",(tid,user["company_id"],service_id,data.label.strip(),user["id"],now))
+            conn.execute("INSERT INTO restaurant_tabs(id,company_id,service_id,label,status,opened_by,opened_at,closed_at,waiter_id) SELECT ?,company_id,id,?,'open',?,?,NULL,waiter_id FROM restaurant_services WHERE id=? AND company_id=?",(tid,data.label.strip(),user["id"],now,service_id,user["company_id"]))
             audit(conn,user["company_id"],user["id"],"restaurant.tab_opened","restaurant_tab",tid,{"service_id":service_id,"label":data.label.strip()})
     except sqlite3.IntegrityError: raise HTTPException(409,"Comanda já existe para este atendimento ou nome repetido.")
     return {"id":tid,"service_id":service_id,"label":data.label.strip(),"status":"open"}
