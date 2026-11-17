@@ -25,3 +25,8 @@ def test_mobile_breakpoints_and_security_headers_present():
     app=(ROOT/"app/main.py").read_text()
     for header in ['X-Content-Type-Options','X-Frame-Options','Content-Security-Policy','Cache-Control']:
         assert header in app
+
+
+def test_public_environment_bootstrap_is_async_before_await():
+    assert "async function loadPublicEnvironment(){try{const r=await fetch('/health'" in JS
+
