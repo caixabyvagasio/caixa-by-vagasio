@@ -722,7 +722,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_orders_cash_ledger')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1392,4 +1392,44 @@ def test_branch_restaurant_menu_isolated_by_filial_and_legacy_menu_excluded(worl
         old_cat=conn.execute('SELECT branch_id FROM restaurant_menu_categories WHERE id=?',(legacy_cat.json()['id'],)).fetchone()
         old_item=conn.execute('SELECT branch_id FROM restaurant_menu_items WHERE id=?',(legacy_link.json()['id'],)).fetchone()
         assert old_cat['branch_id'] is None and old_item['branch_id'] is None
+    finally:conn.close()
+
+
+def test_branch_restaurant_order_production_cash_close_and_branch_ledgers(world):
+    token=company(world,"Restaurant order", "restaurant-order", "order@restaurant.test");headers=auth(token)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branches=world.get('/v1/company/branches',headers=headers).json()['items'];branch=branches[0]['id']
+    second=world.post('/v1/company/branches',headers=headers,json={'code':'other-order','name':'Outra filial'}).json()['id']
+    uid=world.get('/v1/me',headers=headers).json()['id'];assert world.put(f'/v1/company/branches/{second}/users',headers=headers,json={'user_ids':[uid]}).status_code==200
+    prod=product(world,token,sku='BR-PLATE',name='Prato branch',price='12.50')
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Salão'}).json()
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'M1','capacity':4}).json()
+    assert world.post(f'/v1/branches/{branch}/inventory/{prod["id"]}/adjustments',headers=headers,json={'direction':'in','quantity':'5','reason':'Estoque cozinha'}).status_code==201
+    assert world.post(f'/v1/branches/{branch}/registers/open',headers=headers,json={'label':'Caixa 1','opening_amount':'10'}).status_code==201
+    service=world.post(f'/v1/branches/{branch}/restaurant/tables/{table["id"]}/open',headers=headers).json()
+    tab=world.post(f'/v1/branches/{branch}/restaurant/services/{service["id"]}/tabs',headers=headers,json={'label':'Mesa 1'});assert tab.status_code==201,tab.text
+    category=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Pratos'}).json()
+    menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':prod['id'],'station':'kitchen'});assert menu.status_code==201,menu.text
+    order=world.post(f'/v1/branches/{branch}/restaurant/tabs/{tab.json()["id"]}/orders',headers=headers,json={'items':[{'menu_item_id':menu.json()['id'],'quantity':'2'}]});assert order.status_code==201,order.text
+    assert world.post(f'/v1/branches/{second}/restaurant/tabs/{tab.json()["id"]}/orders',headers=headers,json={'items':[{'menu_item_id':menu.json()['id'],'quantity':'1'}]}).status_code==404
+    assert world.post(f'/v1/branches/{branch}/restaurant/orders/{order.json()["id"]}/send',headers=headers).status_code==200
+    prodq=world.get(f'/v1/branches/{branch}/restaurant/production?station=kitchen',headers=headers).json();assert len(prodq['items'])==1
+    item_id=prodq['items'][0]['id']
+    for status in ('preparing','ready','delivered'):
+        r=world.patch(f'/v1/branches/{branch}/restaurant/order-items/{item_id}',headers=headers,json={'status':status});assert r.status_code==200,r.text
+    tabid=tab.json()['id'];detail=world.get(f'/v1/branches/{branch}/restaurant/tabs/{tabid}',headers=headers).json();assert detail['total']=='25.00'
+    paid=world.post(f'/v1/branches/{branch}/restaurant/tabs/{tabid}/payments',headers=headers,json={'amount':'25','received_amount':'30','idempotency_key':'branch-rest-pay-01'});assert paid.status_code==201,paid.text;assert paid.json()['change']=='5.00'
+    replay=world.post(f'/v1/branches/{branch}/restaurant/tabs/{tabid}/payments',headers=headers,json={'amount':'25','received_amount':'30','idempotency_key':'branch-rest-pay-01'});assert replay.status_code==200 and replay.json()['idempotent'] is True
+    assert world.get(f'/v1/branches/{branch}/inventory',headers=headers).json()['items'][0]['quantity']=='3'
+    assert world.get(f'/v1/branches/{second}/inventory',headers=headers).json()['items'][0]['quantity']=='0'
+    assert world.get(f'/v1/branches/{branch}/registers/current',headers=headers).json()['expected_amount']=='35.00'
+    assert world.get(f'/v1/branches/{second}/registers/current',headers=headers).json()['register'] is None
+    assert world.get(f'/v1/branches/{branch}/sales',headers=headers).json()['items'][0]['total']=='25.00'
+    assert world.get(f'/v1/branches/{branch}/restaurant/tabs?status=all',headers=headers).json()['items'][0]['status']=='closed'
+    report=world.get(f'/v1/branches/{branch}/restaurant/reports/operations',headers=headers);assert report.status_code==200 and report.json()['cash_received']=='25.00'
+    conn=main.connect_db()
+    try:
+        company_id=world.get('/v1/me',headers=headers).json()['company_id']
+        assert conn.execute('SELECT COUNT(*) FROM sales WHERE company_id=?',(company_id,)).fetchone()[0]==0
+        assert conn.execute('SELECT COUNT(*) FROM branch_sales WHERE branch_id=?',(branch,)).fetchone()[0]==1
     finally:conn.close()
