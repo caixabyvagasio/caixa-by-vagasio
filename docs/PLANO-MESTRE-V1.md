@@ -89,7 +89,8 @@
 | 2026-11-17 13:21 | `fb28c5551a87d2139a0763069525127f59a4f867` | Transfer lock fix + parallel transfer/overdraw tests locais. | Rodar CI e publicar dev apenas após passar. |
 | 2026-11-17 13:30 | `e1f2a137278c75fa54bd22a59134155326367de1` | Transfer fix CI general+Postgres success; dev `dep-dbu80jl9fdbs73dv4r0g` live. | Seguir para receipts/void locks. |
 | 2026-11-17 13:30 | `55378c69368872a01d77ebef13708070cd7a0d23` | Receipts lock fix CI general+Postgres success; dev `dep-dbu84959fdbs73dvhbvg` live. Local concurrent receipt test verified. | Implement and test same-sale concurrent void lock. |
-| 2026-11-17 13:30 | `55378c69368872a01d77ebef13708070cd7a0d23` | Voids same-sale lock + eight duplicate concurrent attempt tests added; focused 2/2, full local 103/1. No CI/deploy of void fix yet. | Run CI PostgreSQL for receipt + void concurrency patches. |
+| 2026-11-17 13:30 | `55378c69368872a01d77ebef13708070cd7a0d23` | Voids same-sale lock + concurrent test locally green, prior to CI. | CI and publish dev. |
+| 2026-11-17 13:30 | `f17b1541dd55a19a2ffb0db6a7ab127c6ee79153` | Receipt and void locks passed general/Postgres CI (`44128071984`, `44128095176`, `44128072464`); dev deploy `dep-dbu879mi0phs739215gg` live; health Postgres. Full local 103/1. | Continue concurrency audit for register operations, order status/branch restaurant lifecycle, legacy stock path. |
 
 ## Work log / checkpoints
 
