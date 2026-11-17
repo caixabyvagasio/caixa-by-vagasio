@@ -473,12 +473,23 @@ def test_simultaneous_open_table_requests_only_create_one_service(world):
     world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
     area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Única'}).json()
     table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'Única','capacity':2}).json()
-    def open_once(): return world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers)
-    with ThreadPoolExecutor(max_workers=4) as pool: responses=list(pool.map(lambda _:open_once(),range(4)))
-    assert sum(r.status_code==200 for r in responses)==1
-    assert all(r.status_code in (200,409) for r in responses)
+    me=world.get('/v1/me',headers=headers).json()
     conn=main.connect_db()
-    try: assert conn.execute("SELECT count(*) FROM restaurant_services WHERE company_id=? AND table_id=? AND status='open'",(world.get('/v1/me',headers=headers).json()['company_id'],table['id'])).fetchone()[0]==1
+    try: user=dict(conn.execute("SELECT u.id,u.company_id,u.email,u.full_name,u.role,u.active,c.status AS company_status FROM users u JOIN companies c ON c.id=u.company_id WHERE u.id=?",(me['id'],)).fetchone())
+    finally: conn.close()
+    def open_once(_):
+        connection=main.connect_db()
+        try:
+            main.restaurant_open_table(table['id'],connection,user)
+            return 200
+        except main.HTTPException as e:
+            return e.status_code
+        finally: connection.close()
+    with ThreadPoolExecutor(max_workers=4) as pool: responses=list(pool.map(open_once,range(4)))
+    assert responses.count(200)==1
+    assert all(code in (200,409) for code in responses)
+    conn=main.connect_db()
+    try: assert conn.execute("SELECT count(*) FROM restaurant_services WHERE company_id=? AND table_id=? AND status='open'",(me['company_id'],table['id'])).fetchone()[0]==1
     finally: conn.close()
 
 

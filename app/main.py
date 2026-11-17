@@ -1538,7 +1538,7 @@ def restaurant_open_table(table_id: str,conn: DB,user: USER):
             audit(conn,user["company_id"],user["id"],"restaurant.service_opened","restaurant_service",sid,{"table_id":table_id})
     except sqlite3.IntegrityError: raise HTTPException(409,"Já existe atendimento para essa mesa.")
     except Exception as exc:
-        if getattr(exc,"pgcode",None)=="40001": raise HTTPException(409,"A mesa foi ocupada por outra operação concorrente; atualize o salão.")
+        if getattr(exc,"pgcode",None) in {"40001","40P01"}: raise HTTPException(409,"A mesa foi ocupada por outra operação concorrente; atualize o salão.")
         raise
     return {"id":sid,"table_id":table_id,"status":"open","opened_at":now}
 
