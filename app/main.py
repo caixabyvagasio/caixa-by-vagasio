@@ -2980,7 +2980,8 @@ def create_branch_expense(branch_id: str,data: ExpenseIn,conn: DB,user: USER,ide
     if data.payment_date and data.payment_date>date.today():raise HTTPException(422,"Data de pagamento não pode ser futura.")
     body={"branch_id":branch_id,"description":data.description.strip(),"amount":cents,"due_date":data.due_date.isoformat(),"cost_center":data.cost_center.strip(),"payment_date":data.payment_date.isoformat() if data.payment_date else None,"payment_reference":data.payment_reference.strip()}
     digest=hashlib.sha256(json.dumps(body,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest();pid,now=new_id(),now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        if is_postgres(conn): conn.execute("SELECT id FROM companies WHERE id=? FOR UPDATE",(user["company_id"],)).fetchone()
         prior=conn.execute("SELECT ed.payable_id,ed.request_hash,ap.status,ap.amount_cents,ap.due_date FROM payable_expense_details ed JOIN accounts_payable ap ON ap.id=ed.payable_id AND ap.company_id=ed.company_id WHERE ed.company_id=? AND ed.idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
         if prior:
             if prior["request_hash"]!=digest:raise HTTPException(409,"Idempotency-Key reutilizada com outros dados.")
@@ -3134,7 +3135,8 @@ def create_expense(data: ExpenseIn,conn: DB,user: USER,
     normalized={"description":data.description,"amount":amount_cents,"due_date":data.due_date.isoformat(),"cost_center":data.cost_center,"payment_date":data.payment_date.isoformat() if data.payment_date else None,"payment_reference":data.payment_reference}
     request_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
     payable_id,created=new_id(),now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        if is_postgres(conn): conn.execute("SELECT id FROM companies WHERE id=? FOR UPDATE",(user["company_id"],)).fetchone()
         prior=conn.execute("SELECT ed.payable_id,ed.request_hash,ap.status,ap.amount_cents,ap.due_date,ed.cost_center FROM payable_expense_details ed JOIN accounts_payable ap ON ap.id=ed.payable_id AND ap.company_id=ed.company_id WHERE ed.company_id=? AND ed.idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
         if prior:
             if prior["request_hash"]!=request_hash: raise HTTPException(409,"Chave de idempotência reutilizada com dados diferentes.")
