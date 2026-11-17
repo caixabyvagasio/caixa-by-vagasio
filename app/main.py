@@ -1537,6 +1537,9 @@ def restaurant_open_table(table_id: str,conn: DB,user: USER):
             if updated.rowcount!=1: raise HTTPException(409,"Mesa ocupada por outra operação.")
             audit(conn,user["company_id"],user["id"],"restaurant.service_opened","restaurant_service",sid,{"table_id":table_id})
     except sqlite3.IntegrityError: raise HTTPException(409,"Já existe atendimento para essa mesa.")
+    except Exception as exc:
+        if getattr(exc,"pgcode",None)=="40001": raise HTTPException(409,"A mesa foi ocupada por outra operação concorrente; atualize o salão.")
+        raise
     return {"id":sid,"table_id":table_id,"status":"open","opened_at":now}
 
 @app.get("/v1/restaurant/reservations")

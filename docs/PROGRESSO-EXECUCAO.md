@@ -69,3 +69,4 @@
 - Adicionado GET `/v1/restaurant/reservations` com filtro e escopo tenant; UI lista reservas confirmadas em salão.
 - Teste concorrente de 4 tentativas de abertura de uma mesa espera uma única resposta 200, demais 409 e uma linha de serviço aberta. Suíte local resultante: 66 passed, 1 skipped. PostgreSQL test deverá ser refeito no CI após commit.
 - Esse ajuste ainda está apenas no worktree desta continuação: pendente commit/CI/deploy. Interface ainda usa prompts para parte dos pedidos e pagamentos. Esta reserva/API melhora a tela, mas não implementa cancelamento/assentamento.
+- Observação sobre falha CI de `808e8b2`: suíte SQLite local completa passou, mas GitHub general + PostgreSQL CI falharam no teste de requests concorrentes. No PostgreSQL, `SERIALIZABLE` lança serialization failure `40001` para losers; rota convertida em resposta de conflito 409. Executar novamente testes local e CI; esse delta de erro HTTP está no worktree posterior e ainda precisa commitar.
