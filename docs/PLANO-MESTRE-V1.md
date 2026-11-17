@@ -85,7 +85,8 @@
 | 2026-11-17 12:49 | `c2389d1088c7dca5a6ec858f74db25274418768f` | Revisão AST comparou permission_for_endpoint e require_permission em todos os handlers (finding inicial 5 divergências); alinhei sales report, branch product reads, close-empty, waiter management, restaurant operations report e branch restaurant payment. CI geral/Postgres posterior verde; Render dev live no commit da ordem. Full local 96/1. | Continuar teste PostgreSQL de concorrência de saldo. |
 | 2026-11-17 12:57 | `d1167d484a1462e2347f0c4d3b06526a7cdbadd9` | Deploy verificado live. Teste concorrente em Postgres revelou SerializationFailure. | Aplicar lock e testar estoque/venda concorrentes no Postgres. |
 | 2026-11-17 13:10 | `14b861d675802341f4f161a7caacfa98f9325d1f` | CI PostgreSQL `44121112420` falhou por serialização concorrente em branch stock upsert. | Corrigir locking e testar contra Postgres. |
-| 2026-11-17 13:16 | `9301a720aa5e811ee3abd50667b6aa3729a183d3` | Stock adjustment e branch sales concorrentes now row-lock/READ COMMITTED; tests full local 99 passed/1 skipped; CI general+Postgres success (`44123478043`, `44123477766`); dev deploy `dep-dbu7rl0m7kps73b8hbig` live; health Postgres, landing 200. Pagamentos/fiscal false. | Continuar lock/integrity audit para transfers, purchases, voids e restaurant; implementar módulos pendentes e E2E. |
+| 2026-11-17 13:16 | `9301a720aa5e811ee3abd50667b6aa3729a183d3` | Stock adjustment e branch sales concorrentes com row-lock/READ COMMITTED; CI+deploy dev verdes. | Auditar transferências, compras, estornos e restaurante. |
+| 2026-11-17 13:21 | `fb28c5551a87d2139a0763069525127f59a4f867` | Transfer lock fix + parallel transfer/overdraw tests locais, full 101/1. Ainda sem CI PostgreSQL. | Rodar CI general/Postgres e corrigir eventuais problemas antes de deploy. |
 
 ## Work log / checkpoints
 
