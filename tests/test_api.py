@@ -383,6 +383,90 @@ def test_restaurant_areas_tables_and_reservations_are_isolated_and_conflict_safe
     assert world.get('/v1/restaurant/floor',headers=auth(other)).status_code==409
 
 
+def test_restaurant_end_to_end_order_production_split_cash_and_release_table(world):
+    owner=company(world);headers=auth(owner)
+    configured=world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    assert configured.status_code==200
+    prod=product(world,owner,sku='LANCHE-01',name='Sanduíche',price='12.00')
+    # Supply opening inventory through the normal central stock ledger.
+    adj=world.post(f"/v1/products/{prod['id']}/stock-adjustments",headers=headers,json={'direction':'in','quantity':'10','reason':'Estoque inicial de teste'})
+    assert adj.status_code==201,adj.text
+    reg=world.post('/v1/registers/open',headers=headers,json={'label':'Caixa salão','opening_amount':'0'})
+    assert reg.status_code==201,reg.text
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Salão'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'Mesa 7','capacity':4}).json()
+    service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json()
+    tab=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Cliente A'});assert tab.status_code==201,tab.text
+    category=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Lanches'});assert category.status_code==201,category.text
+    menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':category.json()['id'],'product_id':prod['id'],'station':'kitchen'});assert menu.status_code==201,menu.text
+    order=world.post(f"/v1/restaurant/tabs/{tab.json()['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu.json()['id'],'quantity':'2'}],'notes':'Sem cebola'});assert order.status_code==201,order.text
+    assert world.post(f"/v1/restaurant/orders/{order.json()['id']}/send",headers=headers).status_code==200
+    queue=world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items'];assert len(queue)==1
+    item=queue[0]['id']
+    for state in ['preparing','ready','delivered']:
+        update=world.patch(f"/v1/restaurant/order-items/{item}",headers=headers,json={'status':state});assert update.status_code==200,update.text
+    detail=world.get(f"/v1/restaurant/tabs/{tab.json()['id']}",headers=headers).json()
+    assert detail['total']=='24.00' and detail['items'][0]['status']=='delivered'
+    # Two separately idempotent cash entries model a split amount; change returned only on the final receipt.
+    first=world.post(f"/v1/restaurant/tabs/{tab.json()['id']}/payments",headers=headers,json={'amount':'10.00','received_amount':'10.00','idempotency_key':'split-cash-0001'})
+    assert first.status_code==201,first.text
+    second=world.post(f"/v1/restaurant/tabs/{tab.json()['id']}/payments",headers=headers,json={'amount':'14.00','received_amount':'20.00','idempotency_key':'split-cash-0002'})
+    assert second.status_code==201,second.text and second.json()['change']=='6.00'
+    final=world.get(f"/v1/restaurant/tabs/{tab.json()['id']}",headers=headers).json()
+    assert final['status']=='closed' and final['paid']=='24.00' and final['remaining']=='0.00'
+    assert world.get('/v1/restaurant/floor',headers=headers).json()['items'][0]['status']=='available'
+    stock=world.get('/v1/products',headers=headers).json()['items'][0]
+    assert stock['stock']=='8'
+    assert world.get('/v1/audit-events',headers=headers).status_code==200
+
+
+def test_restaurant_menu_and_order_data_are_company_scoped(world):
+    token=company(world);headers=auth(token)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    other=company(world,'Outro','outro','other@example.test');other_headers=auth(other)
+    world.put('/v1/company/profile',headers=auth(other),json={'primary_segment':'restaurant','answers':{'tables':True}})
+    category=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Bebidas'});assert category.status_code==201
+    assert world.get('/v1/restaurant/menu',headers=other_headers).json()['categories']==[]
+    product_other=product(world,other,sku='OUTRO-1')
+    rejected=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':category.json()['id'],'product_id':product_other['id'],'station':'bar'})
+    assert rejected.status_code==404
+    operator=world.post('/v1/users',headers=headers,json={'full_name':'Operador','email':'floor@example.test','password':'floor-test-password-123','role':'operator'})
+    assert operator.status_code==201
+    logged=world.post('/v1/auth/login',json={'company_slug':'mercado-um','email':'floor@example.test','password':'floor-test-password-123'}).json()['access_token']
+    denied=world.post('/v1/restaurant/menu/categories',headers=auth(logged),json={'name':'Não permitido'})
+    assert denied.status_code==403
+
+
+def test_restaurant_cash_payment_idempotency_is_safe(world):
+    owner=company(world);headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    prod=product(world,owner,sku='IDEMP-1',price='5.00')
+    world.post(f"/v1/products/{prod['id']}/stock-adjustments",headers=headers,json={'direction':'in','quantity':'2','reason':'Teste inicial'})
+    world.post('/v1/registers/open',headers=headers,json={'label':'Caixa','opening_amount':'0'})
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Sala'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'T1','capacity':2}).json()
+    service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json()
+    tab=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'A'}).json()
+    category=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Comida'}).json()
+    menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':prod['id']}).json()
+    order=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1'}]}).json()
+    world.post(f"/v1/restaurant/orders/{order['id']}/send",headers=headers)
+    item=world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items'][0]
+    for status in ['preparing','ready','delivered']: world.patch(f"/v1/restaurant/order-items/{item['id']}",headers=headers,json={'status':status})
+    payment={'amount':'5','received_amount':'5','idempotency_key':'idempotency-restaurant-0001'}
+    first=world.post(f"/v1/restaurant/tabs/{tab['id']}/payments",headers=headers,json=payment);assert first.status_code==201
+    again=world.post(f"/v1/restaurant/tabs/{tab['id']}/payments",headers=headers,json=payment);assert again.status_code==201 and again.json()['idempotent'] is True
+    changed=world.post(f"/v1/restaurant/tabs/{tab['id']}/payments",headers=headers,json={**payment,'amount':'4'});assert changed.status_code==409
+    assert len(world.get('/v1/sales',headers=headers).json()['items'])==1
+
+
+def test_restaurant_electronic_payments_are_not_supported(world):
+    owner=company(world);headers=auth(owner)
+    world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
+    response=world.post('/v1/restaurant/tabs/not-a-tab/payments',headers=headers,json={'amount':'1','received_amount':'1','idempotency_key':'electronic-test-0001','method':'pix'})
+    assert response.status_code==422
+
+
 def test_restaurant_open_table_rejects_conflicting_occupation(world):
     owner=company(world);headers=auth(owner)
     world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}})
@@ -624,7 +708,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):

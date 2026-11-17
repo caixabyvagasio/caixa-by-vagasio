@@ -110,7 +110,7 @@ class PostgresConnection:
 def install_postgres_immutability(conn):
     if not is_postgres(conn): return
     conn.execute("CREATE OR REPLACE FUNCTION caixa_reject_immutable_change() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'append-only record' USING ERRCODE='23000'; END; $$")
-    for table in ("audit_events","payable_payments","company_profile_versions"):
+    for table in ("audit_events","payable_payments","company_profile_versions","restaurant_events","restaurant_tab_payments"):
         conn.execute(f"DROP TRIGGER IF EXISTS {table}_immutable_write ON {table}")
         conn.execute(f"CREATE TRIGGER {table}_immutable_write BEFORE UPDATE OR DELETE ON {table} FOR EACH ROW EXECUTE FUNCTION caixa_reject_immutable_change()")
 
@@ -331,7 +331,14 @@ def apply_schema_migrations(conn) -> None:
     migration(2,"product_metadata",add_product_metadata)
     migration(3,"company_barcode_unique_index",add_barcode_index)
     migration(4,"backfill_legacy_paid_payables",backfill_paid_payables)
-    migration(5,"plans_branches_entitlements_permissions",lambda: None)
+    def verify_tables(*names):
+        def check():
+            for name in names:
+                if not conn.execute(f"PRAGMA table_info({name})").fetchone():
+                    raise RuntimeError("Schema obrigatório ausente: "+name)
+        return check
+    migration(5,"plans_branches_entitlements_permissions",verify_tables("plans","plan_entitlements","company_subscriptions","company_module_entitlements","branches","branch_users","role_permissions","user_permissions"))
+    migration(6,"restaurant_menu_tabs_orders_cash_payments",verify_tables("restaurant_menu_categories","restaurant_menu_items","restaurant_tabs","restaurant_orders","restaurant_order_items","restaurant_tab_payments","restaurant_events"))
 
 
 def init_db() -> None:
@@ -549,8 +556,46 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS restaurant_services (
             id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), table_id TEXT NOT NULL REFERENCES restaurant_tables(id),
             status TEXT NOT NULL CHECK(status IN ('open','awaiting_payment','closed','cancelled')),
+            opened_by TEXT NOT NULL REFERENCES users(id), opened_at TEXT NOT NULL, closed_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS restaurant_one_open_service_per_table ON restaurant_services(company_id,table_id) WHERE status='open';
+        CREATE TABLE IF NOT EXISTS restaurant_menu_categories (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, UNIQUE(company_id,name)
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_menu_items (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), category_id TEXT NOT NULL REFERENCES restaurant_menu_categories(id),
+            product_id TEXT NOT NULL REFERENCES products(id), station TEXT NOT NULL CHECK(station IN ('kitchen','bar','counter')),
+            active INTEGER NOT NULL DEFAULT 1, created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+            UNIQUE(company_id,product_id)
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_tabs (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), service_id TEXT NOT NULL REFERENCES restaurant_services(id),
+            label TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('open','closed','cancelled')),
             opened_by TEXT NOT NULL REFERENCES users(id), opened_at TEXT NOT NULL, closed_at TEXT,
-            UNIQUE(company_id,table_id,status)
+            UNIQUE(company_id,label), UNIQUE(company_id,service_id,label)
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_orders (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), tab_id TEXT NOT NULL REFERENCES restaurant_tabs(id),
+            status TEXT NOT NULL CHECK(status IN ('open','sent','preparing','ready','delivered','cancelled')),
+            notes TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_order_items (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), order_id TEXT NOT NULL REFERENCES restaurant_orders(id),
+            menu_item_id TEXT NOT NULL REFERENCES restaurant_menu_items(id), product_id TEXT NOT NULL REFERENCES products(id),
+            name_snapshot TEXT NOT NULL, quantity_milli INTEGER NOT NULL CHECK(quantity_milli>0), unit_price_cents INTEGER NOT NULL CHECK(unit_price_cents>=0),
+            station TEXT NOT NULL CHECK(station IN ('kitchen','bar','counter')), status TEXT NOT NULL CHECK(status IN ('queued','preparing','ready','delivered','cancelled')),
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_tab_payments (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), tab_id TEXT NOT NULL REFERENCES restaurant_tabs(id),
+            amount_cents INTEGER NOT NULL CHECK(amount_cents>0), method TEXT NOT NULL CHECK(method='cash'), idempotency_key TEXT NOT NULL,
+            received_by TEXT NOT NULL REFERENCES users(id), received_at TEXT NOT NULL, UNIQUE(company_id,idempotency_key)
+        );
+        CREATE TABLE IF NOT EXISTS restaurant_events (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id), tab_id TEXT NOT NULL REFERENCES restaurant_tabs(id),
+            entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, action TEXT NOT NULL, details_json TEXT NOT NULL,
+            actor_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS company_profile_versions (
             id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
@@ -569,6 +614,14 @@ def init_db() -> None:
             BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
         CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_events
             BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS restaurant_events_no_update BEFORE UPDATE ON restaurant_events
+            BEGIN SELECT RAISE(ABORT, 'restaurant events are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS restaurant_events_no_delete BEFORE DELETE ON restaurant_events
+            BEGIN SELECT RAISE(ABORT, 'restaurant events are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS restaurant_payments_no_update BEFORE UPDATE ON restaurant_tab_payments
+            BEGIN SELECT RAISE(ABORT, 'restaurant payments are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS restaurant_payments_no_delete BEFORE DELETE ON restaurant_tab_payments
+            BEGIN SELECT RAISE(ABORT, 'restaurant payments are append-only'); END;
         """)
         apply_schema_migrations(conn)
         install_postgres_immutability(conn)
@@ -737,6 +790,26 @@ class RestaurantReservationIn(StrictModel):
     party_size: int = Field(ge=1,le=100)
     starts_at: str = Field(min_length=10,max_length=40)
     ends_at: str = Field(min_length=10,max_length=40)
+class RestaurantCategoryIn(StrictModel):
+    name: str = Field(min_length=2,max_length=80)
+class RestaurantMenuItemIn(StrictModel):
+    category_id: str
+    product_id: str
+    station: Literal["kitchen","bar","counter"] = "kitchen"
+class RestaurantTabIn(StrictModel):
+    label: str = Field(min_length=1,max_length=40)
+class RestaurantOrderLineIn(StrictModel):
+    menu_item_id: str
+    quantity: Decimal = Field(gt=0,max_digits=12,decimal_places=3)
+class RestaurantOrderIn(StrictModel):
+    items: list[RestaurantOrderLineIn] = Field(min_length=1,max_length=50)
+    notes: str = Field(default="",max_length=500)
+class RestaurantItemStatusIn(StrictModel):
+    status: Literal["preparing","ready","delivered","cancelled"]
+class RestaurantCashPaymentIn(StrictModel):
+    amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
+    received_amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
+    idempotency_key: str = Field(min_length=8,max_length=128)
 class RolePermissionIn(StrictModel):
     role: Literal["admin","manager","operator","stock"]
     permission: str = Field(min_length=3,max_length=80)
@@ -1017,8 +1090,8 @@ def current_user(credentials: Annotated[HTTPAuthorizationCredentials | None, Dep
 USER = Annotated[dict, Depends(current_user)]
 
 
-PERMISSION_CATALOG={"products.read":"Consultar produtos","products.write":"Gerenciar produtos","stock.adjust":"Ajustar estoque","sales.create":"Registrar vendas","sales.void":"Cancelar vendas","cash.manage":"Operar caixa","customers.read":"Consultar clientes","customers.write":"Gerenciar clientes","purchases.manage":"Gerenciar compras","finance.read":"Consultar financeiro","finance.write":"Gerenciar financeiro","users.manage":"Gerenciar acessos","profile.manage":"Configurar perfil","branches.manage":"Gerenciar filiais","modules.manage":"Gerenciar módulos","restaurant.floor":"Operar ambientes, mesas e reservas"}
-ROLE_PERMISSIONS={"owner":set(PERMISSION_CATALOG),"admin":set(PERMISSION_CATALOG)-{"branches.manage","modules.manage"},"manager":set(PERMISSION_CATALOG)-{"users.manage","branches.manage","modules.manage"},"operator":{"products.read","sales.create","cash.manage","customers.read","restaurant.floor"},"stock":{"products.read","products.write","stock.adjust","purchases.manage"}}
+PERMISSION_CATALOG={"products.read":"Consultar produtos","products.write":"Gerenciar produtos","stock.adjust":"Ajustar estoque","sales.create":"Registrar vendas","sales.void":"Cancelar vendas","cash.manage":"Operar caixa","customers.read":"Consultar clientes","customers.write":"Gerenciar clientes","purchases.manage":"Gerenciar compras","finance.read":"Consultar financeiro","finance.write":"Gerenciar financeiro","users.manage":"Gerenciar acessos","profile.manage":"Configurar perfil","branches.manage":"Gerenciar filiais","modules.manage":"Gerenciar módulos","restaurant.floor":"Operar ambientes, mesas e reservas","reports.read":"Consultar relatórios","restaurant.menu":"Gerenciar cardápio","restaurant.orders":"Criar e distribuir pedidos","restaurant.production":"Atualizar produção e entrega","restaurant.cash":"Receber e encerrar comandas"}
+ROLE_PERMISSIONS={"owner":set(PERMISSION_CATALOG),"admin":set(PERMISSION_CATALOG)-{"branches.manage","modules.manage"},"manager":set(PERMISSION_CATALOG)-{"users.manage","branches.manage","modules.manage"},"operator":{"products.read","sales.create","cash.manage","customers.read","restaurant.floor","restaurant.orders","restaurant.production","restaurant.cash","reports.read"},"stock":{"products.read","products.write","stock.adjust","purchases.manage"}}
 MODULE_STATUSES={"sales":"ENABLED","inventory":"ENABLED","purchasing":"ENABLED","customers":"ENABLED","finance":"ENABLED","reports":"ENABLED","staff":"ENABLED","profile_setup":"ENABLED","restaurant_floor":"AVAILABLE","barcode":"NOT_IMPLEMENTED","weighed_items":"NOT_IMPLEMENTED","expiry_control":"NOT_IMPLEMENTED","tables_tabs":"NOT_IMPLEMENTED","delivery":"NOT_IMPLEMENTED","kitchen":"NOT_IMPLEMENTED","variants":"NOT_IMPLEMENTED","returns":"NOT_IMPLEMENTED","commissions":"NOT_IMPLEMENTED","appointments":"NOT_IMPLEMENTED","measurement_sales":"NOT_IMPLEMENTED","restaurant_floor":"AVAILABLE"}
 
 def require_role(user: dict, *roles: str) -> None:
@@ -1424,7 +1497,7 @@ def restaurant_areas(conn: DB,user: USER):
 @app.get("/v1/restaurant/floor")
 def restaurant_floor(conn: DB,user: USER):
     require_restaurant_floor(conn,user)
-    rows=conn.execute("SELECT t.id,t.label,t.capacity,t.status,a.name AS area FROM restaurant_tables t JOIN restaurant_areas a ON a.id=t.area_id WHERE t.company_id=? AND t.active=1 ORDER BY a.name,t.label",(user["company_id"],)).fetchall()
+    rows=conn.execute("SELECT t.id,t.label,t.capacity,t.status,a.name AS area,s.id AS service_id FROM restaurant_tables t JOIN restaurant_areas a ON a.id=t.area_id LEFT JOIN restaurant_services s ON s.table_id=t.id AND s.company_id=t.company_id AND s.status='open' WHERE t.company_id=? AND t.active=1 ORDER BY a.name,t.label",(user["company_id"],)).fetchall()
     return {"items":[dict(r) for r in rows],"total":len(rows)}
 
 @app.post("/v1/restaurant/areas",status_code=201)
@@ -1473,12 +1546,181 @@ def restaurant_reserve(data: RestaurantReservationIn,conn: DB,user: USER):
     table=conn.execute("SELECT capacity FROM restaurant_tables WHERE id=? AND company_id=? AND active=1",(data.table_id,user["company_id"])).fetchone()
     if not table: raise HTTPException(404,"Mesa não encontrada.")
     if data.party_size>table["capacity"]: raise HTTPException(409,"Grupo excede a capacidade da mesa.")
-    if conn.execute("SELECT 1 FROM restaurant_reservations WHERE company_id=? AND table_id=? AND status IN ('confirmed','seated') AND starts_at<? AND ends_at>?",(user["company_id"],data.table_id,data.ends_at,data.starts_at)).fetchone(): raise HTTPException(409,"Reserva conflitante.")
     rid,now=new_id(),now_iso()
     with transaction(conn):
+        if conn.execute("SELECT 1 FROM restaurant_reservations WHERE company_id=? AND table_id=? AND status IN ('confirmed','seated') AND starts_at<? AND ends_at>?",(user["company_id"],data.table_id,data.ends_at,data.starts_at)).fetchone(): raise HTTPException(409,"Reserva conflitante.")
         conn.execute("INSERT INTO restaurant_reservations VALUES(?,?,?,?,?,?,?,'confirmed',?,?)",(rid,user["company_id"],data.table_id,data.customer_name.strip(),data.party_size,data.starts_at,data.ends_at,user["id"],now))
         audit(conn,user["company_id"],user["id"],"restaurant.reservation_created","restaurant_reservation",rid,{"table_id":data.table_id,"starts_at":data.starts_at,"ends_at":data.ends_at})
     return {"id":rid,"table_id":data.table_id,"status":"confirmed","starts_at":data.starts_at,"ends_at":data.ends_at}
+
+@app.get("/v1/restaurant/menu")
+def restaurant_menu(conn: DB,user: USER):
+    require_restaurant_floor(conn,user)
+    cats=conn.execute("SELECT id,name FROM restaurant_menu_categories WHERE company_id=? AND active=1 ORDER BY name",(user["company_id"],)).fetchall()
+    rows=conn.execute("SELECT m.id,m.category_id,c.name AS category,m.product_id,p.name,p.price_cents,p.unit,m.station FROM restaurant_menu_items m JOIN restaurant_menu_categories c ON c.id=m.category_id AND c.company_id=m.company_id JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.company_id=? AND m.active=1 AND p.active=1 ORDER BY c.name,p.name",(user["company_id"],)).fetchall()
+    return {"categories":[dict(x) for x in cats],"items":[{"id":r["id"],"category_id":r["category_id"],"category":r["category"],"product_id":r["product_id"],"name":r["name"],"price":cents_to_money(r["price_cents"]),"unit":r["unit"],"station":r["station"]} for r in rows]}
+
+@app.post("/v1/restaurant/menu/categories",status_code=201)
+def restaurant_create_category(data: RestaurantCategoryIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.menu")
+    cid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO restaurant_menu_categories VALUES(?,?,?,1,?,?)",(cid,user["company_id"],data.name.strip(),user["id"],now))
+            audit(conn,user["company_id"],user["id"],"restaurant.menu_category_created","restaurant_menu_category",cid,{"name":data.name.strip()})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Categoria já cadastrada.")
+    return {"id":cid,"name":data.name.strip()}
+
+@app.post("/v1/restaurant/menu/items",status_code=201)
+def restaurant_create_menu_item(data: RestaurantMenuItemIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.menu")
+    if not conn.execute("SELECT 1 FROM restaurant_menu_categories WHERE id=? AND company_id=? AND active=1",(data.category_id,user["company_id"])).fetchone(): raise HTTPException(404,"Categoria não encontrada.")
+    if not conn.execute("SELECT 1 FROM products WHERE id=? AND company_id=? AND active=1",(data.product_id,user["company_id"])).fetchone(): raise HTTPException(404,"Produto do estoque central não encontrado.")
+    mid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO restaurant_menu_items VALUES(?,?,?,?,?,1,?,?)",(mid,user["company_id"],data.category_id,data.product_id,data.station,user["id"],now))
+            audit(conn,user["company_id"],user["id"],"restaurant.menu_item_created","restaurant_menu_item",mid,{"product_id":data.product_id,"category_id":data.category_id,"station":data.station})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Produto já vinculado ao cardápio.")
+    return {"id":mid,"category_id":data.category_id,"product_id":data.product_id,"station":data.station}
+
+@app.post("/v1/restaurant/services/{service_id}/tabs",status_code=201)
+def restaurant_create_tab(service_id: str,data: RestaurantTabIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
+    service=conn.execute("SELECT id FROM restaurant_services WHERE id=? AND company_id=? AND status='open'",(service_id,user["company_id"])).fetchone()
+    if not service: raise HTTPException(404,"Atendimento aberto não encontrado.")
+    tid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):
+            conn.execute("INSERT INTO restaurant_tabs VALUES(?,?,?,?,'open',?,?,NULL)",(tid,user["company_id"],service_id,data.label.strip(),user["id"],now))
+            audit(conn,user["company_id"],user["id"],"restaurant.tab_opened","restaurant_tab",tid,{"service_id":service_id,"label":data.label.strip()})
+    except sqlite3.IntegrityError: raise HTTPException(409,"Comanda já existe para este atendimento ou nome repetido.")
+    return {"id":tid,"service_id":service_id,"label":data.label.strip(),"status":"open"}
+
+@app.post("/v1/restaurant/tabs/{tab_id}/orders",status_code=201)
+def restaurant_create_order(tab_id: str,data: RestaurantOrderIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
+    oid,now=new_id(),now_iso()
+    with transaction(conn):
+        tab=conn.execute("SELECT id,status FROM restaurant_tabs WHERE id=? AND company_id=?",(tab_id,user["company_id"])).fetchone()
+        if not tab or tab["status"]!='open': raise HTTPException(409,"Comanda não está aberta.")
+        conn.execute("INSERT INTO restaurant_orders VALUES(?,?,?,'open',?,?,?,?)",(oid,user["company_id"],tab_id,data.notes.strip(),user["id"],now,now))
+        for line in data.items:
+            menu=conn.execute("SELECT m.id,m.product_id,m.station,p.name,p.price_cents FROM restaurant_menu_items m JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.id=? AND m.company_id=? AND m.active=1 AND p.active=1",(line.menu_item_id,user["company_id"])).fetchone()
+            if not menu: raise HTTPException(404,"Item de cardápio não encontrado.")
+            conn.execute("INSERT INTO restaurant_order_items VALUES(?,?,?,?,?,?,?,?,?,'queued',?)",(new_id(),user["company_id"],oid,menu["id"],menu["product_id"],menu["name"],decimal_milli(line.quantity),menu["price_cents"],menu["station"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.order_created","restaurant_order",oid,{"tab_id":tab_id,"item_count":len(data.items),"notes":data.notes})
+        conn.execute("INSERT INTO restaurant_events VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],tab_id,"order",oid,"created",json.dumps({"items":[x.menu_item_id for x in data.items],"notes":data.notes}),user["id"],now))
+    return {"id":oid,"tab_id":tab_id,"status":"open","items":len(data.items)}
+
+@app.post("/v1/restaurant/orders/{order_id}/send")
+def restaurant_send_order(order_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
+    now=now_iso()
+    with transaction(conn):
+        order=conn.execute("SELECT * FROM restaurant_orders WHERE id=? AND company_id=?",(order_id,user["company_id"])).fetchone()
+        if not order: raise HTTPException(404,"Pedido não encontrado.")
+        if order["status"]!='open': raise HTTPException(409,"Pedido já foi enviado ou mudou de estado.")
+        conn.execute("UPDATE restaurant_orders SET status='sent',updated_at=? WHERE id=? AND company_id=?",(now,order_id,user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"restaurant.order_sent","restaurant_order",order_id,{"tab_id":order["tab_id"]})
+        conn.execute("INSERT INTO restaurant_events VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],order["tab_id"],"order",order_id,"sent",json.dumps({}),user["id"],now))
+    return {"id":order_id,"status":"sent","sent_at":now}
+
+@app.get("/v1/restaurant/production")
+def restaurant_production(station: Literal["kitchen","bar","counter"],conn: DB,user: USER):
+    require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.production")
+    rows=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.status,i.station,o.tab_id,o.created_at FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE i.company_id=? AND i.station=? AND i.status IN ('queued','preparing','ready') AND o.status IN ('sent','preparing','ready') AND t.status='open' ORDER BY o.created_at,i.created_at",(user["company_id"],station)).fetchall()
+    return {"station":station,"items":[{"id":r["id"],"order_id":r["order_id"],"tab_id":r["tab_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"status":r["status"],"created_at":r["created_at"]} for r in rows]}
+
+@app.patch("/v1/restaurant/order-items/{item_id}")
+def restaurant_update_item(item_id: str,data: RestaurantItemStatusIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.production")
+    now=now_iso()
+    with transaction(conn):
+        row=conn.execute("SELECT i.*,o.tab_id,o.status AS order_status,t.status AS tab_status FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE i.id=? AND i.company_id=?",(item_id,user["company_id"])).fetchone()
+        if not row: raise HTTPException(404,"Item do pedido não encontrado.")
+        allowed={"queued":{"preparing","cancelled"},"preparing":{"ready","cancelled"},"ready":{"delivered"}}
+        if data.status not in allowed.get(row["status"],set()) or row["tab_status"]!='open': raise HTTPException(409,"Transição de produção inválida.")
+        conn.execute("UPDATE restaurant_order_items SET status=? WHERE id=? AND company_id=?",(data.status,item_id,user["company_id"]))
+        items=conn.execute("SELECT status FROM restaurant_order_items WHERE order_id=? AND company_id=?",(row["order_id"],user["company_id"])).fetchall()
+        states={x["status"] for x in items}
+        order_status="delivered" if states<={"delivered","cancelled"} and "delivered" in states else "ready" if states<={"ready","delivered","cancelled"} and "ready" in states else "preparing" if "preparing" in states else row["order_status"]
+        conn.execute("UPDATE restaurant_orders SET status=?,updated_at=? WHERE id=? AND company_id=?",(order_status,now,row["order_id"],user["company_id"]))
+        conn.execute("INSERT INTO restaurant_events VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],row["tab_id"],"order_item",item_id,data.status,json.dumps({"from":row["status"],"to":data.status}),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.order_item_status","restaurant_order_item",item_id,{"from":row["status"],"to":data.status,"order_id":row["order_id"]})
+    return {"id":item_id,"status":data.status,"order_status":order_status}
+
+@app.get("/v1/restaurant/tabs")
+def restaurant_list_tabs(conn: DB,user: USER,status_filter: Literal["open","closed","all"]="open"):
+    require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
+    rows=conn.execute("SELECT t.id,t.service_id,t.label,t.status,t.opened_at,s.table_id,rt.label AS table_label,a.name AS area FROM restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id JOIN restaurant_tables rt ON rt.id=s.table_id AND rt.company_id=s.company_id JOIN restaurant_areas a ON a.id=rt.area_id AND a.company_id=rt.company_id WHERE t.company_id=? AND (?='all' OR t.status=?) ORDER BY t.opened_at DESC LIMIT 100",(user["company_id"],status_filter,status_filter)).fetchall()
+    return {"items":[dict(r) for r in rows]}
+
+@app.get("/v1/restaurant/tabs/{tab_id}")
+def restaurant_tab_detail(tab_id: str,conn: DB,user: USER):
+    require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
+    tab=conn.execute("SELECT t.*,s.table_id FROM restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id WHERE t.id=? AND t.company_id=?",(tab_id,user["company_id"])).fetchone()
+    if not tab: raise HTTPException(404,"Comanda não encontrada.")
+    items=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,i.station,i.status FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status<>'cancelled' ORDER BY o.created_at,i.created_at",(tab_id,user["company_id"])).fetchall()
+    payments=conn.execute("SELECT amount_cents,method,received_at FROM restaurant_tab_payments WHERE tab_id=? AND company_id=? ORDER BY received_at",(tab_id,user["company_id"])).fetchall()
+    total=sum((r["quantity_milli"]*r["unit_price_cents"]+500)//1000 for r in items);paid=sum(r["amount_cents"] for r in payments)
+    return {"id":tab["id"],"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in items],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
+
+@app.post("/v1/restaurant/tabs/{tab_id}/payments",status_code=201)
+def restaurant_tab_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.cash")
+    amount=decimal_money_cents(data.amount);received=decimal_money_cents(data.received_amount)
+    if received<amount: raise HTTPException(422,"Dinheiro recebido insuficiente.")
+    now=now_iso()
+    with transaction(conn):
+        prior=conn.execute("SELECT id,tab_id,amount_cents,received_at FROM restaurant_tab_payments WHERE company_id=? AND idempotency_key=?",(user["company_id"],data.idempotency_key)).fetchone()
+        if prior:
+            if prior["tab_id"]!=tab_id or prior["amount_cents"]!=amount: raise HTTPException(409,"Chave idempotente reutilizada com dados diferentes.")
+            return {"tab_id":tab_id,"amount":cents_to_money(prior["amount_cents"]),"change":cents_to_money(received-amount),"method":"cash","status":"already_recorded","idempotent":True,"received_at":prior["received_at"],"electronic_confirmation":False}
+        tab=conn.execute("SELECT t.*,s.table_id FROM restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id WHERE t.id=? AND t.company_id=?",(tab_id,user["company_id"])).fetchone()
+        if not tab or tab["status"]!='open': raise HTTPException(409,"Comanda não está aberta.")
+        row=conn.execute("SELECT COALESCE(SUM((i.quantity_milli*i.unit_price_cents+500)/1000),0) FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status<>'cancelled'",(tab_id,user["company_id"])).fetchone()
+        total=int(row[0]);paid=int(conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM restaurant_tab_payments WHERE tab_id=? AND company_id=?",(tab_id,user["company_id"])).fetchone()[0])
+        if paid+amount>total: raise HTTPException(409,"Recebimento excede o saldo da comanda.")
+        # Only cash self-declaration is supported; require a real open central register and record that receipt there.
+        register=conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1",(user["company_id"],)).fetchone()
+        if not register: raise HTTPException(409,"Abra um caixa central antes de receber a comanda.")
+        orders=conn.execute("SELECT DISTINCT o.id,o.status FROM restaurant_orders o JOIN restaurant_order_items i ON i.order_id=o.id AND i.company_id=o.company_id WHERE o.tab_id=? AND o.company_id=? AND i.status<>'cancelled'",(tab_id,user["company_id"])).fetchall()
+        if any(o["status"]!="delivered" for o in orders): raise HTTPException(409,"Todos os itens devem ser entregues antes de receber.")
+        conn.execute("INSERT INTO restaurant_tab_payments VALUES(?,?,?,?,'cash',?,?,?)",(new_id(),user["company_id"],tab_id,amount,data.idempotency_key,user["id"],now))
+        conn.execute("INSERT INTO cash_movements VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],register["id"],user["id"],"sale",amount,"Comanda "+tab_id,None,now))
+        if paid+amount==total:
+            sale_id=new_id()
+            request_hash=hashlib.sha256(json.dumps({"restaurant_tab":tab_id,"total_cents":total},sort_keys=True).encode()).hexdigest()
+            conn.execute("INSERT INTO sales(id,company_id,register_id,created_by,idempotency_key,request_hash,status,subtotal_cents,total_cents,payment_method,received_cents,change_cents,created_at,customer_id) VALUES(?,?,?,?,?,?,'paid',?,?,'cash',?,0,?,NULL)",(sale_id,user["company_id"],register["id"],user["id"],"restaurant-tab:"+tab_id,request_hash,total,total,total,now))
+            for line in conn.execute("SELECT i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,p.sku FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN products p ON p.id=i.product_id AND p.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status='delivered'",(tab_id,user["company_id"])).fetchall():
+                gross=(line["quantity_milli"]*line["unit_price_cents"]+500)//1000
+                conn.execute("INSERT INTO sale_items VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),sale_id,line["product_id"],line["sku"],line["name_snapshot"],line["quantity_milli"],line["unit_price_cents"],0,gross))
+            for item in conn.execute("SELECT product_id,SUM(quantity_milli) AS qty FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status='delivered' GROUP BY product_id",(tab_id,user["company_id"])).fetchall():
+                product=conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND active=1",(item["product_id"],user["company_id"])).fetchone()
+                if not product or product["stock_milli"]<item["qty"]: raise HTTPException(409,"Estoque insuficiente para concluir a comanda.")
+                after=product["stock_milli"]-item["qty"]
+                conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,product["id"],user["company_id"]))
+                conn.execute("INSERT INTO stock_movements VALUES(?,?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],product["id"],user["id"],"sale",-item["qty"],product["stock_milli"],after,"Baixa comanda "+tab_id,None,now))
+            audit(conn,user["company_id"],user["id"],"sale.completed","sale",sale_id,{"total":cents_to_money(total),"payment_method":"cash","register_id":register["id"],"source":"restaurant_tab","tab_id":tab_id})
+            conn.execute("UPDATE restaurant_tabs SET status='closed',closed_at=? WHERE id=? AND company_id=?",(now,tab_id,user["company_id"]))
+            service_id=tab["service_id"]
+            open_tabs=conn.execute("SELECT 1 FROM restaurant_tabs WHERE service_id=? AND company_id=? AND status='open'",(service_id,user["company_id"])).fetchone()
+            if not open_tabs:
+                conn.execute("UPDATE restaurant_services SET status='closed',closed_at=? WHERE id=? AND company_id=?",(now,service_id,user["company_id"]))
+                conn.execute("UPDATE restaurant_tables SET status='available' WHERE id=? AND company_id=?",(tab["table_id"],user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"restaurant.cash_payment","restaurant_tab",tab_id,{"amount":cents_to_money(amount),"method":"cash","fully_paid":paid+amount==total})
+        conn.execute("INSERT INTO restaurant_events VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],tab_id,"payment",data.idempotency_key,"cash_received",json.dumps({"amount_cents":amount,"change_cents":received-amount}),user["id"],now))
+    return {"tab_id":tab_id,"amount":cents_to_money(amount),"change":cents_to_money(received-amount),"method":"cash","status":"closed" if paid+amount==total else "partially_paid","electronic_confirmation":False}
+
+@app.get("/v1/restaurant/reports/operations")
+def restaurant_operations_report(conn: DB,user: USER):
+    require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
+    open_tabs=conn.execute("SELECT count(*) FROM restaurant_tabs WHERE company_id=? AND status='open'",(user["company_id"],)).fetchone()[0]
+    open_tables=conn.execute("SELECT count(*) FROM restaurant_tables WHERE company_id=? AND active=1 AND status='occupied'",(user["company_id"],)).fetchone()[0]
+    order_counts={r["status"]:r["n"] for r in conn.execute("SELECT status,count(*) AS n FROM restaurant_orders WHERE company_id=? GROUP BY status",(user["company_id"],)).fetchall()}
+    cash=conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM restaurant_tab_payments WHERE company_id=?",(user["company_id"],)).fetchone()[0]
+    return {"open_tabs":open_tabs,"occupied_tables":open_tables,"orders_by_status":order_counts,"cash_received":cents_to_money(cash),"payment_methods_available":["cash"],"electronic_payments":"unavailable","fiscal":"unavailable"}
 
 @app.get("/v1/company/commercial")
 def company_commercial(conn: DB,user: USER):
@@ -1502,6 +1744,8 @@ def create_user(data: UserCreateIn, conn: DB, user: USER):
     try:
         with transaction(conn):
             conn.execute("INSERT INTO users VALUES(?,?,?,?,?,?,1,?)", (user_id, user["company_id"], data.email, data.full_name.strip(), password_hash(data.password), data.role, created))
+            primary=conn.execute("SELECT id FROM branches WHERE company_id=? AND code='main' AND status='active'",(user["company_id"],)).fetchone()
+            if primary: conn.execute("INSERT INTO branch_users(company_id,branch_id,user_id) VALUES(?,?,?)",(user["company_id"],primary["id"],user_id))
             audit(conn, user["company_id"], user["id"], "user.created", "user", user_id, {"email": data.email, "role": data.role})
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Já existe um usuário com esse e-mail nesta empresa.")
@@ -1594,6 +1838,7 @@ def create_purchase_order(data: PurchaseCreateIn,conn: DB,user: USER):
 @app.get("/v1/finance/payables")
 def list_payables(conn: DB,user: USER,status_filter: str=Query(default="all",alias="status"),limit: int=Query(default=100,ge=1,le=200)):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"finance.read")
     if status_filter not in {"all","open","paid","cancelled"}: raise HTTPException(422,"Filtro de situação inválido.")
     rows=conn.execute("""SELECT ap.*,s.name AS supplier_name,
         COALESCE((SELECT SUM(pp.amount_cents) FROM payable_payments pp WHERE pp.company_id=ap.company_id AND pp.payable_id=ap.id),0) AS paid_cents,
@@ -1608,6 +1853,7 @@ def list_payables(conn: DB,user: USER,status_filter: str=Query(default="all",ali
 @app.post("/v1/finance/payables/{payable_id}/mark-paid")
 def mark_payable_paid(payable_id: str,data: PayablePaidIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"finance.write")
     paid_at=now_iso()
     with transaction(conn):
         row=conn.execute("SELECT * FROM accounts_payable WHERE id=? AND company_id=?",(payable_id,user["company_id"])).fetchone()
@@ -1627,6 +1873,7 @@ def mark_payable_paid(payable_id: str,data: PayablePaidIn,conn: DB,user: USER):
 def record_payable_payment(payable_id: str,data: PayablePartialIn,request: Request,conn: DB,user: USER,
                            idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"finance.write")
     if not idempotency_key or not 1<=len(idempotency_key)<=128:
         raise HTTPException(400,"Envie Idempotency-Key para registrar a baixa sem duplicidade.")
     amount_cents=decimal_money_cents(data.amount)
@@ -1662,6 +1909,7 @@ def create_expense(data: ExpenseIn,conn: DB,user: USER,
                    idempotency_key: Annotated[str|None,Header(alias="Idempotency-Key")]=None,response: Response=None):
     require_role(user,"owner","admin","manager")
     require_permission(conn,user,"finance.write")
+    require_permission(conn,user,"finance.write")
     if not idempotency_key or not 1<=len(idempotency_key)<=128:
         raise HTTPException(400,"Envie Idempotency-Key para evitar duplicidade.")
     amount_cents=decimal_money_cents(data.amount)
@@ -1692,6 +1940,7 @@ def create_expense(data: ExpenseIn,conn: DB,user: USER,
 @app.get("/v1/finance/summary")
 def finance_summary(conn: DB,user: USER):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"finance.read")
     sales=conn.execute("SELECT COALESCE(SUM(total_cents),0) FROM sales WHERE company_id=? AND status='paid'",(user["company_id"],)).fetchone()[0]
     open_amount=conn.execute("SELECT COALESCE(SUM(MAX(0,ap.amount_cents-COALESCE(p.paid_cents,0))),0) FROM accounts_payable ap LEFT JOIN (SELECT company_id,payable_id,SUM(amount_cents) AS paid_cents FROM payable_payments GROUP BY company_id,payable_id) p ON p.company_id=ap.company_id AND p.payable_id=ap.id WHERE ap.company_id=? AND ap.status='open'",(user["company_id"],)).fetchone()[0]
     overdue=conn.execute("SELECT COALESCE(SUM(MAX(0,ap.amount_cents-COALESCE(p.paid_cents,0))),0) FROM accounts_payable ap LEFT JOIN (SELECT company_id,payable_id,SUM(amount_cents) AS paid_cents FROM payable_payments GROUP BY company_id,payable_id) p ON p.company_id=ap.company_id AND p.payable_id=ap.id WHERE ap.company_id=? AND ap.status='open' AND ap.due_date<date('now')",(user["company_id"],)).fetchone()[0]
@@ -1701,6 +1950,7 @@ def finance_summary(conn: DB,user: USER):
 @app.get("/v1/finance/cashflow")
 def finance_cashflow(conn: DB,user: USER,start_date: date=Query(...),end_date: date=Query(...)):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"finance.read")
     if end_date<start_date: raise HTTPException(422,"Data final deve ser igual ou posterior à inicial.")
     if (end_date-start_date).days>365: raise HTTPException(422,"Período máximo do relatório é 366 dias.")
     start=start_date.isoformat(); end=end_date.isoformat()
@@ -1727,6 +1977,7 @@ def list_purchase_orders(conn: DB,user: USER,limit: int=Query(default=100,ge=1,l
 @app.patch("/v1/purchase-orders/{order_id}")
 def update_purchase_status(order_id: str,data: PurchaseStatusIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"purchases.manage")
     with transaction(conn):
         order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=?",(order_id,user["company_id"])).fetchone()
         if not order: raise HTTPException(404,"Pedido não encontrado nesta empresa.")
@@ -1810,6 +2061,7 @@ def create_product(data: ProductIn, conn: DB, user: USER):
 @app.put("/v1/products/{product_id}")
 def update_product(product_id: str, data: ProductIn, conn: DB, user: USER):
     require_role(user,"owner","admin","manager")
+    require_permission(conn,user,"products.write")
     try:
         with transaction(conn):
             old=conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND active=1",(product_id,user["company_id"])).fetchone()
@@ -1830,6 +2082,7 @@ def update_product(product_id: str, data: ProductIn, conn: DB, user: USER):
 @app.patch("/v1/users/{user_id}")
 def update_user(user_id: str, data: UserStatusIn, conn: DB, user: USER):
     require_role(user, "owner", "admin")
+    require_permission(conn,user,"users.manage")
     if user_id == user["id"] and not data.active:
         raise HTTPException(409, "Não é possível desativar a própria conta nesta versão.")
     with transaction(conn):
@@ -1941,6 +2194,7 @@ def current_register(conn: DB, user: USER):
 @app.post("/v1/registers/{register_id}/movements", status_code=201)
 def cash_movement(register_id: str, data: CashMovementIn, conn: DB, user: USER):
     require_role(user, "owner", "admin", "manager")
+    require_permission(conn,user,"cash.manage")
     movement_id, created = new_id(), now_iso()
     amount = decimal_money_cents(data.amount) * (1 if data.kind == "supply" else -1)
     with transaction(conn):
@@ -1961,6 +2215,7 @@ def cash_movement(register_id: str, data: CashMovementIn, conn: DB, user: USER):
 @app.post("/v1/registers/{register_id}/close")
 def close_register(register_id: str, data: RegisterCloseIn, conn: DB, user: USER):
     require_role(user, "owner", "admin", "manager")
+    require_permission(conn,user,"cash.manage")
     with transaction(conn):
         reg = conn.execute("SELECT * FROM cash_registers WHERE id=? AND company_id=? AND status='open'", (register_id, user["company_id"])).fetchone()
         if not reg:
