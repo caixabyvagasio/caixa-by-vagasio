@@ -30,3 +30,11 @@ def test_mobile_breakpoints_and_security_headers_present():
 def test_public_environment_bootstrap_is_async_before_await():
     assert "async function loadPublicEnvironment(){try{const r=await fetch('/health'" in JS
 
+
+
+def test_public_landing_matches_caixa_brand_and_avoids_unimplemented_claims():
+    for text in ['landing-header','landing-layout','landing-copy','preview-shell','PRÉVIA ILUSTRATIVA','Varejo geral','Supermercados e mercearias','Restaurantes e lanchonetes','Lojas de roupas e calçados','Materiais de construção','Prestadores de serviços']:
+        assert text in HTML or text in CSS
+    assert 'Valores demonstrativos não são dados reais.' in HTML
+    assert 'As ferramentas específicas de cada segmento são liberadas conforme sua implementação e validação.' in HTML
+    assert 'Integrações completas' not in HTML
