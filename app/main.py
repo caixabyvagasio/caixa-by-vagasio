@@ -2886,8 +2886,9 @@ def receive_branch_purchase(branch_id: str,order_id: str,data: PurchaseReceiveIn
     if not idempotency_key or len(idempotency_key)>128:raise HTTPException(400,"Envie Idempotency-Key para evitar recebimento duplicado.")
     normalized={"branch_id":branch_id,"items":sorted([{"item":x.order_item_id,"quantity":str(x.quantity)} for x in data.items],key=lambda x:x["item"]),"due_date":data.due_date.isoformat() if data.due_date else None}
     request_hash=hashlib.sha256(json.dumps(normalized,sort_keys=True,separators=(",",":")).encode()).hexdigest();receipt_id,now=new_id(),now_iso()
-    with transaction(conn):
-        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=? AND branch_id=?",(order_id,user["company_id"],branch_id)).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        order=conn.execute("SELECT * FROM purchase_orders WHERE id=? AND company_id=? AND branch_id=?"+lock_clause,(order_id,user["company_id"],branch_id)).fetchone()
         if not order:raise HTTPException(404,"Pedido não encontrado nesta filial.")
         prior=conn.execute("SELECT * FROM purchase_receipts WHERE company_id=? AND idempotency_key=?",(user["company_id"],idempotency_key)).fetchone()
         if prior:
@@ -2897,7 +2898,7 @@ def receive_branch_purchase(branch_id: str,order_id: str,data: PurchaseReceiveIn
         if order["status"] not in {"ordered","partially_received"}:raise HTTPException(409,"Pedido precisa estar enviado e aberto para recebimento.")
         if len({x.order_item_id for x in data.items})!=len(data.items):raise HTTPException(422,"Não repita a mesma linha de pedido no recebimento.")
         receipt_rows=[]
-        for line in data.items:
+        for line in sorted(data.items,key=lambda x:x.order_item_id):
             qty=decimal_milli(line.quantity)
             item=conn.execute("SELECT poi.*,p.name,p.sku FROM purchase_order_items poi JOIN products p ON p.id=poi.product_id AND p.company_id=poi.company_id WHERE poi.id=? AND poi.purchase_order_id=? AND poi.company_id=? AND poi.branch_id=?",(line.order_item_id,order_id,user["company_id"],branch_id)).fetchone()
             if not item:raise HTTPException(404,"Linha do pedido não encontrada nesta filial.")
@@ -2907,8 +2908,10 @@ def receive_branch_purchase(branch_id: str,order_id: str,data: PurchaseReceiveIn
         conn.execute("INSERT INTO purchase_receipts(id,company_id,purchase_order_id,received_by,received_at,idempotency_key,request_hash,branch_id) VALUES(?,?,?,?,?,?,?,?)",(receipt_id,user["company_id"],order_id,user["id"],now,idempotency_key,request_hash,branch_id))
         payable_amount=0
         for line,item,qty in receipt_rows:
-            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?",(user["company_id"],branch_id,item["product_id"])).fetchone();before=int(row[0]) if row else 0;after=before+qty
-            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO UPDATE SET quantity_milli=excluded.quantity_milli,updated_at=excluded.updated_at",(user["company_id"],branch_id,item["product_id"],after,now))
+            conn.execute("INSERT INTO branch_product_stock(company_id,branch_id,product_id,quantity_milli,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(company_id,branch_id,product_id) DO NOTHING",(user["company_id"],branch_id,item["product_id"],0,now))
+            lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+            row=conn.execute("SELECT quantity_milli FROM branch_product_stock WHERE company_id=? AND branch_id=? AND product_id=?"+lock_clause,(user["company_id"],branch_id,item["product_id"])).fetchone();before=int(row[0]);after=before+qty
+            conn.execute("UPDATE branch_product_stock SET quantity_milli=?,updated_at=? WHERE company_id=? AND branch_id=? AND product_id=?",(after,now,user["company_id"],branch_id,item["product_id"]))
             conn.execute("UPDATE purchase_order_items SET received_milli=received_milli+? WHERE id=? AND company_id=? AND branch_id=?",(qty,line.order_item_id,user["company_id"],branch_id))
             conn.execute("INSERT INTO purchase_receipt_items(id,receipt_id,purchase_order_item_id,product_id,quantity_milli,unit_cost_cents,branch_id) VALUES(?,?,?,?,?,?,?)",(new_id(),receipt_id,line.order_item_id,item["product_id"],qty,item["unit_cost_cents"],branch_id))
             conn.execute("INSERT INTO branch_stock_events(id,company_id,branch_id,product_id,actor_id,kind,quantity_milli,before_milli,after_milli,reason,transfer_id,created_at) VALUES(?,?,?,?,?,'adjustment_in',?,?,?,?,NULL,?)",(new_id(),user["company_id"],branch_id,item["product_id"],user["id"],qty,before,after,"Recebimento de pedido "+order["order_number"],now))
