@@ -185,3 +185,11 @@
 
 - O primeiro full test no snapshot de trabalho teve falso 404 do favicon porque o checkout inicial não tinha assets binários; foram baixadas cópias idênticas ao branch remoto para o workspace temporário (nenhuma alteração nos arquivos do branch). Full final: **94 passed, 1 skipped**. Anterior ao asset restore foi 93/1 + 1 falso falho; teste focado multibranch 5/5.
 - Correção do fail-closed ainda não enviada ao remoto. Os testes existentes de barcode/branch/shared catalog não foram todos exercitados ainda na alteração, e CI geral+PostgreSQL deve passar antes da publicação.
+
+
+## Continuação — revisão semântica de permissões (2026-11-17 12:49 BRT)
+- HEAD verificado antes do lote: `c2389d1088c7dca5a6ec858f74db25274418768f`; CI general e PostgreSQL para esse commit estavam ambos success.
+- AST da aplicação encontrou inicialmente 5 divergências middleware↔handler: branch sales report, branch products, branch restaurant close-empty, criar garçom, relatório operacional de restaurante; inspeção revelou também payment suffix branch e permission report da rota restaurant. Corrigido mapa e alterado handler do relatório de restaurante para exigir `reports.read`, coerente com sua finalidade e com middleware.
+- Testes novos verificam permissões esperadas nas rotas mapeadas, custom role permission na API de filial e consistência automatizada de `permission_for_endpoint` versus `require_permission` em todos handlers AST-inspectáveis. Nenhuma transação de negócio executada além de fixtures QA locais.
+- Full local: **96 passed, 1 skipped**, duas warnings upstream (pytest/Starlette HTTPX deprecation). Teste AST adicional focado: 1 passed. AST manual após correções: 0 mismatches.
+- Ainda não commitado/CI/deploy. Cobertura AST não classifica handlers sem `require_permission`, checks próprios de role nem prova autorização semanticamente correta para toda rota; Master está fora do mapa porque usa bootstrap secret e exige arquitetura separada.
