@@ -2562,8 +2562,9 @@ def restaurant_open_table(table_id: str,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user)
     sid,now=new_id(),now_iso()
     try:
-        with transaction(conn):
-            table=conn.execute("SELECT status FROM restaurant_tables WHERE id=? AND company_id=? AND active=1",(table_id,user["company_id"])).fetchone()
+        with transaction(conn,"READ COMMITTED"):
+            lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+            table=conn.execute("SELECT status FROM restaurant_tables WHERE id=? AND company_id=? AND active=1"+lock_clause,(table_id,user["company_id"])).fetchone()
             if not table: raise HTTPException(404,"Mesa não encontrada.")
             if table["status"]!='available': raise HTTPException(409,"Mesa não está livre.")
             conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at,waiter_id) SELECT ?,company_id,id,'open',?,?,NULL,waiter_id FROM restaurant_tables WHERE id=? AND company_id=?",(sid,user["id"],now,table_id,user["company_id"]))
@@ -2632,11 +2633,12 @@ def restaurant_create_menu_item(data: RestaurantMenuItemIn,conn: DB,user: USER):
 @app.post("/v1/restaurant/services/{service_id}/tabs",status_code=201)
 def restaurant_create_tab(service_id: str,data: RestaurantTabIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
-    service=conn.execute("SELECT id FROM restaurant_services WHERE id=? AND company_id=? AND status='open'",(service_id,user["company_id"])).fetchone()
-    if not service: raise HTTPException(404,"Atendimento aberto não encontrado.")
     tid,now=new_id(),now_iso()
     try:
-        with transaction(conn):
+        with transaction(conn,"READ COMMITTED"):
+            lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+            service=conn.execute("SELECT id FROM restaurant_services WHERE id=? AND company_id=? AND status='open'"+lock_clause,(service_id,user["company_id"])).fetchone()
+            if not service: raise HTTPException(404,"Atendimento aberto não encontrado.")
             conn.execute("INSERT INTO restaurant_tabs(id,company_id,service_id,label,status,opened_by,opened_at,closed_at,waiter_id) SELECT ?,company_id,id,?,'open',?,?,NULL,waiter_id FROM restaurant_services WHERE id=? AND company_id=?",(tid,data.label.strip(),user["id"],now,service_id,user["company_id"]))
             audit(conn,user["company_id"],user["id"],"restaurant.tab_opened","restaurant_tab",tid,{"service_id":service_id,"label":data.label.strip()})
     except sqlite3.IntegrityError: raise HTTPException(409,"Comanda já existe para este atendimento ou nome repetido.")
@@ -2646,8 +2648,9 @@ def restaurant_create_tab(service_id: str,data: RestaurantTabIn,conn: DB,user: U
 def restaurant_create_order(tab_id: str,data: RestaurantOrderIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
     oid,now=new_id(),now_iso()
-    with transaction(conn):
-        tab=conn.execute("SELECT id,status FROM restaurant_tabs WHERE id=? AND company_id=?",(tab_id,user["company_id"])).fetchone()
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        tab=conn.execute("SELECT id,status FROM restaurant_tabs WHERE id=? AND company_id=?"+lock_clause,(tab_id,user["company_id"])).fetchone()
         if not tab or tab["status"]!='open': raise HTTPException(409,"Comanda não está aberta.")
         conn.execute("INSERT INTO restaurant_orders(id,company_id,tab_id,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,'open',?,?,?,?)",(oid,user["company_id"],tab_id,data.notes.strip(),user["id"],now,now))
         for line in data.items:
@@ -2681,7 +2684,11 @@ def restaurant_production(station: Literal["kitchen","bar","counter"],conn: DB,u
 def restaurant_update_item(item_id: str,data: RestaurantItemStatusIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.production")
     now=now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        candidate=conn.execute("SELECT o.tab_id FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE i.id=? AND i.company_id=?",(item_id,user["company_id"])).fetchone()
+        if not candidate: raise HTTPException(404,"Item do pedido não encontrado.")
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        conn.execute("SELECT id FROM restaurant_tabs WHERE id=? AND company_id=?"+lock_clause,(candidate["tab_id"],user["company_id"])).fetchone()
         row=conn.execute("SELECT i.*,o.tab_id,o.status AS order_status,t.status AS tab_status FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE i.id=? AND i.company_id=?",(item_id,user["company_id"])).fetchone()
         if not row: raise HTTPException(404,"Item do pedido não encontrado.")
         allowed={"queued":{"preparing","cancelled"},"preparing":{"ready","cancelled"},"ready":{"delivered"}}
@@ -2717,18 +2724,20 @@ def restaurant_tab_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: 
     amount=decimal_money_cents(data.amount);received=decimal_money_cents(data.received_amount)
     if received<amount: raise HTTPException(422,"Dinheiro recebido insuficiente.")
     now=now_iso()
-    with transaction(conn):
+    with transaction(conn,"READ COMMITTED"):
+        lock_clause=" FOR UPDATE" if is_postgres(conn) else ""
+        tab=conn.execute("SELECT t.*,s.table_id FROM restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id WHERE t.id=? AND t.company_id=?"+lock_clause,(tab_id,user["company_id"])).fetchone()
+        if not tab: raise HTTPException(404,"Comanda não encontrada.")
         prior=conn.execute("SELECT id,tab_id,amount_cents,received_at FROM restaurant_tab_payments WHERE company_id=? AND idempotency_key=?",(user["company_id"],data.idempotency_key)).fetchone()
         if prior:
             if prior["tab_id"]!=tab_id or prior["amount_cents"]!=amount: raise HTTPException(409,"Chave idempotente reutilizada com dados diferentes.")
             return {"tab_id":tab_id,"amount":cents_to_money(prior["amount_cents"]),"change":cents_to_money(received-amount),"method":"cash","status":"already_recorded","idempotent":True,"received_at":prior["received_at"],"electronic_confirmation":False}
-        tab=conn.execute("SELECT t.*,s.table_id FROM restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id WHERE t.id=? AND t.company_id=?",(tab_id,user["company_id"])).fetchone()
-        if not tab or tab["status"]!='open': raise HTTPException(409,"Comanda não está aberta.")
+        if tab["status"]!='open': raise HTTPException(409,"Comanda não está aberta.")
         row=conn.execute("SELECT COALESCE(SUM((i.quantity_milli*i.unit_price_cents+500)/1000),0) FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status<>'cancelled'",(tab_id,user["company_id"])).fetchone()
         total=int(row[0]);paid=int(conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM restaurant_tab_payments WHERE tab_id=? AND company_id=?",(tab_id,user["company_id"])).fetchone()[0])
         if paid+amount>total: raise HTTPException(409,"Recebimento excede o saldo da comanda.")
         # Only cash self-declaration is supported; require a real open central register and record that receipt there.
-        register=conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1",(user["company_id"],)).fetchone()
+        register=conn.execute("SELECT * FROM cash_registers WHERE company_id=? AND status='open' ORDER BY opened_at DESC LIMIT 1"+(" FOR UPDATE" if is_postgres(conn) else ""),(user["company_id"],)).fetchone()
         if not register: raise HTTPException(409,"Abra um caixa central antes de receber a comanda.")
         orders=conn.execute("SELECT DISTINCT o.id,o.status FROM restaurant_orders o JOIN restaurant_order_items i ON i.order_id=o.id AND i.company_id=o.company_id WHERE o.tab_id=? AND o.company_id=? AND i.status<>'cancelled'",(tab_id,user["company_id"])).fetchall()
         if any(o["status"]!="delivered" for o in orders): raise HTTPException(409,"Todos os itens devem ser entregues antes de receber.")
@@ -2741,8 +2750,8 @@ def restaurant_tab_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: 
             for line in conn.execute("SELECT i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,p.sku FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN products p ON p.id=i.product_id AND p.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status='delivered'",(tab_id,user["company_id"])).fetchall():
                 gross=(line["quantity_milli"]*line["unit_price_cents"]+500)//1000
                 conn.execute("INSERT INTO sale_items(id,sale_id,product_id,sku,name,quantity_milli,unit_price_cents,discount_cents,line_total_cents) VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),sale_id,line["product_id"],line["sku"],line["name_snapshot"],line["quantity_milli"],line["unit_price_cents"],0,gross))
-            for item in conn.execute("SELECT product_id,SUM(quantity_milli) AS qty FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status='delivered' GROUP BY product_id",(tab_id,user["company_id"])).fetchall():
-                product=conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND active=1",(item["product_id"],user["company_id"])).fetchone()
+            for item in conn.execute("SELECT product_id,SUM(quantity_milli) AS qty FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status='delivered' GROUP BY product_id ORDER BY product_id",(tab_id,user["company_id"])).fetchall():
+                product=conn.execute("SELECT * FROM products WHERE id=? AND company_id=? AND active=1"+(" FOR UPDATE" if is_postgres(conn) else ""),(item["product_id"],user["company_id"])).fetchone()
                 if not product or product["stock_milli"]<item["qty"]: raise HTTPException(409,"Estoque insuficiente para concluir a comanda.")
                 after=product["stock_milli"]-item["qty"]
                 conn.execute("UPDATE products SET stock_milli=? WHERE id=? AND company_id=?",(after,product["id"],user["company_id"]))
