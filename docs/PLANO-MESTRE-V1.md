@@ -86,7 +86,8 @@
 | 2026-11-17 12:57 | `d1167d484a1462e2347f0c4d3b06526a7cdbadd9` | Deploy verificado live. Teste concorrente em Postgres revelou SerializationFailure. | Aplicar lock e testar estoque/venda concorrentes no Postgres. |
 | 2026-11-17 13:10 | `14b861d675802341f4f161a7caacfa98f9325d1f` | CI PostgreSQL `44121112420` falhou por serialização concorrente em branch stock upsert. | Corrigir locking e testar contra Postgres. |
 | 2026-11-17 13:16 | `9301a720aa5e811ee3abd50667b6aa3729a183d3` | Stock adjustment e branch sales concorrentes com row-lock/READ COMMITTED; CI+deploy dev verdes. | Auditar transferências, compras, estornos e restaurante. |
-| 2026-11-17 13:21 | `fb28c5551a87d2139a0763069525127f59a4f867` | Transfer lock fix + parallel transfer/overdraw tests locais, full 101/1. Ainda sem CI PostgreSQL. | Rodar CI general/Postgres e corrigir eventuais problemas antes de deploy. |
+| 2026-11-17 13:21 | `fb28c5551a87d2139a0763069525127f59a4f867` | Transfer lock fix + parallel transfer/overdraw tests locais. | Rodar CI e publicar dev apenas após passar. |
+| 2026-11-17 13:30 | `e1f2a137278c75fa54bd22a59134155326367de1` | Transfer fix CI general+Postgres success; dev `dep-dbu80jl9fdbs73dv4r0g` live. Receipts local row-lock pedido/stock fix; full 102 passed/1 skipped. Sem CI. | Executar CI PostgreSQL para concurrent receipts, corrigir antes de deploy. |
 
 ## Work log / checkpoints
 
