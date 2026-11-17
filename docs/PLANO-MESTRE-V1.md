@@ -85,6 +85,7 @@
 | BRT/data | HEAD | Trabalho/resultado | Próxima ação |
 |---|---|---|---|
 | 2026-11-17 12:22 | `c6ea16fd7496976f4d2d777ff018616ee4521507` | HEAD confirmado antes de alterações; auditoria completa relida. Sem dados modificados. | Corrigir user/waiter active lifecycle; testes e CI; prosseguir em segurança/multibranch. |
+| 2026-11-17 12:30 | `0bc9104f8af612e168ceff04d488ae8306010ccf` | Correção waiter user/profile active implementada, testada local 101 passed/1 skipped, CI geral+PostgreSQL verdes; deploy dev `dep-dbu74up42hec73bp4jbg` live, health PostgreSQL OK. Início correção de guarda fail-closed em legacy operational routes, ainda sem publicar. | Rodar focused/full tests, atualizar CI, deploy dev se verdes. |
 
 ## Pendências de maior prioridade visíveis no baseline
 
