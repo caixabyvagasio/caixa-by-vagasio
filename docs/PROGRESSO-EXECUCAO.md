@@ -278,3 +278,5 @@
 - A proteção de vendas legacy/caixa está localmente verificada; duas operações de pagamento de contas também estavam sujeitas a saldo concorrente. `pay_branch_payable`, `record_payable_payment` e `mark_payable_paid` agora usam READ COMMITTED e bloqueiam a linha da conta antes do cálculo/inserção, incluindo idempotência e atualização de status.
 - Teste de conta de R$100 com 8 pagamentos concorrentes de R$40: exatamente dois aceitos, seis 409, total R$80 em ledger, saldo R$20; focados (varejo, sangria, payables) 6 passaram. Suite completa **114 passed, 1 skipped**.
 - CI/deploy destas alterações de varejo/payables pendentes. Código continua só em dev branch quando CI verde; nenhum dado persistente alterado.
+
+- Fechamento desta continuação: varejo/caixa legacy e baixa concorrente de contas a pagar publicados no dev no commit `9e68477fc93c2656182c1d7267c66380d0542e7b`, deploy `dep-dbu99tjrjlhs73a0dimg` live. CI geral `44141669301` e PostgreSQL `44141669479` success. Suíte local 114 passed/1 skipped. Health PostgreSQL; payments/fiscal false.
