@@ -300,3 +300,10 @@
 - Cancelamento integral de pedido branch/legacy permitido apenas quando todos itens ainda queued, após pedido aberto/enviado e antes de preparo; exige motivo; operação manager/owner; atualiza pedidos/itens, retira da produção, muda total cobrável, grava evento append-only e auditoria. Quando qualquer item já está preparando/pronto, bloqueia em 409 para não apagar produção iniciada. Testes cobrem cenário permitido e bloqueio tardio nos dois fluxos.
 - Full local **128 passed, 1 skipped**; CI geral `44207151784` e PostgreSQL `44207151742` success; commit `c18ef4ce761af7797bac5796403608da40d0d5ec`; Render dev `dep-dbuf05vf3r2c73ase270` live; health PostgreSQL OK, payments/fiscal false. Nenhum tenant real alterado.
 - Restaurant segment remains INCOMPLETE. Próximos trabalhos exclusivamente restaurant: cancelamento autorizado de item após início com política compensatória/auditoria; additional/modifiers/variants/combos; recipes/ingredients and cost; table/guest/payment split and partial/mixed cash; customer QR; delivery/pickup/courier; waiter/KDS UI, roles/config; realtime, reports, full authenticated E2E.
+
+
+## Restaurante — disponibilidade do cardápio publicada (2026-11-17 22:03 BRT)
+- Itens de cardápio legado e por filial podem ser pausados/reativados por owner/admin/manager via PATCH autenticado; operação auditada. GET gerencial lista itens ativos e pausados com estado; novas orders continuam exigindo item ativo; waiter vê apenas itens ativos pelo cardápio. Pausar não afeta produto de estoque, snapshots de preço, pedidos existentes nem vendas pendentes.
+- UI do salão dá toggle “Pausar item/Reativar item” para responsáveis e mostra estado.
+- Testes específicos e suite completa: 134 passed, 1 skipped. JS parser limpo. CI geral e PostgreSQL para HEAD `d2a43194acde8c385e29d8082a171257877735b6` passaram. Render dev deploy `dep-dbufiuifngtc73cktuug` live; health status ok/postgresql, pagamentos/fiscal false.
+- Status geral continua INCOMPLETO: sem validação E2E autenticada visual; addons/modificadores/variantes/combos, receita/ingredientes, delivery/retirada/QR, fluxo completo de papéis e relatórios por função continuam pendentes.
