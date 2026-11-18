@@ -331,3 +331,9 @@
 - Migration v20 aditiva/idempotente: grupos/opções branch-scoped e legado, preço e limites mínimo/máximo; APIs CRUD de grupos e opções, desativação auditada; o servidor valida filial, item, duplicados e min/max para pedidos do salão, waiter e filial. Opções selecionadas e preço entram no snapshot do pedido; total/fila KDS/detalhe mostram escolhas; split preserva o snapshot. UI permite criar grupos/opções, escolher pelo waiter e no detalhe do salão.
 - Testes completos locais passaram: 142 passed, 1 skipped; regressões dirigidas cobrem min/max, preço, branch scope, snapshot após desativação e KDS. CI ainda pendente.
 - Prosseguir somente após CI geral e PostgreSQL; não publicar até ambos verdes. Escopo maior ainda incompleto (combos/promoções, fichas técnicas/ingredientes, delivery/retirada/QR, financeiro, equipes, E2E autenticado, multi-filial integral, e integrações que exigem sandbox/homologação).
+
+
+## Publicação — grupos de opções de cardápio (2026-11-17 23:03 BRT; verificação 23:10)
+- Migration v20 e CRUD por item/filial/legado de grupos de opções, mínimo/máximo e preço; pedido valida servidor, snapshots imutáveis seguem para total, salão, waiter, KDS e divisão de item. UI cadastra os grupos e permite seleção no garçom/salão.
+- Suíte local completa 142 passed/1 skipped; CIs geral e PostgreSQL verdes no HEAD `a4581f4511a688dcc2a0d6af6bd0a41494087147`; deploy dev `dep-dbugkagjo6nc73a1rp4g` live. Health OK, storage PostgreSQL, pagamentos e fiscal false. Arquivos JS e HTML buscados do dev contêm bundle versão `restaurant-options1`, botão de grupo e controles waiter.
+- Segmento não concluído. Próximos blocos: combos/promoções, fichas técnicas e inventário/validade, operações balcão/retirada/delivery/QR, relações cliente/fidelidade, financeiro e relatórios específicos, realtime, equipe/funções, multi-filial completo e E2E autenticado responsivo; integrações reais dependem de homologação.
