@@ -334,6 +334,11 @@
 
 
 ## Publicação — grupos de opções de cardápio (2026-11-17 23:03 BRT; verificação 23:10)
-- Migration v20 e CRUD por item/filial/legado de grupos de opções, mínimo/máximo e preço; pedido valida servidor, snapshots imutáveis seguem para total, salão, waiter, KDS e divisão de item. UI cadastra os grupos e permite seleção no garçom/salão.
+- Migration v20 e CRUD por item/filial/legado de grupos de opções, mínimo/máximo e preço; pedido valida servidor, snapshots imutáveis seguem para total, salão, waiter, KDS e divisão de item. UI cadastrou os grupos e seleção no garçom/salão.
 - Suíte local completa 142 passed/1 skipped; CIs geral e PostgreSQL verdes no HEAD `a4581f4511a688dcc2a0d6af6bd0a41494087147`; deploy dev `dep-dbugkagjo6nc73a1rp4g` live. Health OK, storage PostgreSQL, pagamentos e fiscal false. Arquivos JS e HTML buscados do dev contêm bundle versão `restaurant-options1`, botão de grupo e controles waiter.
 - Segmento não concluído. Próximos blocos: combos/promoções, fichas técnicas e inventário/validade, operações balcão/retirada/delivery/QR, relações cliente/fidelidade, financeiro e relatórios específicos, realtime, equipe/funções, multi-filial completo e E2E autenticado responsivo; integrações reais dependem de homologação.
+
+
+## Fila de espera restaurante (2026-11-17 23:03 BRT)
+- Migration aditiva/idempotente v21 com fila isolada para operação sem filial e por filial; APIs listar/cadastrar/cancelar e acomodar em mesa livre com criação atômica de atendimento, mudança de estado da mesa e auditoria. UI mostra grupos aguardando, escolhe mesa livre, acomoda/remove; tela atualiza junto ao salão.
+- Testes locais totais: 144 passed, 1 skipped, incluindo isolamento de filial, criação do atendimento, cancelamento e auditoria. Aguardar CI geral e PostgreSQL, depois deploy apenas no dev.
