@@ -1035,6 +1035,8 @@ class RestaurantOrderIn(StrictModel):
     notes: str = Field(default="",max_length=500)
 class RestaurantItemStatusIn(StrictModel):
     status: Literal["preparing","ready","delivered","cancelled"]
+class RestaurantCancelIn(StrictModel):
+    reason: str = Field(min_length=3,max_length=240)
 class RestaurantCashPaymentIn(StrictModel):
     amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
     received_amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
@@ -2240,6 +2242,25 @@ def branch_restaurant_send_order(branch_id: str,order_id: str,conn: DB,user: USE
     return {"id":order_id,"branch_id":branch_id,"status":"sent","sent_at":now}
 
 
+@app.post("/v1/branches/{branch_id}/restaurant/orders/{order_id}/cancel")
+def branch_restaurant_cancel_order(branch_id: str,order_id: str,data: RestaurantCancelIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
+    now=now_iso()
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        order=conn.execute("SELECT o.*,t.status AS tab_status FROM branch_restaurant_orders o JOIN branch_restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id AND t.branch_id=o.branch_id WHERE o.id=? AND o.company_id=? AND o.branch_id=?"+lock,(order_id,user["company_id"],branch_id)).fetchone()
+        if not order:raise HTTPException(404,"Pedido não encontrado nesta filial.")
+        if order["tab_status"]!="open" or order["status"] not in {"open","sent","preparing"}:raise HTTPException(409,"Pedido ou comanda não podem mais ser cancelados.")
+        items=conn.execute("SELECT id,status FROM branch_restaurant_order_items WHERE order_id=? AND company_id=? AND branch_id=? ORDER BY id",(order_id,user["company_id"],branch_id)).fetchall()
+        if not items or any(x["status"]!="queued" for x in items):raise HTTPException(409,"Cancelamento integral só é permitido antes do início do preparo; solicite cancelamento dos itens ao gerente.")
+        conn.execute("UPDATE branch_restaurant_order_items SET status='cancelled' WHERE order_id=? AND company_id=? AND branch_id=? AND status='queued'",(order_id,user["company_id"],branch_id))
+        conn.execute("UPDATE branch_restaurant_orders SET status='cancelled',updated_at=? WHERE id=? AND company_id=? AND branch_id=?",(now,order_id,user["company_id"],branch_id))
+        details={"reason":data.reason.strip(),"item_count":len(items),"before_status":order["status"]}
+        conn.execute("INSERT INTO branch_restaurant_events(id,company_id,branch_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],branch_id,order["tab_id"],"order",order_id,"cancelled",json.dumps(details),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_order_cancelled","restaurant_order",order_id,{"branch_id":branch_id,**details})
+    return {"id":order_id,"branch_id":branch_id,"status":"cancelled","cancelled_at":now}
+
+
 @app.get("/v1/branches/{branch_id}/restaurant/production")
 def branch_restaurant_production(branch_id: str,station: Literal["kitchen","bar","counter"],conn: DB,user: USER):
     require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.production")
@@ -2759,6 +2780,25 @@ def restaurant_send_order(order_id: str,conn: DB,user: USER):
         audit(conn,user["company_id"],user["id"],"restaurant.order_sent","restaurant_order",order_id,{"tab_id":order["tab_id"]})
         conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],order["tab_id"],"order",order_id,"sent",json.dumps({}),user["id"],now))
     return {"id":order_id,"status":"sent","sent_at":now}
+
+@app.post("/v1/restaurant/orders/{order_id}/cancel")
+def restaurant_cancel_order(order_id: str,data: RestaurantCancelIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders");require_waiter_single_branch(conn,user)
+    now=now_iso()
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        order=conn.execute("SELECT o.*,t.status AS tab_status FROM restaurant_orders o JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE o.id=? AND o.company_id=?"+lock,(order_id,user["company_id"])).fetchone()
+        if not order:raise HTTPException(404,"Pedido não encontrado nesta empresa.")
+        if order["tab_status"]!="open" or order["status"] not in {"open","sent","preparing"}:raise HTTPException(409,"Pedido ou comanda não podem mais ser cancelados.")
+        items=conn.execute("SELECT id,status FROM restaurant_order_items WHERE order_id=? AND company_id=? ORDER BY id",(order_id,user["company_id"])).fetchall()
+        if not items or any(x["status"]!="queued" for x in items):raise HTTPException(409,"Cancelamento integral só é permitido antes do início do preparo; solicite cancelamento dos itens ao gerente.")
+        conn.execute("UPDATE restaurant_order_items SET status='cancelled' WHERE order_id=? AND company_id=? AND status='queued'",(order_id,user["company_id"]))
+        conn.execute("UPDATE restaurant_orders SET status='cancelled',updated_at=? WHERE id=? AND company_id=?",(now,order_id,user["company_id"]))
+        details={"reason":data.reason.strip(),"item_count":len(items),"before_status":order["status"]}
+        conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],order["tab_id"],"order",order_id,"cancelled",json.dumps(details),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.order_cancelled","restaurant_order",order_id,details)
+    return {"id":order_id,"status":"cancelled","cancelled_at":now}
+
 
 @app.get("/v1/restaurant/production")
 def restaurant_production(station: Literal["kitchen","bar","counter"],conn: DB,user: USER):
