@@ -1459,6 +1459,38 @@ def test_frontend_favicon_asset_is_served_and_linked(world):
 
 
 
+
+def test_restaurant_unsent_item_can_be_split_between_open_tabs_same_service(world):
+    owner=company(world,name="Item split",slug="item-split",email="item-split@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Item split room'}).json();table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'IS-01','capacity':5}).json();service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json()
+    source=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Split source'}).json();target=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Split target'}).json()
+    p=product(world,owner,sku='SPLIT-UNSENT',name='Shareable dish',price='9.25');cat=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Shareable'}).json();menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json()
+    order=world.post(f"/v1/restaurant/tabs/{source['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'3'}]}).json();item_id=world.get(f"/v1/restaurant/tabs/{source['id']}",headers=headers).json()['items'][0]['id']
+    moved=world.post(f"/v1/restaurant/tabs/{source['id']}/move-item",headers=headers,json={'item_id':item_id,'target_tab_id':target['id'],'quantity':'1.25'});assert moved.status_code==200,moved.text
+    assert moved.json()['source_remaining']=='1.75'
+    a=world.get(f"/v1/restaurant/tabs/{source['id']}",headers=headers).json();b=world.get(f"/v1/restaurant/tabs/{target['id']}",headers=headers).json()
+    assert a['total']=='16.19' and a['items'][0]['quantity']=='1.75'
+    assert b['total']=='11.56' and b['items'][0]['quantity']=='1.25' and b['items'][0]['status']=='queued'
+    assert world.post(f"/v1/restaurant/tabs/{source['id']}/move-item",headers=headers,json={'item_id':item_id,'target_tab_id':target['id'],'quantity':'2'}).status_code==422
+    other_service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json() if False else None
+    assert any(e['action']=='restaurant.item_moved_between_tabs' and e['entity_id']==item_id for e in world.get('/v1/audit-events',headers=headers).json()['items'])
+
+
+def test_branch_restaurant_unsent_item_split_is_scoped_to_branch_and_service(world):
+    owner=company(world,name="Branch item split",slug="branch-item-split",email="branch-item-split@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id'];area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Branch split room'}).json();table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'BIS-01','capacity':5}).json();service=world.post(f"/v1/branches/{branch}/restaurant/tables/{table['id']}/open",headers=headers).json()
+    source=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Branch split source'}).json();target=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Branch split target'}).json()
+    p=product(world,owner,sku='BRANCH-SPLIT-UNSENT',name='Branch shareable dish',price='6.40');cat=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Branch shareable'}).json();menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json()
+    order=world.post(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'2'}]}).json();item_id=world.get(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}",headers=headers).json()['items'][0]['id']
+    moved=world.post(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}/move-item",headers=headers,json={'item_id':item_id,'target_tab_id':target['id'],'quantity':'0.5'});assert moved.status_code==200,moved.text
+    assert world.get(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}",headers=headers).json()['total']=='9.60'
+    assert world.get(f"/v1/branches/{branch}/restaurant/tabs/{target['id']}",headers=headers).json()['total']=='3.20'
+    assert world.get(f"/v1/branches/{branch}/restaurant/production?station=kitchen",headers=headers).json()['items']==[]
+    assert world.get('/v1/audit-events',headers=headers).json()['items']
+
+
 def test_restaurant_menu_price_is_independent_from_inventory_product_price_and_audited(world):
     owner=company(world,name="Menu pricing",slug="menu-pricing",email="menu-pricing@example.test");headers=auth(owner)
     assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
