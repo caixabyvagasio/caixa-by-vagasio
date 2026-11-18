@@ -1457,6 +1457,55 @@ def test_frontend_favicon_asset_is_served_and_linked(world):
     assert response.content.startswith(b'\x89PNG\r\n\x1a\n')
 
 
+
+def test_restaurant_order_cancellation_is_audited_and_only_before_preparation(world):
+    owner=company(world,name="Order cancel lifecycle",slug="order-cancel-lifecycle",email="order-cancel-lifecycle@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Cancellation room'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'OC-01','capacity':4}).json()
+    service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json()
+    tab=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Cancel before prep'}).json()
+    p=product(world,owner,sku='CANCEL-ORDER-PRODUCT',name='Cancel product')
+    category=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Cancel category'}).json()
+    menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':p['id'],'station':'kitchen'}).json()
+    order=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'2'}],'notes':'QA cancellation'}).json()
+    sent=world.post(f"/v1/restaurant/orders/{order['id']}/send",headers=headers);assert sent.status_code==200,sent.text
+    cancelled=world.post(f"/v1/restaurant/orders/{order['id']}/cancel",headers=headers,json={'reason':'Cliente desistiu antes do preparo'});assert cancelled.status_code==200,cancelled.text
+    assert cancelled.json()['status']=='cancelled'
+    detail=world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers).json();assert detail['total']=='0.00'
+    assert world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items']==[]
+    events=world.get('/v1/audit-events',headers=headers).json()['items']
+    assert any(e['action']=='restaurant.order_cancelled' and e['entity_id']==order['id'] for e in events)
+    # A sent item already taken into preparation cannot be cancelled as a whole order.
+    tab2=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Cancel after prep'}).json()
+    order2=world.post(f"/v1/restaurant/tabs/{tab2['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1'}]}).json()
+    assert world.post(f"/v1/restaurant/orders/{order2['id']}/send",headers=headers).status_code==200
+    item=world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items'][0]
+    assert world.patch(f"/v1/restaurant/order-items/{item['id']}",headers=headers,json={'status':'preparing'}).status_code==200
+    blocked=world.post(f"/v1/restaurant/orders/{order2['id']}/cancel",headers=headers,json={'reason':'Late cancellation'});assert blocked.status_code==409,blocked.text
+
+
+def test_branch_restaurant_order_cancellation_is_audited_and_respects_prep_stage(world):
+    owner=company(world,name="Branch order cancel lifecycle",slug="branch-order-cancel-lifecycle",email="branch-order-cancel-lifecycle@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Branch cancel room'}).json()
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'BC-01','capacity':4}).json()
+    service=world.post(f"/v1/branches/{branch}/restaurant/tables/{table['id']}/open",headers=headers).json()
+    tab=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Branch cancel'}).json()
+    p=product(world,owner,sku='BRANCH-CANCEL-ORDER-PRODUCT',name='Branch cancel product')
+    category=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Branch cancel category'}).json()
+    menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':p['id'],'station':'bar'}).json()
+    order=world.post(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'2'}]}).json()
+    assert world.post(f"/v1/branches/{branch}/restaurant/orders/{order['id']}/send",headers=headers).status_code==200
+    result=world.post(f"/v1/branches/{branch}/restaurant/orders/{order['id']}/cancel",headers=headers,json={'reason':'Cliente desistiu antes de preparar'})
+    assert result.status_code==200 and result.json()['status']=='cancelled',result.text
+    detail=world.get(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}",headers=headers).json();assert detail['total']=='0.00'
+    assert world.get(f'/v1/branches/{branch}/restaurant/production?station=bar',headers=headers).json()['items']==[]
+    events=world.get('/v1/audit-events',headers=headers).json()['items']
+    assert any(e['action']=='restaurant.branch_order_cancelled' and e['entity_id']==order['id'] for e in events)
+
+
 def test_waiter_portal_assignment_ordering_and_scope(world):
     owner=company(world);headers=auth(owner)
     assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
