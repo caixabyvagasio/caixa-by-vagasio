@@ -1460,6 +1460,37 @@ def test_frontend_favicon_asset_is_served_and_linked(world):
 
 
 
+
+def test_restaurant_menu_item_can_be_paused_and_reactivated_without_changing_stock_or_old_orders(world):
+    owner=company(world,name="Menu availability",slug="menu-availability",email="menu-availability@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    p=product(world,owner,sku='AVAILABILITY-ITEM',name='Seasonal dish',price='10.00');assert world.post(f"/v1/products/{p['id']}/stock-adjustments",headers=headers,json={'direction':'in','quantity':'8','reason':'QA stock'}).status_code==201
+    cat=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Seasonal'}).json();menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json();iid=menu['id']
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Availability room'}).json();table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'AV-1','capacity':4}).json();service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json();tab=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Before pause'}).json()
+    order=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':iid,'quantity':'2'}]});assert order.status_code==201,order.text
+    paused=world.patch(f'/v1/restaurant/menu/items/{iid}/availability',headers=headers,json={'active':False});assert paused.status_code==200,paused.text
+    listing=world.get('/v1/restaurant/menu',headers=headers).json()['items'];assert next(x for x in listing if x['id']==iid)['active'] is False
+    denied=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':iid,'quantity':'1'}]});assert denied.status_code==404
+    assert world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers).json()['total']=='20.00'
+    conn=main.connect_db();stock=conn.execute('SELECT stock_milli FROM products WHERE id=?',(p['id'],)).fetchone()[0];conn.close();assert stock==8000
+    resumed=world.patch(f'/v1/restaurant/menu/items/{iid}/availability',headers=headers,json={'active':True});assert resumed.status_code==200
+    allowed=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':iid,'quantity':'1'}]});assert allowed.status_code==201,allowed.text
+    events=world.get('/v1/audit-events',headers=headers).json()['items'];assert sum(e['action']=='restaurant.menu_availability_changed' and e['entity_id']==iid for e in events)==2
+
+
+def test_branch_restaurant_menu_item_availability_is_isolated_to_branch(world):
+    owner=company(world,name="Branch availability",slug="branch-availability",email="branch-availability@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id'];other=world.post('/v1/company/branches',headers=headers,json={'code':'availability-2','name':'Outra filial'}).json()['id']
+    p=product(world,owner,sku='BRANCH-AVAILABILITY',name='Branch seasonal');cat=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Seasonal branch'}).json();menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json()
+    paused=world.patch(f"/v1/branches/{branch}/restaurant/menu/items/{menu['id']}/availability",headers=headers,json={'active':False});assert paused.status_code==200,paused.text
+    assert next(x for x in world.get(f'/v1/branches/{branch}/restaurant/menu',headers=headers).json()['items'] if x['id']==menu['id'])['active'] is False
+    assert world.get(f'/v1/branches/{other}/restaurant/menu',headers=headers).json()['items']==[]
+    cat2=world.post(f'/v1/branches/{other}/restaurant/menu/categories',headers=headers,json={'name':'Other seasonal'}).json();menu2=world.post(f'/v1/branches/{other}/restaurant/menu/items',headers=headers,json={'category_id':cat2['id'],'product_id':p['id']});assert menu2.status_code==201,menu2.text
+    assert next(x for x in world.get(f'/v1/branches/{other}/restaurant/menu',headers=headers).json()['items'] if x['id']==menu2.json()['id'])['active'] is True
+    assert any(e['action']=='restaurant.branch_menu_availability_changed' and e['entity_id']==menu['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
+
+
 def test_restaurant_unsent_item_can_be_split_between_open_tabs_same_service(world):
     owner=company(world,name="Item split",slug="item-split",email="item-split@example.test");headers=auth(owner)
     assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
