@@ -735,7 +735,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status'),(18,'restaurant_menu_item_price'),(19,'restaurant_menu_addons_and_order_snapshots'),(20,'restaurant_menu_option_groups_and_order_snapshots')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status'),(18,'restaurant_menu_item_price'),(19,'restaurant_menu_addons_and_order_snapshots'),(20,'restaurant_menu_option_groups_and_order_snapshots'),(21,'restaurant_waitlist_ledger')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1522,6 +1522,37 @@ def test_branch_restaurant_menu_item_availability_is_isolated_to_branch(world):
 
 
 
+
+
+
+def test_restaurant_waitlist_add_seat_cancel_and_audit(world):
+    owner=company(world,name='Waitlist',slug='waitlist',email='waitlist@example.test');headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    waiting=world.post('/v1/restaurant/waitlist',headers=headers,json={'customer_name':'Cliente aguardando','party_size':3,'phone':'5551234','notes':'Carrinho'});assert waiting.status_code==201,waiting.text
+    listed=world.get('/v1/restaurant/waitlist',headers=headers).json();assert listed['items'][0]['customer_name']=='Cliente aguardando'
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Wait room'}).json();table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'WL-1','capacity':4}).json()
+    seated=world.post(f"/v1/restaurant/waitlist/{waiting.json()['id']}/seat",headers=headers,json={'table_id':table['id']});assert seated.status_code==201,seated.text
+    assert world.get('/v1/restaurant/floor',headers=headers).json()['items'][0]['status']=='occupied'
+    conn=main.connect_db()
+    try: row=conn.execute('SELECT status,service_id FROM restaurant_waitlist WHERE id=?',(waiting.json()['id'],)).fetchone();assert row['status']=='seated' and row['service_id']==seated.json()['service_id']
+    finally:conn.close()
+    second=world.post('/v1/restaurant/waitlist',headers=headers,json={'customer_name':'Cliente dois','party_size':2});assert second.status_code==201
+    assert world.post(f"/v1/restaurant/waitlist/{second.json()['id']}/cancel",headers=headers).status_code==200
+    assert world.post(f"/v1/restaurant/waitlist/{second.json()['id']}/cancel",headers=headers).status_code==409
+    events=world.get('/v1/audit-events',headers=headers).json()['items'];assert any(e['action']=='restaurant.waitlist_seated' and e['entity_id']==waiting.json()['id'] for e in events)
+
+
+def test_branch_restaurant_waitlist_scoped_seating_and_cancel(world):
+    owner=company(world,name='Branch Waitlist',slug='branch-waitlist',email='branch-waitlist@example.test');headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id'];waiting=world.post(f'/v1/branches/{branch}/restaurant/waitlist',headers=headers,json={'customer_name':'Filial aguardando','party_size':2});assert waiting.status_code==201,waiting.text
+    assert world.get(f'/v1/branches/{branch}/restaurant/waitlist',headers=headers).json()['items'][0]['id']==waiting.json()['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Branch wait'}).json();table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'BWL-1','capacity':4}).json()
+    seated=world.post(f"/v1/branches/{branch}/restaurant/waitlist/{waiting.json()['id']}/seat",headers=headers,json={'table_id':table['id']});assert seated.status_code==201,seated.text
+    assert seated.json()['service_id']
+    second=world.post(f'/v1/branches/{branch}/restaurant/waitlist',headers=headers,json={'customer_name':'Filial 2','party_size':1}).json()
+    assert world.post(f"/v1/branches/{branch}/restaurant/waitlist/{second['id']}/cancel",headers=headers).status_code==200
+    assert world.get(f'/v1/branches/{branch}/restaurant/waitlist',headers=headers).json()['items']==[]
 
 
 def test_restaurant_option_groups_enforce_min_max_and_snapshot_prices(world):
