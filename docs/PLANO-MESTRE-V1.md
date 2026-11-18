@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 22:03 | `7c4a2f6ee7c63c95518d54454c58970914e04fd2` | Audited atomic table transfer (legacy + branch) + UI; menu availability toggle preceding deployment; 136 passed/1 skipped; general+PostgreSQL CI green; dev `dep-dbufo10m7kps73c98khg` live/healthy. | Continue restaurant feature scope and E2E. |
+
+
+
 | 2026-11-17 22:03 | `d2a43194acde8c385e29d8082a171257877735b6` | Restaurant menu item pause/reactivate legacy and branch, UI role gating, audit, no order/history/stock mutation; 134 passed/1 skipped, CI both green, dev `dep-dbufiuifngtc73cktuug` live/healthy. | Continue restaurant-only; addons, recipes, delivery/QR, function-specific UI and authenticated E2E remain. |
 
 
