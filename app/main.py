@@ -1005,6 +1005,8 @@ class RestaurantTableIn(StrictModel):
     area_id: str
     label: str = Field(min_length=1,max_length=30)
     capacity: int = Field(ge=1,le=100)
+class RestaurantTransferTableIn(StrictModel):
+    target_table_id: str
 class RestaurantReservationIn(StrictModel):
     table_id: str
     customer_name: str = Field(min_length=2,max_length=120)
@@ -1418,7 +1420,7 @@ def permission_for_endpoint(method: str, path: str):
         if "/restaurant/payments" in path or path.endswith("/payments"): return "restaurant.cash"
         if "/restaurant/production" in path or "/restaurant/order-items/" in path: return "restaurant.production"
         if "/restaurant/reports/" in path: return "reports.read"
-        if path.endswith("/close-empty"): return "restaurant.floor"
+        if path.endswith("/close-empty") or path.endswith("/transfer"): return "restaurant.floor"
         if "/restaurant/tabs" in path or "/restaurant/orders" in path or "/restaurant/services/" in path: return "restaurant.orders"
         return "restaurant.floor"
         if "/restaurant/payments" in path: return "restaurant.cash"
@@ -1455,7 +1457,7 @@ def permission_for_endpoint(method: str, path: str):
         if "/production" in path or "/order-items/" in path: return "restaurant.production"
         if "/reports/" in path: return "reports.read"
         if "/reports/" in path: return "reports.read"
-        if path.endswith("/close-empty"): return "restaurant.floor"
+        if path.endswith("/close-empty") or path.endswith("/transfer"): return "restaurant.floor"
         if "/tabs" in path or "/orders" in path or "/services/" in path: return "restaurant.orders"
         return "restaurant.floor"
     if path.startswith("/v1/products"):
@@ -2462,6 +2464,30 @@ def branch_restaurant_create_table(branch_id: str,data: RestaurantTableIn,conn: 
     return {"id":tid,"branch_id":branch_id,"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity,"status":"available"}
 
 
+@app.post("/v1/branches/{branch_id}/restaurant/services/{service_id}/transfer")
+def branch_restaurant_transfer_service(branch_id: str,service_id: str,data: RestaurantTransferTableIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    now=now_iso()
+    try:
+        with transaction(conn,"READ COMMITTED"):
+            lock=" FOR UPDATE" if is_postgres(conn) else ""
+            service=conn.execute("SELECT * FROM restaurant_services WHERE id=? AND company_id=? AND branch_id=? AND status='open'"+lock,(service_id,user["company_id"],branch_id)).fetchone()
+            if not service:raise HTTPException(404,"Atendimento aberto não encontrado nesta filial.")
+            source=conn.execute("SELECT id,label,status FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=?"+lock,(service["table_id"],user["company_id"],branch_id)).fetchone()
+            target=conn.execute("SELECT id,label,status,capacity FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1"+lock,(data.target_table_id,user["company_id"],branch_id)).fetchone()
+            if not source or not target:raise HTTPException(404,"Mesa de origem ou destino não encontrada nesta filial.")
+            if source["id"]==target["id"]:raise HTTPException(409,"Escolha uma mesa diferente para transferir.")
+            if source["status"]!='occupied' or target["status"]!='available':raise HTTPException(409,"A origem precisa estar ocupada e a mesa destino livre.")
+            if target["capacity"]<1:raise HTTPException(409,"Mesa destino sem capacidade válida.")
+            conn.execute("UPDATE restaurant_services SET table_id=? WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(target["id"],service_id,user["company_id"],branch_id))
+            a=conn.execute("UPDATE restaurant_tables SET status='available' WHERE id=? AND company_id=? AND branch_id=? AND status='occupied'",(source["id"],user["company_id"],branch_id))
+            b=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND branch_id=? AND status='available'",(target["id"],user["company_id"],branch_id))
+            if a.rowcount!=1 or b.rowcount!=1:raise HTTPException(409,"O salão mudou durante a transferência; atualize e tente novamente.")
+            audit(conn,user["company_id"],user["id"],"restaurant.branch_service_transferred","restaurant_service",service_id,{"branch_id":branch_id,"from_table_id":source["id"],"from_label":source["label"],"to_table_id":target["id"],"to_label":target["label"]})
+    except sqlite3.IntegrityError:raise HTTPException(409,"A mesa destino já recebeu outro atendimento.")
+    return {"service_id":service_id,"branch_id":branch_id,"from_table_id":source["id"],"to_table_id":target["id"],"status":"open","transferred_at":now}
+
+
 @app.post("/v1/branches/{branch_id}/restaurant/tables/{table_id}/open")
 def branch_restaurant_open_table(branch_id: str,table_id: str,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
@@ -2697,6 +2723,30 @@ def restaurant_create_table(data: RestaurantTableIn,conn: DB,user: USER):
             audit(conn,user["company_id"],user["id"],"restaurant.table_created","restaurant_table",tid,{"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity})
     except sqlite3.IntegrityError: raise HTTPException(409,"Mesa já cadastrada.")
     return {"id":tid,"area_id":data.area_id,"label":data.label.strip(),"capacity":data.capacity,"status":"available"}
+
+
+@app.post("/v1/restaurant/services/{service_id}/transfer")
+def restaurant_transfer_service(service_id: str,data: RestaurantTransferTableIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor");require_waiter_single_branch(conn,user)
+    now=now_iso()
+    try:
+        with transaction(conn,"READ COMMITTED"):
+            lock=" FOR UPDATE" if is_postgres(conn) else ""
+            service=conn.execute("SELECT * FROM restaurant_services WHERE id=? AND company_id=? AND status='open'"+lock,(service_id,user["company_id"])).fetchone()
+            if not service:raise HTTPException(404,"Atendimento aberto não encontrado.")
+            source=conn.execute("SELECT id,label,status,branch_id FROM restaurant_tables WHERE id=? AND company_id=?"+lock,(service["table_id"],user["company_id"])).fetchone()
+            target=conn.execute("SELECT id,label,status,capacity,branch_id FROM restaurant_tables WHERE id=? AND company_id=? AND active=1"+lock,(data.target_table_id,user["company_id"])).fetchone()
+            if not source or not target:raise HTTPException(404,"Mesa de origem ou destino não encontrada.")
+            if source["id"]==target["id"]:raise HTTPException(409,"Escolha uma mesa diferente para transferir.")
+            if source["branch_id"]!=target["branch_id"]:raise HTTPException(409,"Transfira somente entre mesas da mesma filial.")
+            if source["status"]!='occupied' or target["status"]!='available':raise HTTPException(409,"A origem precisa estar ocupada e a mesa destino livre.")
+            conn.execute("UPDATE restaurant_services SET table_id=? WHERE id=? AND company_id=? AND status='open'",(target["id"],service_id,user["company_id"]))
+            a=conn.execute("UPDATE restaurant_tables SET status='available' WHERE id=? AND company_id=? AND status='occupied'",(source["id"],user["company_id"]))
+            b=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND status='available'",(target["id"],user["company_id"]))
+            if a.rowcount!=1 or b.rowcount!=1:raise HTTPException(409,"O salão mudou durante a transferência; atualize e tente novamente.")
+            audit(conn,user["company_id"],user["id"],"restaurant.service_transferred","restaurant_service",service_id,{"from_table_id":source["id"],"from_label":source["label"],"to_table_id":target["id"],"to_label":target["label"]})
+    except sqlite3.IntegrityError:raise HTTPException(409,"A mesa destino já recebeu outro atendimento.")
+    return {"service_id":service_id,"from_table_id":source["id"],"to_table_id":target["id"],"status":"open","transferred_at":now}
 
 @app.post("/v1/restaurant/tables/{table_id}/open")
 def restaurant_open_table(table_id: str,conn: DB,user: USER):
