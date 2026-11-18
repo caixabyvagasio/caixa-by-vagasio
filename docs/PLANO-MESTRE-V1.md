@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 22:36 | `a620e644955890ef55f3203091299ec5e23d3164` | Restaurant add-ons per menu item & branch, immutable order/KDS/waiter snapshots, v19 additive migration; 148 passed/1 skipped, both CI green; dev deploy `dep-dbug9v0ae00c73ef1mbg` healthy. | Continue unfinished restaurant scope, then authenticated E2E; integrations remain pending sandbox credentials. |
+
+
+
 | 2026-11-17 22:25 | `9dbd5c342a8a0293172a3afe361a5f24211af2f3` | Open tabs merge safely (orders moved, source closed, paid tabs refused), UI, tests 138 passed/1 skipped, general+PostgreSQL CI green, dev `dep-dbuft688v5cc738vromg` live. | Continue remaining restaurant features and authenticated E2E. |
 
 
