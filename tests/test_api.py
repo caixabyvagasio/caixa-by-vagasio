@@ -735,7 +735,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status'),(18,'restaurant_menu_item_price')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status'),(18,'restaurant_menu_item_price'),(19,'restaurant_menu_addons_and_order_snapshots')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1522,6 +1522,40 @@ def test_branch_restaurant_menu_item_availability_is_isolated_to_branch(world):
 
 
 
+
+def test_restaurant_menu_addons_are_price_snapshotted_and_audited(world):
+    owner=company(world,name="Menu addons",slug="menu-addons",email="menu-addons@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Addon room'}).json();table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'AD-01','capacity':4}).json();service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json();tab=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Addon tab'}).json()
+    p=product(world,owner,sku='MENU-ADDON',name='Base dish',price='7.00');cat=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Addon foods'}).json();menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json()
+    addon=world.post(f"/v1/restaurant/menu/items/{menu['id']}/addons",headers=headers,json={'name':'Extra cheese','price':'1.25'});assert addon.status_code==201,addon.text
+    assert world.get('/v1/restaurant/menu',headers=headers).json()['items'][0]['addons'][0]['price']=='1.25'
+    order=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'2','addons':[{'addon_id':addon.json()['id'],'quantity':2}]}]});assert order.status_code==201,order.text
+    detail=world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers).json();assert detail['total']=='19.00';assert detail['items'][0]['unit_price']=='9.50';assert detail['items'][0]['addons']==[{'id':addon.json()['id'],'name':'Extra cheese','quantity':2,'unit_price_cents':125}]
+    assert world.post(f"/v1/restaurant/orders/{order.json()['id']}/send",headers=headers).status_code==200
+    kds=world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items'];assert kds[0]['addons'][0]['name']=='Extra cheese'
+    disabled=world.delete(f"/v1/restaurant/menu/items/{menu['id']}/addons/{addon.json()['id']}",headers=headers);assert disabled.status_code==200,disabled.text
+    assert world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers).json()['total']=='19.00'
+    rejected=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1','addons':[{'addon_id':addon.json()['id'],'quantity':1}]}]});assert rejected.status_code==404
+    added=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1'}]});assert added.status_code==201
+    assert any(e['action']=='restaurant.menu_addon_created' and e['entity_id']==addon.json()['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
+
+
+def test_branch_restaurant_addons_are_scoped_snapshotted_and_cannot_be_forged(world):
+    owner=company(world,name="Branch addons",slug="branch-addons",email="branch-addons@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id'];area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Branch addon room'}).json();table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'BAD-01','capacity':4}).json();service=world.post(f"/v1/branches/{branch}/restaurant/tables/{table['id']}/open",headers=headers).json();tab=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Branch addon tab'}).json()
+    p=product(world,owner,sku='BRANCH-MENU-ADDON',name='Branch base',price='5.00');cat=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Branch addon category'}).json();menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json();addon=world.post(f"/v1/branches/{branch}/restaurant/menu/items/{menu['id']}/addons",headers=headers,json={'name':'Avocado','price':'3.40'});assert addon.status_code==201,addon.text
+    forged=world.post(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1','addons':[{'addon_id':'foreign-addon','quantity':1}]}]});assert forged.status_code==404
+    order=world.post(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1.5','addons':[{'addon_id':addon.json()['id'],'quantity':1}]}]});assert order.status_code==201,order.text
+    detail=world.get(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}",headers=headers).json();assert detail['total']=='12.60';assert detail['items'][0]['addons'][0]['name']=='Avocado'
+    assert world.post(f"/v1/branches/{branch}/restaurant/orders/{order.json()['id']}/send",headers=headers).status_code==200
+    kds=world.get(f'/v1/branches/{branch}/restaurant/production?station=kitchen',headers=headers).json()['items'];assert kds[0]['addons'][0]['name']=='Avocado'
+    deleted=world.delete(f"/v1/branches/{branch}/restaurant/menu/items/{menu['id']}/addons/{addon.json()['id']}",headers=headers);assert deleted.status_code==200,deleted.text
+    assert world.get(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}",headers=headers).json()['total']=='12.60'
+    assert any(e['action']=='restaurant.branch_menu_addon_disabled' and e['entity_id']==addon.json()['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
+
+
 def test_restaurant_open_tabs_merge_moves_orders_closes_source_and_preserves_totals(world):
     owner=company(world,name="Merge tabs",slug="merge-tabs",email="merge-tabs@example.test");headers=auth(owner)
     assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
@@ -1706,15 +1740,22 @@ def test_waiter_portal_assignment_ordering_and_scope(world):
     category=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Bebidas'}).json()
     menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':product_row['id'],'station':'bar'});assert menu.status_code==201,menu.text
     ordered=world.post(f"/v1/waiter/tabs/{tab.json()['id']}/orders",headers=wh,json={'items':[{'menu_item_id':menu.json()['id'],'quantity':'2'}],'notes':'Sem gelo'});assert ordered.status_code==201,ordered.text
+    waiter_addon=world.post(f"/v1/restaurant/menu/items/{menu.json()['id']}/addons",headers=headers,json={'name':'Limão extra','price':'0.75'});assert waiter_addon.status_code==201,waiter_addon.text
+    ordered_addon=world.post(f"/v1/waiter/tabs/{tab.json()['id']}/orders",headers=wh,json={'items':[{'menu_item_id':menu.json()['id'],'quantity':'1','addons':[{'addon_id':waiter_addon.json()['id'],'quantity':2}]}]});assert ordered_addon.status_code==201,ordered_addon.text
     sent=world.post(f"/v1/waiter/orders/{ordered.json()['id']}/send",headers=wh);assert sent.status_code==200 and sent.json()['status']=='sent'
-    detail=world.get(f"/v1/waiter/tabs/{tab.json()['id']}",headers=wh).json();assert detail['total']=='17.00'
+    sent_addon=world.post(f"/v1/waiter/orders/{ordered_addon.json()['id']}/send",headers=wh);assert sent_addon.status_code==200
+    detail=world.get(f"/v1/waiter/tabs/{tab.json()['id']}",headers=wh).json();assert detail['total']=='27.00';assert detail['items'][1]['addons'][0]['name']=='Limão extra'
     # Manager/production transitions remain auditable; waiter can record only the supported cash receipt.
     owner_reg=world.post('/v1/registers/open',headers=headers,json={'label':'Caixa salão','opening_amount':'0'});assert owner_reg.status_code==201,owner_reg.text
     item=world.get('/v1/restaurant/production?station=bar',headers=headers).json()['items'][0]
     for status in ('preparing','ready'):
         transition=world.patch(f"/v1/restaurant/order-items/{item['id']}",headers=headers,json={'status':status});assert transition.status_code==200,transition.text
     delivered=world.patch(f"/v1/waiter/order-items/{item['id']}/delivered",headers=wh);assert delivered.status_code==200,delivered.text
-    payment=world.post(f"/v1/waiter/tabs/{tab.json()['id']}/payments",headers=wh,json={'amount':'17.00','received_amount':'20.00','idempotency_key':'waiter-cash-0001'});assert payment.status_code==201,payment.text
+    addon_item=next(i for i in world.get('/v1/restaurant/tabs/'+tab.json()['id'],headers=headers).json()['items'] if i['order_id']==ordered_addon.json()['id'])
+    for status in ('preparing','ready'):
+        assert world.patch(f"/v1/restaurant/order-items/{addon_item['id']}",headers=headers,json={'status':status}).status_code==200
+    assert world.patch(f"/v1/waiter/order-items/{addon_item['id']}/delivered",headers=wh).status_code==200
+    payment=world.post(f"/v1/waiter/tabs/{tab.json()['id']}/payments",headers=wh,json={'amount':'27.00','received_amount':'30.00','idempotency_key':'waiter-cash-0001'});assert payment.status_code==201,payment.text
     assert payment.json()['change']=='3.00' and payment.json()['electronic_confirmation'] is False
     # A different tenant cannot read a comanda assigned here.
     other=company(world,name='Outra empresa',slug='outra-empresa',email='other-owner@example.test')
