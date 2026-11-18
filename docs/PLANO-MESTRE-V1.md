@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 21:03 | `999b3048d50acf2b15de8ae7a81a6aca4a7013c6` live | Reserva chega e vira serviço, cancel/no-show auditados; migration 17 persiste `no_show`; primeira UI de ações chegou; 125/1 e CI geral/Postgres success, dev live `dep-dbuengcipgvc738n5ck0`. Migration 17/status UI ampliados localmente, 126/1; ainda não enviados para CI. | Atualizar backend/test/frontend/doc, rerun general/Postgres; dev deploy only if green. |
+
+## Work log / checkpoints
+
 | 2026-11-17 20:55 | branch `development-v1` HEAD `671bc9f158cf0178e1557ab7426ed532a8195c36` | New functional slice local: reservation lifecycle seated/cancel/no-show, query filtering, desktop branch+legacy UI; 125 passed/1 skipped. Pending CI/PostgreSQL+dev deploy. | Keep scope to restaurant; next recipes/ingredient inventory and order cancel/reversal. |
 
 ## Work log / checkpoints
