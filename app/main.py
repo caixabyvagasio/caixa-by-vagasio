@@ -553,6 +553,12 @@ def apply_schema_migrations(conn) -> None:
                 cols={r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 if "options_json" not in cols:conn.execute(f"ALTER TABLE {table} ADD COLUMN options_json TEXT NOT NULL DEFAULT '[]'")
     migration(20,"restaurant_menu_option_groups_and_order_snapshots",add_restaurant_option_groups)
+    def create_restaurant_waitlists():
+        for table,scope in (("restaurant_waitlist","branch_id TEXT REFERENCES branches(id)"),("branch_restaurant_waitlist","branch_id TEXT NOT NULL REFERENCES branches(id)")):
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {table}(id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),{scope},customer_name TEXT NOT NULL,party_size INTEGER NOT NULL CHECK(party_size BETWEEN 1 AND 100),phone TEXT NOT NULL DEFAULT '',notes TEXT NOT NULL DEFAULT '',status TEXT NOT NULL CHECK(status IN ('waiting','seated','cancelled')),service_id TEXT,created_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL,seated_at TEXT,cancelled_at TEXT)")
+            if table=="restaurant_waitlist":conn.execute("CREATE INDEX IF NOT EXISTS restaurant_waitlist_company_status ON restaurant_waitlist(company_id,status,created_at)")
+            else:conn.execute("CREATE INDEX IF NOT EXISTS branch_restaurant_waitlist_lookup ON branch_restaurant_waitlist(company_id,branch_id,status,created_at)")
+    migration(21,"restaurant_waitlist_ledger",create_restaurant_waitlists)
 
 
 def init_db() -> None:
@@ -1024,6 +1030,14 @@ class BranchSaleIn(StrictModel):
     payment_method: Literal["cash"]
     received_amount: Decimal = Field(ge=0,max_digits=12,decimal_places=2)
     customer_id: str|None=None
+
+class RestaurantWaitlistIn(StrictModel):
+    customer_name: str = Field(min_length=2,max_length=120)
+    party_size: int = Field(ge=1,le=100)
+    phone: str = Field(default="",max_length=40)
+    notes: str = Field(default="",max_length=300)
+class RestaurantWaitlistSeatIn(StrictModel):
+    table_id: str
 
 class RestaurantAreaIn(StrictModel):
     name: str = Field(min_length=2,max_length=80)
@@ -2205,6 +2219,50 @@ def require_restaurant_branch(conn,user,branch_id):
     require_restaurant_floor(conn,user)
 
 
+@app.get("/v1/branches/{branch_id}/restaurant/waitlist")
+def branch_restaurant_waitlist(branch_id: str,conn: DB,user: USER):
+    require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    rows=conn.execute("SELECT id,customer_name,party_size,phone,notes,status,service_id,created_at,seated_at FROM branch_restaurant_waitlist WHERE company_id=? AND branch_id=? AND status='waiting' ORDER BY created_at,id",(user["company_id"],branch_id)).fetchall()
+    return {"branch_id":branch_id,"items":[dict(r) for r in rows]}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/waitlist",status_code=201)
+def branch_restaurant_waitlist_add(branch_id: str,data: RestaurantWaitlistIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    wid,now=new_id(),now_iso()
+    with transaction(conn):
+        conn.execute("INSERT INTO branch_restaurant_waitlist(id,company_id,branch_id,customer_name,party_size,phone,notes,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,'waiting',?,?)",(wid,user["company_id"],branch_id,data.customer_name.strip(),data.party_size,data.phone.strip(),data.notes.strip(),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_waitlist_added","restaurant_waitlist",wid,{"branch_id":branch_id,"party_size":data.party_size})
+    return {"id":wid,"branch_id":branch_id,"customer_name":data.customer_name.strip(),"party_size":data.party_size,"status":"waiting","created_at":now}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/waitlist/{wait_id}/seat",status_code=201)
+def branch_restaurant_waitlist_seat(branch_id: str,wait_id: str,data: RestaurantWaitlistSeatIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor");now=now_iso();sid=new_id()
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        guest=conn.execute("SELECT * FROM branch_restaurant_waitlist WHERE id=? AND company_id=? AND branch_id=? AND status='waiting'"+lock,(wait_id,user["company_id"],branch_id)).fetchone()
+        if not guest:raise HTTPException(404,"Cliente aguardando não encontrado nesta filial.")
+        table=conn.execute("SELECT id,status,waiter_id FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1"+lock,(data.table_id,user["company_id"],branch_id)).fetchone()
+        if not table or table["status"]!='available':raise HTTPException(409,"Mesa livre não encontrada nesta filial.")
+        conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at,waiter_id,branch_id) VALUES(?,?,?,'open',?,?,NULL,?,?)",(sid,user["company_id"],data.table_id,user["id"],now,table["waiter_id"],branch_id))
+        changed=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND branch_id=? AND status='available'",(data.table_id,user["company_id"],branch_id))
+        if changed.rowcount!=1:raise HTTPException(409,"Mesa mudou de estado; atualize o salão.")
+        conn.execute("UPDATE branch_restaurant_waitlist SET status='seated',service_id=?,seated_at=? WHERE id=? AND company_id=? AND branch_id=? AND status='waiting'",(sid,now,wait_id,user["company_id"],branch_id))
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_waitlist_seated","restaurant_waitlist",wait_id,{"branch_id":branch_id,"table_id":data.table_id,"service_id":sid,"party_size":guest["party_size"]})
+    return {"id":wait_id,"service_id":sid,"table_id":data.table_id,"status":"seated","seated_at":now}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/waitlist/{wait_id}/cancel")
+def branch_restaurant_waitlist_cancel(branch_id: str,wait_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor");now=now_iso()
+    with transaction(conn):
+        row=conn.execute("SELECT id FROM branch_restaurant_waitlist WHERE id=? AND company_id=? AND branch_id=? AND status='waiting'",(wait_id,user["company_id"],branch_id)).fetchone()
+        if not row:raise HTTPException(409,"Só é possível remover quem ainda está aguardando.")
+        conn.execute("UPDATE branch_restaurant_waitlist SET status='cancelled',cancelled_at=? WHERE id=? AND company_id=? AND branch_id=?",(now,wait_id,user["company_id"],branch_id));audit(conn,user["company_id"],user["id"],"restaurant.branch_waitlist_cancelled","restaurant_waitlist",wait_id,{"branch_id":branch_id})
+    return {"id":wait_id,"status":"cancelled","cancelled_at":now}
+
+
 @app.get("/v1/branches/{branch_id}/restaurant/areas")
 def branch_restaurant_areas(branch_id: str,conn: DB,user: USER):
     require_restaurant_branch(conn,user,branch_id)
@@ -2860,6 +2918,50 @@ def waiter_send_order(order_id: str,conn: DB,user: USER):
     order=conn.execute("SELECT o.tab_id FROM restaurant_orders o JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE o.id=? AND o.company_id=? AND t.waiter_id=?",(order_id,user["company_id"],user["id"])).fetchone()
     if not order: raise HTTPException(404,"Pedido não atribuído a você.")
     return restaurant_send_order(order_id,conn,user)
+
+@app.get("/v1/restaurant/waitlist")
+def restaurant_waitlist(conn: DB,user: USER):
+    require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor");require_waiter_single_branch(conn,user)
+    rows=conn.execute("SELECT id,customer_name,party_size,phone,notes,status,service_id,created_at,seated_at FROM restaurant_waitlist WHERE company_id=? AND status='waiting' ORDER BY created_at,id",(user["company_id"],)).fetchall()
+    return {"items":[dict(r) for r in rows]}
+
+
+@app.post("/v1/restaurant/waitlist",status_code=201)
+def restaurant_waitlist_add(data: RestaurantWaitlistIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor");require_waiter_single_branch(conn,user)
+    wid,now=new_id(),now_iso()
+    with transaction(conn):
+        conn.execute("INSERT INTO restaurant_waitlist(id,company_id,customer_name,party_size,phone,notes,status,created_by,created_at) VALUES(?,?,?,?,?,?,'waiting',?,?)",(wid,user["company_id"],data.customer_name.strip(),data.party_size,data.phone.strip(),data.notes.strip(),user["id"],now));audit(conn,user["company_id"],user["id"],"restaurant.waitlist_added","restaurant_waitlist",wid,{"party_size":data.party_size})
+    return {"id":wid,"customer_name":data.customer_name.strip(),"party_size":data.party_size,"status":"waiting","created_at":now}
+
+
+@app.post("/v1/restaurant/waitlist/{wait_id}/seat",status_code=201)
+def restaurant_waitlist_seat(wait_id: str,data: RestaurantWaitlistSeatIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor");require_waiter_single_branch(conn,user);now=now_iso();sid=new_id()
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        guest=conn.execute("SELECT * FROM restaurant_waitlist WHERE id=? AND company_id=? AND status='waiting'"+lock,(wait_id,user["company_id"])).fetchone()
+        if not guest:raise HTTPException(404,"Cliente aguardando não encontrado.")
+        table=conn.execute("SELECT id,status,waiter_id,branch_id FROM restaurant_tables WHERE id=? AND company_id=? AND active=1"+lock,(data.table_id,user["company_id"])).fetchone()
+        if not table or table["status"]!='available':raise HTTPException(409,"Mesa livre não encontrada.")
+        if table["branch_id"] is not None:raise HTTPException(409,"Use a rota da filial para sentar clientes nela.")
+        conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at,waiter_id,branch_id) VALUES(?,?,?,'open',?,?,NULL,?,NULL)",(sid,user["company_id"],data.table_id,user["id"],now,table["waiter_id"]))
+        changed=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND branch_id IS NULL AND status='available'",(data.table_id,user["company_id"]))
+        if changed.rowcount!=1:raise HTTPException(409,"Mesa mudou de estado; atualize o salão.")
+        conn.execute("UPDATE restaurant_waitlist SET status='seated',service_id=?,seated_at=? WHERE id=? AND company_id=? AND status='waiting'",(sid,now,wait_id,user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"restaurant.waitlist_seated","restaurant_waitlist",wait_id,{"table_id":data.table_id,"service_id":sid,"party_size":guest["party_size"]})
+    return {"id":wait_id,"service_id":sid,"table_id":data.table_id,"status":"seated","seated_at":now}
+
+
+@app.post("/v1/restaurant/waitlist/{wait_id}/cancel")
+def restaurant_waitlist_cancel(wait_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor");require_waiter_single_branch(conn,user);now=now_iso()
+    with transaction(conn):
+        row=conn.execute("SELECT id FROM restaurant_waitlist WHERE id=? AND company_id=? AND status='waiting'",(wait_id,user["company_id"])).fetchone()
+        if not row:raise HTTPException(409,"Só é possível remover quem ainda está aguardando.")
+        conn.execute("UPDATE restaurant_waitlist SET status='cancelled',cancelled_at=? WHERE id=? AND company_id=?",(now,wait_id,user["company_id"]));audit(conn,user["company_id"],user["id"],"restaurant.waitlist_cancelled","restaurant_waitlist",wait_id,{})
+    return {"id":wait_id,"status":"cancelled","cancelled_at":now}
+
 
 @app.get("/v1/restaurant/areas")
 def restaurant_areas(conn: DB,user: USER):
