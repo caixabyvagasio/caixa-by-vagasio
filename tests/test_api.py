@@ -735,7 +735,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status'),(18,'restaurant_menu_item_price'),(19,'restaurant_menu_addons_and_order_snapshots')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status'),(18,'restaurant_menu_item_price'),(19,'restaurant_menu_addons_and_order_snapshots'),(20,'restaurant_menu_option_groups_and_order_snapshots')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1521,6 +1521,41 @@ def test_branch_restaurant_menu_item_availability_is_isolated_to_branch(world):
     assert any(e['action']=='restaurant.branch_menu_availability_changed' and e['entity_id']==menu['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
 
 
+
+
+
+def test_restaurant_option_groups_enforce_min_max_and_snapshot_prices(world):
+    owner=company(world,name="Option groups",slug="option-groups",email="option-groups@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Option room'}).json();table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'OG-1','capacity':4}).json();service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json();tab=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Option tab'}).json()
+    p=product(world,owner,sku='OPTION-BASE',name='Burger',price='10.00');cat=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Option foods'}).json();menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json()
+    group=world.post(f"/v1/restaurant/menu/items/{menu['id']}/option-groups",headers=headers,json={'name':'Ponto da carne','min_select':1,'max_select':1});assert group.status_code==201,group.text
+    rare=world.post(f"/v1/restaurant/menu/option-groups/{group.json()['id']}/options",headers=headers,json={'name':'Ao ponto','price':'0.00'}).json();well=world.post(f"/v1/restaurant/menu/option-groups/{group.json()['id']}/options",headers=headers,json={'name':'Bem passado','price':'1.50'}).json()
+    assert world.get('/v1/restaurant/menu',headers=headers).json()['items'][0]['option_groups'][0]['min_select']==1
+    missing=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'2'}]});assert missing.status_code==422
+    over=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1','options':[{'option_id':rare['id']},{'option_id':well['id']}]}]});assert over.status_code==422
+    created=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'2','options':[{'option_id':well['id']}]}]});assert created.status_code==201,created.text
+    detail=world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers).json();assert detail['total']=='23.00';assert detail['items'][0]['options'][0]['name']=='Bem passado';assert detail['items'][0]['unit_price']=='11.50'
+    assert world.delete(f"/v1/restaurant/menu/option-groups/{group.json()['id']}/options/{well['id']}",headers=headers).status_code==200
+    assert world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers).json()['total']=='23.00'
+    sent=world.post(f"/v1/restaurant/orders/{created.json()['id']}/send",headers=headers);assert sent.status_code==200
+    assert world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items'][0]['options'][0]['name']=='Bem passado'
+    invalid=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1','options':[{'option_id':well['id']}]}]});assert invalid.status_code==404
+
+
+def test_branch_restaurant_option_groups_are_branch_scoped_and_validated(world):
+    owner=company(world,name="Branch option groups",slug="branch-option-groups",email="branch-option-groups@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id'];area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Branch options'}).json();table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'BO-1','capacity':4}).json();service=world.post(f"/v1/branches/{branch}/restaurant/tables/{table['id']}/open",headers=headers).json();tab=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Branch option tab'}).json()
+    p=product(world,owner,sku='BRANCH-OPTION',name='Pizza',price='20.00');cat=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Branch options menu'}).json();menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json()
+    group=world.post(f"/v1/branches/{branch}/restaurant/menu/items/{menu['id']}/option-groups",headers=headers,json={'name':'Tamanho','min_select':1,'max_select':1});assert group.status_code==201,group.text
+    large=world.post(f"/v1/branches/{branch}/restaurant/menu/option-groups/{group.json()['id']}/options",headers=headers,json={'name':'Grande','price':'4.00'});assert large.status_code==201,large.text
+    rejected=world.post(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1','options':[{'option_id':large.json()['id'],'quantity':2}]}]});assert rejected.status_code==422
+    created=world.post(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1.5','options':[{'option_id':large.json()['id']}]}]});assert created.status_code==201,created.text
+    detail=world.get(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}",headers=headers).json();assert detail['total']=='36.00';assert detail['items'][0]['options'][0]['name']=='Grande'
+    sent=world.post(f"/v1/branches/{branch}/restaurant/orders/{created.json()['id']}/send",headers=headers);assert sent.status_code==200
+    assert world.get(f'/v1/branches/{branch}/restaurant/production?station=kitchen',headers=headers).json()['items'][0]['options'][0]['name']=='Grande'
+    foreign=world.post(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1','options':[{'option_id':'not-this-branch'}]}]});assert foreign.status_code==404
 
 
 def test_restaurant_menu_addons_are_price_snapshotted_and_audited(world):
