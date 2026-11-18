@@ -280,3 +280,10 @@
 - CI/deploy destas alterações de varejo/payables pendentes. Código continua só em dev branch quando CI verde; nenhum dado persistente alterado.
 
 - Fechamento desta continuação: varejo/caixa legacy e baixa concorrente de contas a pagar publicados no dev no commit `9e68477fc93c2656182c1d7267c66380d0542e7b`, deploy `dep-dbu99tjrjlhs73a0dimg` live. CI geral `44141669301` e PostgreSQL `44141669479` success. Suíte local 114 passed/1 skipped. Health PostgreSQL; payments/fiscal false.
+
+
+## Segmento restaurante — início do ciclo funcional contínuo (17/11/2026 20:55 BRT)
+- Inspecionado HEAD `671bc9f158cf0178e1557ab7426ed532a8195c36`; catálogo, salão, mesas, reservas básicas, cardápio, comandas/pedidos, fila por estação, recebimento cash e portal básico do garçom já existem. Essa base é parcial; não se declara segmento completo.
+- Entrega local deste incremento: ciclo de reserva lista estados filtráveis; confirmação pode ser convertida em atendimento real atomicamente, abrindo serviço/ocupando mesa/marcando reserva seated; duplicidade/mesa ocupada retorna 409; reserva confirmada pode ser cancelada ou registrada como não comparecimento com auditoria. Mesmas rotas para legado e branch-scoped. Interface exibe estado e ações no painel de reservas, ambos os modos.
+- Corrigido parâmetro query de status que anteriormente ignorava `?status=all`; adicionados testes API para assentar, impedir repetição, cancelar e no-show em branch/legacy. Full local: **125 passed, 1 skipped**; pytest local usa SQLite, CI PostgreSQL será condição de publicação.
+- Foco de produto continua exclusivamente restaurantes/lanchonetes; nenhum módulo especializado de outro segmento será criado. Próxima execução após CI: aprofundar fichas técnicas/ingredientes e cancelamentos/estornos operacionais.
