@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 22:25 | `9dbd5c342a8a0293172a3afe361a5f24211af2f3` | Open tabs merge safely (orders moved, source closed, paid tabs refused), UI, tests 138 passed/1 skipped, general+PostgreSQL CI green, dev `dep-dbuft688v5cc738vromg` live. | Continue remaining restaurant features and authenticated E2E. |
+
+
+
 | 2026-11-17 22:03 | `7c4a2f6ee7c63c95518d54454c58970914e04fd2` | Audited atomic table transfer (legacy + branch) + UI; menu availability toggle preceding deployment; 136 passed/1 skipped; general+PostgreSQL CI green; dev `dep-dbufo10m7kps73c98khg` live/healthy. | Continue restaurant feature scope and E2E. |
 
 
