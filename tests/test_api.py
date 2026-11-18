@@ -1950,6 +1950,54 @@ def test_concurrent_branch_table_open_creates_one_service_only(world):
     finally: conn.close()
 
 
+
+def test_branch_reservation_lifecycle_seats_guest_and_opens_service_atomically(world):
+    owner=company(world,name="Reservation lifecycle",slug="reservation-lifecycle",email="reservation-lifecycle@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Salão lifecycle'});assert area.status_code==201,area.text
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area.json()['id'],'label':'RL-01','capacity':4});assert table.status_code==201,table.text
+    reservation=world.post(f'/v1/branches/{branch}/restaurant/reservations',headers=headers,json={'table_id':table.json()['id'],'customer_name':'Cliente lifecycle','party_size':3,'starts_at':'2026-12-12T18:00','ends_at':'2026-12-12T19:00'});assert reservation.status_code==201,reservation.text
+    seated=world.post(f"/v1/branches/{branch}/restaurant/reservations/{reservation.json()['id']}/seat",headers=headers);assert seated.status_code==201,seated.text
+    assert seated.json()['status']=='seated' and seated.json()['service_id']
+    floor=world.get(f'/v1/branches/{branch}/restaurant/floor',headers=headers).json()['items']
+    assert next(x for x in floor if x['id']==table.json()['id'])['status']=='occupied'
+    listed=world.get(f'/v1/branches/{branch}/restaurant/reservations?status=all',headers=headers).json()['items']
+    assert next(x for x in listed if x['id']==reservation.json()['id'])['status']=='seated'
+    assert world.post(f"/v1/branches/{branch}/restaurant/reservations/{reservation.json()['id']}/seat",headers=headers).status_code==409
+
+
+def test_branch_reservation_can_cancel_or_record_no_show_with_audit(world):
+    owner=company(world,name="Reservation outcomes",slug="reservation-outcomes",email="reservation-outcomes@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Salão outcomes'}).json()
+    table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'RO-01','capacity':4}).json()
+    results=[]
+    for i,action in enumerate(('cancel','no_show')):
+        reservation=world.post(f'/v1/branches/{branch}/restaurant/reservations',headers=headers,json={'table_id':table['id'],'customer_name':f'Cliente {i}','party_size':2,'starts_at':f'2026-12-13T1{i}:00','ends_at':f'2026-12-13T1{i}:45'})
+        assert reservation.status_code==201,reservation.text
+        result=world.post(f"/v1/branches/{branch}/restaurant/reservations/{reservation.json()['id']}/cancel",headers=headers,json={'action':action})
+        assert result.status_code==200 and result.json()['outcome']==action
+        results.append(reservation.json()['id'])
+    events=world.get('/v1/audit-events',headers=headers).json()['items']
+    assert any(e['action']=='restaurant.branch_reservation_cancelled' and e['entity_id']==results[0] for e in events)
+    assert any(e['action']=='restaurant.branch_reservation_no_show' and e['entity_id']==results[1] for e in events)
+
+
+def test_legacy_reservation_lifecycle_seats_guest_and_records_no_show(world):
+    owner=company(world,name="Legacy reservation lifecycle",slug="legacy-reservation-lifecycle",email="legacy-reservation-lifecycle@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Legacy lifecycle'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'LL-01','capacity':4}).json()
+    reservation=world.post('/v1/restaurant/reservations',headers=headers,json={'table_id':table['id'],'customer_name':'Cliente legado','party_size':2,'starts_at':'2026-12-14T18:00','ends_at':'2026-12-14T19:00'});assert reservation.status_code==201,reservation.text
+    seated=world.post(f"/v1/restaurant/reservations/{reservation.json()['id']}/seat",headers=headers);assert seated.status_code==201,seated.text
+    assert world.get('/v1/restaurant/floor',headers=headers).json()['items'][0]['status']=='occupied'
+    other=world.post('/v1/restaurant/reservations',headers=headers,json={'table_id':table['id'],'customer_name':'No show','party_size':1,'starts_at':'2026-12-15T18:00','ends_at':'2026-12-15T19:00'});assert other.status_code==201,other.text
+    outcome=world.post(f"/v1/restaurant/reservations/{other.json()['id']}/cancel",headers=headers,json={'action':'no_show'})
+    assert outcome.status_code==200 and outcome.json()['outcome']=='no_show'
+
+
 def test_concurrent_branch_reservations_for_same_table_do_not_overlap(world):
     from concurrent.futures import ThreadPoolExecutor
     token=company(world,'Branch reservations','branch-reservations','branch-reservations@example.test');headers=auth(token)
