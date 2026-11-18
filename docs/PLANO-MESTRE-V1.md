@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 22:03 | `d2a43194acde8c385e29d8082a171257877735b6` | Restaurant menu item pause/reactivate legacy and branch, UI role gating, audit, no order/history/stock mutation; 134 passed/1 skipped, CI both green, dev `dep-dbufiuifngtc73cktuug` live/healthy. | Continue restaurant-only; addons, recipes, delivery/QR, function-specific UI and authenticated E2E remain. |
+
+
+
 | 2026-11-17 21:21 | `c18ef4ce761af7797bac5796403608da40d0d5ec` | Restaurant reservation lifecycle with persisted no_show migration v17; audited whole-order cancellation before prep in legacy+branch. 128 passed/1 skipped; general `44207151784`+PostgreSQL `44207151742` green; dev `dep-dbuf05vf3r2c73ase270` live, health PostgreSQL. | Continue only restaurant scope. Remaining: item cancel after prep w/ compensating policy, modifiers/variants/combos/recipes, guest/payment splits, delivery, QR, operational settings/realtime, role-specific UI, authenticated E2E. |
 
 
