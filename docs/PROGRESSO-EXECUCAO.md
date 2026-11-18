@@ -342,3 +342,9 @@
 ## Fila de espera restaurante (2026-11-17 23:03 BRT)
 - Migration aditiva/idempotente v21 com fila isolada para operação sem filial e por filial; APIs listar/cadastrar/cancelar e acomodar em mesa livre com criação atômica de atendimento, mudança de estado da mesa e auditoria. UI mostra grupos aguardando, escolhe mesa livre, acomoda/remove; tela atualiza junto ao salão.
 - Testes locais totais: 144 passed, 1 skipped, incluindo isolamento de filial, criação do atendimento, cancelamento e auditoria. Aguardar CI geral e PostgreSQL, depois deploy apenas no dev.
+
+
+## Publicação confirmada — opções de cardápio e fila de espera (2026-11-17 23:21 BRT)
+- Migration v20 de grupos de opções (min/max, adicionais de preço, snapshots de pedidos em salão/garçom/KDS) e v21 da fila de espera (CRUD, cancelamento, acomodação atômica em mesa livre) publicadas juntas.
+- Testes locais: 144 passed, 1 skipped. CI geral e PostgreSQL passaram no HEAD `b38fbfd0fb18241621a49a253ceb2403cf6d0fc0`. Deploy dev live `dep-dbugolpsrm7s73eqq0c0`; health PostgreSQL OK, pagamentos e fiscal false. JS live confirma as ações e controles do waiter; HTML live versão `restaurant-waitlist1` confirma interface de fila.
+- Segmento continua incompleto: combos/cupões/promoções, fichas técnicas/ingredientes/lotes/perdas, balcão/retirada/delivery/QR, cliente/fidelidade, relatórios financeiros e operacionais específicos, realtime, gestão de equipe, multi-filial completo e teste E2E autenticado desktop/tablet/mobile. Hardware/pagamentos/fiscal aguardam homologação.
