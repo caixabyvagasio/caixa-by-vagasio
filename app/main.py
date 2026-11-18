@@ -520,6 +520,13 @@ def apply_schema_migrations(conn) -> None:
         conn.execute("ALTER TABLE restaurant_reservations_v17 RENAME TO restaurant_reservations")
         conn.execute("CREATE INDEX IF NOT EXISTS restaurant_reservation_overlap ON restaurant_reservations(company_id,table_id,status,starts_at,ends_at)")
     migration(17,"restaurant_reservation_no_show_status",add_reservation_no_show_status)
+    def add_legacy_restaurant_menu_price():
+        cols={r[1] for r in conn.execute("PRAGMA table_info(restaurant_menu_items)").fetchall()}
+        if "unit_price_cents" not in cols:
+            if is_postgres(conn): conn.execute("ALTER TABLE restaurant_menu_items ADD COLUMN unit_price_cents BIGINT NOT NULL DEFAULT 0")
+            else: conn.execute("ALTER TABLE restaurant_menu_items ADD COLUMN unit_price_cents INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE restaurant_menu_items SET unit_price_cents=(SELECT price_cents FROM products WHERE products.id=restaurant_menu_items.product_id AND products.company_id=restaurant_menu_items.company_id) WHERE unit_price_cents=0 AND EXISTS(SELECT 1 FROM products WHERE products.id=restaurant_menu_items.product_id AND products.company_id=restaurant_menu_items.company_id)")
+    migration(18,"restaurant_menu_item_price",add_legacy_restaurant_menu_price)
 
 
 def init_db() -> None:
@@ -1012,6 +1019,9 @@ class RestaurantMenuItemIn(StrictModel):
     category_id: str
     product_id: str
     station: Literal["kitchen","bar","counter"] = "kitchen"
+    price: Decimal | None = Field(default=None,gt=0,max_digits=12,decimal_places=2)
+class RestaurantMenuPriceIn(StrictModel):
+    price: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
 class RestaurantTabIn(StrictModel):
     label: str = Field(min_length=1,max_length=40)
 class WaiterCreateIn(StrictModel):
@@ -2188,10 +2198,23 @@ def branch_restaurant_create_menu_item(branch_id: str,data: RestaurantMenuItemIn
     mid,now=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO branch_restaurant_menu_items(id,company_id,branch_id,category_id,product_id,station,active,created_by,created_at,unit_price_cents) SELECT ?,?,?,?,?,?,1,?,?,price_cents FROM products WHERE id=? AND company_id=? AND active=1",(mid,user["company_id"],branch_id,data.category_id,data.product_id,data.station,user["id"],now,data.product_id,user["company_id"]))
+            menu_price=decimal_money_cents(data.price) if data.price is not None else None
+            conn.execute("INSERT INTO branch_restaurant_menu_items(id,company_id,branch_id,category_id,product_id,station,active,created_by,created_at,unit_price_cents) SELECT ?,?,?,?,?,?,1,?,?,COALESCE(?,price_cents) FROM products WHERE id=? AND company_id=? AND active=1",(mid,user["company_id"],branch_id,data.category_id,data.product_id,data.station,user["id"],now,menu_price,data.product_id,user["company_id"]))
             audit(conn,user["company_id"],user["id"],"restaurant.branch_menu_item_created","restaurant_menu_item",mid,{"branch_id":branch_id,"product_id":data.product_id,"category_id":data.category_id,"station":data.station})
     except sqlite3.IntegrityError: raise HTTPException(409,"Produto já vinculado ao cardápio desta filial.")
     return {"id":mid,"branch_id":branch_id,"category_id":data.category_id,"product_id":data.product_id,"station":data.station}
+
+
+@app.patch("/v1/branches/{branch_id}/restaurant/menu/items/{item_id}/price")
+def branch_restaurant_update_menu_price(branch_id: str,item_id: str,data: RestaurantMenuPriceIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.menu")
+    price=decimal_money_cents(data.price);now=now_iso()
+    with transaction(conn):
+        row=conn.execute("SELECT unit_price_cents FROM branch_restaurant_menu_items WHERE id=? AND company_id=? AND branch_id=? AND active=1",(item_id,user["company_id"],branch_id)).fetchone()
+        if not row:raise HTTPException(404,"Item do cardápio não encontrado nesta filial.")
+        conn.execute("UPDATE branch_restaurant_menu_items SET unit_price_cents=? WHERE id=? AND company_id=? AND branch_id=?",(price,item_id,user["company_id"],branch_id))
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_menu_price_updated","restaurant_menu_item",item_id,{"branch_id":branch_id,"from_cents":int(row["unit_price_cents"]),"to_cents":price})
+    return {"id":item_id,"branch_id":branch_id,"price":cents_to_money(price)}
 
 
 @app.post("/v1/branches/{branch_id}/restaurant/services/{service_id}/tabs",status_code=201)
@@ -2710,7 +2733,7 @@ def restaurant_reserve(data: RestaurantReservationIn,conn: DB,user: USER):
 def restaurant_menu(conn: DB,user: USER):
     require_restaurant_floor(conn,user)
     cats=conn.execute("SELECT id,name FROM restaurant_menu_categories WHERE company_id=? AND active=1 ORDER BY name",(user["company_id"],)).fetchall()
-    rows=conn.execute("SELECT m.id,m.category_id,c.name AS category,m.product_id,p.name,p.price_cents,p.unit,m.station FROM restaurant_menu_items m JOIN restaurant_menu_categories c ON c.id=m.category_id AND c.company_id=m.company_id JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.company_id=? AND m.active=1 AND p.active=1 ORDER BY c.name,p.name",(user["company_id"],)).fetchall()
+    rows=conn.execute("SELECT m.id,m.category_id,c.name AS category,m.product_id,p.name,m.unit_price_cents AS price_cents,p.unit,m.station FROM restaurant_menu_items m JOIN restaurant_menu_categories c ON c.id=m.category_id AND c.company_id=m.company_id JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.company_id=? AND m.active=1 AND p.active=1 ORDER BY c.name,p.name",(user["company_id"],)).fetchall()
     return {"categories":[dict(x) for x in cats],"items":[{"id":r["id"],"category_id":r["category_id"],"category":r["category"],"product_id":r["product_id"],"name":r["name"],"price":cents_to_money(r["price_cents"]),"unit":r["unit"],"station":r["station"]} for r in rows]}
 
 @app.post("/v1/restaurant/menu/categories",status_code=201)
@@ -2732,10 +2755,24 @@ def restaurant_create_menu_item(data: RestaurantMenuItemIn,conn: DB,user: USER):
     mid,now=new_id(),now_iso()
     try:
         with transaction(conn):
-            conn.execute("INSERT INTO restaurant_menu_items(id,company_id,category_id,product_id,station,active,created_by,created_at) VALUES(?,?,?,?,?,1,?,?)",(mid,user["company_id"],data.category_id,data.product_id,data.station,user["id"],now))
+            product_price=conn.execute("SELECT price_cents FROM products WHERE id=? AND company_id=? AND active=1",(data.product_id,user["company_id"])).fetchone()[0]
+            menu_price=decimal_money_cents(data.price) if data.price is not None else int(product_price)
+            conn.execute("INSERT INTO restaurant_menu_items(id,company_id,category_id,product_id,station,active,created_by,created_at,unit_price_cents) VALUES(?,?,?,?,?,1,?,?,?)",(mid,user["company_id"],data.category_id,data.product_id,data.station,user["id"],now,menu_price))
             audit(conn,user["company_id"],user["id"],"restaurant.menu_item_created","restaurant_menu_item",mid,{"product_id":data.product_id,"category_id":data.category_id,"station":data.station})
     except sqlite3.IntegrityError: raise HTTPException(409,"Produto já vinculado ao cardápio.")
-    return {"id":mid,"category_id":data.category_id,"product_id":data.product_id,"station":data.station}
+    return {"id":mid,"category_id":data.category_id,"product_id":data.product_id,"station":data.station,"price":cents_to_money(menu_price)}
+
+
+@app.patch("/v1/restaurant/menu/items/{item_id}/price")
+def restaurant_update_menu_price(item_id: str,data: RestaurantMenuPriceIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.menu")
+    price=decimal_money_cents(data.price)
+    with transaction(conn):
+        row=conn.execute("SELECT unit_price_cents FROM restaurant_menu_items WHERE id=? AND company_id=? AND active=1",(item_id,user["company_id"])).fetchone()
+        if not row:raise HTTPException(404,"Item do cardápio não encontrado.")
+        conn.execute("UPDATE restaurant_menu_items SET unit_price_cents=? WHERE id=? AND company_id=?",(price,item_id,user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"restaurant.menu_price_updated","restaurant_menu_item",item_id,{"from_cents":int(row["unit_price_cents"]),"to_cents":price})
+    return {"id":item_id,"price":cents_to_money(price)}
 
 @app.post("/v1/restaurant/services/{service_id}/tabs",status_code=201)
 def restaurant_create_tab(service_id: str,data: RestaurantTabIn,conn: DB,user: USER):
@@ -2761,7 +2798,7 @@ def restaurant_create_order(tab_id: str,data: RestaurantOrderIn,conn: DB,user: U
         if not tab or tab["status"]!='open': raise HTTPException(409,"Comanda não está aberta.")
         conn.execute("INSERT INTO restaurant_orders(id,company_id,tab_id,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,'open',?,?,?,?)",(oid,user["company_id"],tab_id,data.notes.strip(),user["id"],now,now))
         for line in data.items:
-            menu=conn.execute("SELECT m.id,m.product_id,m.station,p.name,p.price_cents FROM restaurant_menu_items m JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.id=? AND m.company_id=? AND m.active=1 AND p.active=1",(line.menu_item_id,user["company_id"])).fetchone()
+            menu=conn.execute("SELECT m.id,m.product_id,m.station,p.name,m.unit_price_cents AS price_cents FROM restaurant_menu_items m JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.id=? AND m.company_id=? AND m.active=1 AND p.active=1",(line.menu_item_id,user["company_id"])).fetchone()
             if not menu: raise HTTPException(404,"Item de cardápio não encontrado.")
             conn.execute("INSERT INTO restaurant_order_items(id,company_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?)",(new_id(),user["company_id"],oid,menu["id"],menu["product_id"],menu["name"],decimal_milli(line.quantity),menu["price_cents"],menu["station"],now))
         audit(conn,user["company_id"],user["id"],"restaurant.order_created","restaurant_order",oid,{"tab_id":tab_id,"item_count":len(data.items),"notes":data.notes})
