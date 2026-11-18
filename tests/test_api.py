@@ -1483,6 +1483,14 @@ def test_restaurant_order_cancellation_is_audited_and_only_before_preparation(wo
     item=world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items'][0]
     assert world.patch(f"/v1/restaurant/order-items/{item['id']}",headers=headers,json={'status':'preparing'}).status_code==200
     blocked=world.post(f"/v1/restaurant/orders/{order2['id']}/cancel",headers=headers,json={'reason':'Late cancellation'});assert blocked.status_code==409,blocked.text
+    tab3=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Partial then cancel'}).json()
+    order3=world.post(f"/v1/restaurant/tabs/{tab3['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1'},{'menu_item_id':menu['id'],'quantity':'2'}]}).json()
+    assert world.post(f"/v1/restaurant/orders/{order3['id']}/send",headers=headers).status_code==200
+    queued=world.get('/v1/restaurant/production?station=kitchen',headers=headers).json()['items']
+    item3=next(i for i in queued if i['order_id']==order3['id'])
+    assert world.patch(f"/v1/restaurant/order-items/{item3['id']}",headers=headers,json={'status':'cancelled'}).status_code==200
+    remaining=world.post(f"/v1/restaurant/orders/{order3['id']}/cancel",headers=headers,json={'reason':'Cancelar restante ainda não preparado'})
+    assert remaining.status_code==200 and remaining.json()['status']=='cancelled',remaining.text
 
 
 def test_branch_restaurant_order_cancellation_is_audited_and_respects_prep_stage(world):
