@@ -538,6 +538,21 @@ def apply_schema_migrations(conn) -> None:
                 cols={r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 if "addons_json" not in cols:conn.execute(f"ALTER TABLE {table} ADD COLUMN addons_json TEXT NOT NULL DEFAULT '[]'")
     migration(19,"restaurant_menu_addons_and_order_snapshots",add_restaurant_addons)
+    def add_restaurant_option_groups():
+        conn.execute("CREATE TABLE IF NOT EXISTS restaurant_menu_option_groups(id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),menu_item_id TEXT NOT NULL REFERENCES restaurant_menu_items(id),name TEXT NOT NULL,min_select INTEGER NOT NULL DEFAULT 0 CHECK(min_select>=0),max_select INTEGER NOT NULL DEFAULT 1 CHECK(max_select BETWEEN 1 AND 20 AND min_select<=max_select),active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),created_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL,UNIQUE(company_id,menu_item_id,name))")
+        conn.execute("CREATE INDEX IF NOT EXISTS restaurant_menu_option_groups_lookup ON restaurant_menu_option_groups(company_id,menu_item_id,active)")
+        conn.execute("CREATE TABLE IF NOT EXISTS restaurant_menu_options(id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),group_id TEXT NOT NULL REFERENCES restaurant_menu_option_groups(id),name TEXT NOT NULL,price_cents INTEGER NOT NULL DEFAULT 0 CHECK(price_cents>=0),active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),created_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL,UNIQUE(company_id,group_id,name))")
+        conn.execute("CREATE INDEX IF NOT EXISTS restaurant_menu_options_lookup ON restaurant_menu_options(company_id,group_id,active)")
+        conn.execute("CREATE TABLE IF NOT EXISTS branch_restaurant_menu_option_groups(id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),menu_item_id TEXT NOT NULL REFERENCES branch_restaurant_menu_items(id),name TEXT NOT NULL,min_select INTEGER NOT NULL DEFAULT 0 CHECK(min_select>=0),max_select INTEGER NOT NULL DEFAULT 1 CHECK(max_select BETWEEN 1 AND 20 AND min_select<=max_select),active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),created_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL,UNIQUE(company_id,branch_id,menu_item_id,name))")
+        conn.execute("CREATE INDEX IF NOT EXISTS branch_restaurant_option_groups_lookup ON branch_restaurant_menu_option_groups(company_id,branch_id,menu_item_id,active)")
+        conn.execute("CREATE TABLE IF NOT EXISTS branch_restaurant_menu_options(id TEXT PRIMARY KEY,company_id TEXT NOT NULL REFERENCES companies(id),branch_id TEXT NOT NULL REFERENCES branches(id),group_id TEXT NOT NULL REFERENCES branch_restaurant_menu_option_groups(id),name TEXT NOT NULL,price_cents INTEGER NOT NULL DEFAULT 0 CHECK(price_cents>=0),active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),created_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL,UNIQUE(company_id,branch_id,group_id,name))")
+        conn.execute("CREATE INDEX IF NOT EXISTS branch_restaurant_options_lookup ON branch_restaurant_menu_options(company_id,branch_id,group_id,active)")
+        for table in ("restaurant_order_items","branch_restaurant_order_items"):
+            if is_postgres(conn):conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS options_json TEXT NOT NULL DEFAULT '[]'")
+            else:
+                cols={r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if "options_json" not in cols:conn.execute(f"ALTER TABLE {table} ADD COLUMN options_json TEXT NOT NULL DEFAULT '[]'")
+    migration(20,"restaurant_menu_option_groups_and_order_snapshots",add_restaurant_option_groups)
 
 
 def init_db() -> None:
@@ -1058,10 +1073,21 @@ class RestaurantAddonCreateIn(StrictModel):
 class RestaurantAddonSelectionIn(StrictModel):
     addon_id: str
     quantity: int = Field(default=1,ge=1,le=20)
+class RestaurantOptionGroupIn(StrictModel):
+    name: str = Field(min_length=1,max_length=80)
+    min_select: int = Field(default=0,ge=0,le=20)
+    max_select: int = Field(default=1,ge=1,le=20)
+class RestaurantMenuOptionIn(StrictModel):
+    name: str = Field(min_length=1,max_length=80)
+    price: Decimal = Field(ge=0,max_digits=12,decimal_places=2)
+class RestaurantOptionSelectionIn(StrictModel):
+    option_id: str
+    quantity: int = Field(default=1,ge=1,le=20)
 class RestaurantOrderLineIn(StrictModel):
     menu_item_id: str
     quantity: Decimal = Field(gt=0,max_digits=12,decimal_places=3)
     addons: list[RestaurantAddonSelectionIn] = Field(default_factory=list,max_length=20)
+    options: list[RestaurantOptionSelectionIn] = Field(default_factory=list,max_length=100)
 class RestaurantOrderIn(StrictModel):
     items: list[RestaurantOrderLineIn] = Field(min_length=1,max_length=50)
     notes: str = Field(default="",max_length=500)
@@ -2203,7 +2229,7 @@ def branch_restaurant_menu(branch_id: str,conn: DB,user: USER):
     require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"products.read")
     cats=conn.execute("SELECT id,name FROM branch_restaurant_menu_categories WHERE company_id=? AND branch_id=? AND active=1 ORDER BY name,id",(user["company_id"],branch_id)).fetchall()
     rows=conn.execute("SELECT m.id,m.category_id,c.name AS category,m.product_id,p.name,m.unit_price_cents AS price_cents,p.unit,m.station,m.active FROM branch_restaurant_menu_items m JOIN branch_restaurant_menu_categories c ON c.id=m.category_id AND c.company_id=m.company_id AND c.branch_id=m.branch_id JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.company_id=? AND m.branch_id=? AND p.active=1 ORDER BY c.name,p.name,m.id",(user["company_id"],branch_id)).fetchall()
-    return {"branch_id":branch_id,"categories":[dict(r) for r in cats],"items":[{"id":r["id"],"category_id":r["category_id"],"category":r["category"],"product_id":r["product_id"],"name":r["name"],"price":cents_to_money(r["price_cents"]),"unit":r["unit"],"station":r["station"],"active":bool(r["active"]),"addons":[{"id":a["id"],"name":a["name"],"price":cents_to_money(a["price_cents"])} for a in conn.execute("SELECT id,name,price_cents FROM branch_restaurant_menu_addons WHERE company_id=? AND branch_id=? AND menu_item_id=? AND active=1 ORDER BY name,id",(user["company_id"],branch_id,r["id"])).fetchall()]} for r in rows],"legacy_unassigned_excluded":True}
+    return {"branch_id":branch_id,"categories":[dict(r) for r in cats],"items":[{"id":r["id"],"category_id":r["category_id"],"category":r["category"],"product_id":r["product_id"],"name":r["name"],"price":cents_to_money(r["price_cents"]),"unit":r["unit"],"station":r["station"],"active":bool(r["active"]),"addons":[{"id":a["id"],"name":a["name"],"price":cents_to_money(a["price_cents"])} for a in conn.execute("SELECT id,name,price_cents FROM branch_restaurant_menu_addons WHERE company_id=? AND branch_id=? AND menu_item_id=? AND active=1 ORDER BY name,id",(user["company_id"],branch_id,r["id"])).fetchall()],"option_groups":[{"id":g["id"],"name":g["name"],"min_select":g["min_select"],"max_select":g["max_select"],"options":[{"id":o["id"],"name":o["name"],"price":cents_to_money(o["price_cents"])} for o in conn.execute("SELECT id,name,price_cents FROM branch_restaurant_menu_options WHERE company_id=? AND branch_id=? AND group_id=? AND active=1 ORDER BY name,id",(user["company_id"],branch_id,g["id"])).fetchall()]} for g in conn.execute("SELECT id,name,min_select,max_select FROM branch_restaurant_menu_option_groups WHERE company_id=? AND branch_id=? AND menu_item_id=? AND active=1 ORDER BY name,id",(user["company_id"],branch_id,r["id"])).fetchall()]} for r in rows],"legacy_unassigned_excluded":True}
 
 
 @app.post("/v1/branches/{branch_id}/restaurant/menu/categories",status_code=201)
@@ -2255,6 +2281,39 @@ def branch_restaurant_disable_menu_addon(branch_id: str,item_id: str,addon_id: s
         conn.execute("UPDATE branch_restaurant_menu_addons SET active=0 WHERE id=? AND company_id=? AND branch_id=?",(addon_id,user["company_id"],branch_id))
         audit(conn,user["company_id"],user["id"],"restaurant.branch_menu_addon_disabled","restaurant_menu_addon",addon_id,{"branch_id":branch_id,"menu_item_id":item_id,"name":row["name"]})
     return {"id":addon_id,"active":False}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/menu/items/{item_id}/option-groups",status_code=201)
+def branch_restaurant_create_option_group(branch_id: str,item_id: str,data: RestaurantOptionGroupIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.menu")
+    if data.min_select>data.max_select:raise HTTPException(422,"O mínimo não pode ser maior que o máximo.")
+    if not conn.execute("SELECT 1 FROM branch_restaurant_menu_items WHERE id=? AND company_id=? AND branch_id=?",(item_id,user["company_id"],branch_id)).fetchone():raise HTTPException(404,"Item não encontrado nesta filial.")
+    gid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):conn.execute("INSERT INTO branch_restaurant_menu_option_groups(id,company_id,branch_id,menu_item_id,name,min_select,max_select,active,created_by,created_at) VALUES(?,?,?,?,?,?,?,1,?,?)",(gid,user["company_id"],branch_id,item_id,data.name.strip(),data.min_select,data.max_select,user["id"],now));audit(conn,user["company_id"],user["id"],"restaurant.branch_option_group_created","restaurant_menu_option_group",gid,{"branch_id":branch_id,"menu_item_id":item_id,"min_select":data.min_select,"max_select":data.max_select})
+    except sqlite3.IntegrityError:raise HTTPException(409,"Grupo já existe para este item.")
+    return {"id":gid,"name":data.name.strip(),"min_select":data.min_select,"max_select":data.max_select,"active":True}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/menu/option-groups/{group_id}/options",status_code=201)
+def branch_restaurant_create_option(branch_id: str,group_id: str,data: RestaurantMenuOptionIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.menu")
+    if not conn.execute("SELECT 1 FROM branch_restaurant_menu_option_groups WHERE id=? AND company_id=? AND branch_id=? AND active=1",(group_id,user["company_id"],branch_id)).fetchone():raise HTTPException(404,"Grupo não encontrado nesta filial.")
+    oid,price,now=new_id(),decimal_money_cents(data.price),now_iso()
+    try:
+        with transaction(conn):conn.execute("INSERT INTO branch_restaurant_menu_options(id,company_id,branch_id,group_id,name,price_cents,active,created_by,created_at) VALUES(?,?,?,?,?,?,1,?,?)",(oid,user["company_id"],branch_id,group_id,data.name.strip(),price,user["id"],now));audit(conn,user["company_id"],user["id"],"restaurant.branch_menu_option_created","restaurant_menu_option",oid,{"branch_id":branch_id,"group_id":group_id,"price_cents":price})
+    except sqlite3.IntegrityError:raise HTTPException(409,"Opção já existe neste grupo.")
+    return {"id":oid,"group_id":group_id,"name":data.name.strip(),"price":cents_to_money(price),"active":True}
+
+
+@app.delete("/v1/branches/{branch_id}/restaurant/menu/option-groups/{group_id}/options/{option_id}")
+def branch_restaurant_disable_option(branch_id: str,group_id: str,option_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.menu")
+    with transaction(conn):
+        row=conn.execute("SELECT name FROM branch_restaurant_menu_options WHERE id=? AND group_id=? AND company_id=? AND branch_id=?",(option_id,group_id,user["company_id"],branch_id)).fetchone()
+        if not row:raise HTTPException(404,"Opção não encontrada nesta filial.")
+        conn.execute("UPDATE branch_restaurant_menu_options SET active=0 WHERE id=? AND group_id=? AND company_id=? AND branch_id=?",(option_id,group_id,user["company_id"],branch_id));audit(conn,user["company_id"],user["id"],"restaurant.branch_menu_option_disabled","restaurant_menu_option",option_id,{"branch_id":branch_id,"group_id":group_id})
+    return {"id":option_id,"active":False}
 
 
 @app.patch("/v1/branches/{branch_id}/restaurant/menu/items/{item_id}/availability")
@@ -2314,6 +2373,31 @@ def restaurant_addon_snapshot(conn, company_id: str, menu_item_id: str, selectio
     return snapshot,total
 
 
+def restaurant_option_snapshot(conn,company_id: str,menu_item_id: str,selections,branch_id: str|None):
+    table="branch_restaurant_menu_option_groups" if branch_id else "restaurant_menu_option_groups"
+    if branch_id:groups=conn.execute("SELECT id,name,min_select,max_select FROM branch_restaurant_menu_option_groups WHERE company_id=? AND branch_id=? AND menu_item_id=? AND active=1",(company_id,branch_id,menu_item_id)).fetchall()
+    else:groups=conn.execute("SELECT id,name,min_select,max_select FROM restaurant_menu_option_groups WHERE company_id=? AND menu_item_id=? AND active=1",(company_id,menu_item_id)).fetchall()
+    selected={}
+    for selection in selections:
+        if selection.option_id in selected:raise HTTPException(422,"Opção duplicada; ajuste a quantidade.")
+        if branch_id:row=conn.execute("SELECT o.id,o.name,o.group_id,o.price_cents,g.menu_item_id FROM branch_restaurant_menu_options o JOIN branch_restaurant_menu_option_groups g ON g.id=o.group_id AND g.company_id=o.company_id AND g.branch_id=o.branch_id WHERE o.id=? AND o.company_id=? AND o.branch_id=? AND o.active=1 AND g.active=1",(selection.option_id,company_id,branch_id)).fetchone()
+        else:row=conn.execute("SELECT o.id,o.name,o.group_id,o.price_cents,g.menu_item_id FROM restaurant_menu_options o JOIN restaurant_menu_option_groups g ON g.id=o.group_id AND g.company_id=o.company_id WHERE o.id=? AND o.company_id=? AND o.active=1 AND g.active=1",(selection.option_id,company_id)).fetchone()
+        if not row or row["menu_item_id"]!=menu_item_id:raise HTTPException(404,"Opção indisponível para este item do cardápio.")
+        selected[row["id"]]=(row,int(selection.quantity))
+    accepted={str(g["id"]):g for g in groups};by_group={str(gid):[] for gid in accepted}
+    for row,qty in selected.values():
+        gid=str(row["group_id"])
+        if gid not in accepted:raise HTTPException(409,"O grupo da opção foi desativado.")
+        by_group[gid].append((row,qty))
+    snapshot=[];total=0
+    for gid,g in accepted.items():
+        choices=by_group[gid];count=sum(q for _,q in choices)
+        if count<int(g["min_select"]) or count>int(g["max_select"]):raise HTTPException(422,f"Grupo '{g['name']}' requer entre {g['min_select']} e {g['max_select']} seleção(ões).")
+        for row,qty in choices:
+            price=int(row["price_cents"]);total+=price*qty;snapshot.append({"id":row["id"],"group_id":gid,"group":g["name"],"name":row["name"],"quantity":qty,"unit_price_cents":price})
+    return snapshot,total
+
+
 @app.post("/v1/branches/{branch_id}/restaurant/tabs/{tab_id}/orders",status_code=201)
 def branch_restaurant_create_order(branch_id: str,tab_id: str,data: RestaurantOrderIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
@@ -2327,7 +2411,8 @@ def branch_restaurant_create_order(branch_id: str,tab_id: str,data: RestaurantOr
             menu=conn.execute("SELECT m.id,m.product_id,m.station,m.unit_price_cents,p.name FROM branch_restaurant_menu_items m JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.id=? AND m.company_id=? AND m.branch_id=? AND m.active=1 AND p.active=1",(line.menu_item_id,user["company_id"],branch_id)).fetchone()
             if not menu: raise HTTPException(404,"Item de cardápio não encontrado nesta filial.")
             addons,addon_cents=restaurant_addon_snapshot(conn,user["company_id"],menu["id"],line.addons,branch_id)
-            conn.execute("INSERT INTO branch_restaurant_order_items(id,company_id,branch_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at,addons_json) VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?,?)",(new_id(),user["company_id"],branch_id,oid,menu["id"],menu["product_id"],menu["name"],decimal_milli(line.quantity),int(menu["unit_price_cents"])+addon_cents,menu["station"],now,json.dumps(addons)))
+            options,option_cents=restaurant_option_snapshot(conn,user["company_id"],menu["id"],line.options,branch_id)
+            conn.execute("INSERT INTO branch_restaurant_order_items(id,company_id,branch_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at,addons_json,options_json) VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)",(new_id(),user["company_id"],branch_id,oid,menu["id"],menu["product_id"],menu["name"],decimal_milli(line.quantity),int(menu["unit_price_cents"])+addon_cents+option_cents,menu["station"],now,json.dumps(addons),json.dumps(options)))
         conn.execute("INSERT INTO branch_restaurant_events(id,company_id,branch_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],branch_id,tab_id,"order",oid,"created",json.dumps({"count":len(data.items),"notes":data.notes}),user["id"],now))
         audit(conn,user["company_id"],user["id"],"restaurant.branch_order_created","restaurant_order",oid,{"branch_id":branch_id,"tab_id":tab_id,"item_count":len(data.items)})
     return {"id":oid,"branch_id":branch_id,"tab_id":tab_id,"status":"open","items":len(data.items)}
@@ -2388,7 +2473,7 @@ def branch_restaurant_move_unsent_item(branch_id: str,tab_id: str,data: Restaura
         if qty>int(item["quantity_milli"]):raise HTTPException(422,"Quantidade maior que o saldo do item.")
         now=now_iso();order_id=new_id();new_item_id=new_id()
         conn.execute("INSERT INTO branch_restaurant_orders(id,company_id,branch_id,tab_id,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,'open','',?,?,?)",(order_id,user["company_id"],branch_id,data.target_tab_id,user["id"],now,now))
-        conn.execute("INSERT INTO branch_restaurant_order_items(id,company_id,branch_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at,addons_json) VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?,?)",(new_item_id,user["company_id"],branch_id,order_id,item["menu_item_id"],item["product_id"],item["name_snapshot"],qty,item["unit_price_cents"],item["station"],now,item["addons_json"] or "[]"))
+        conn.execute("INSERT INTO branch_restaurant_order_items(id,company_id,branch_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at,addons_json,options_json) VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?,?,?)",(new_item_id,user["company_id"],branch_id,order_id,item["menu_item_id"],item["product_id"],item["name_snapshot"],qty,item["unit_price_cents"],item["station"],now,item["addons_json"] or "[]",item["options_json"] or "[]"))
         remaining=int(item["quantity_milli"])-qty
         if remaining:conn.execute("UPDATE branch_restaurant_order_items SET quantity_milli=? WHERE id=? AND company_id=? AND branch_id=?",(remaining,data.item_id,user["company_id"],branch_id))
         else:conn.execute("UPDATE branch_restaurant_order_items SET status='cancelled' WHERE id=? AND company_id=? AND branch_id=?",(data.item_id,user["company_id"],branch_id))
@@ -2421,8 +2506,8 @@ def branch_restaurant_cancel_order(branch_id: str,order_id: str,data: Restaurant
 @app.get("/v1/branches/{branch_id}/restaurant/production")
 def branch_restaurant_production(branch_id: str,station: Literal["kitchen","bar","counter"],conn: DB,user: USER):
     require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.production")
-    rows=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.status,i.station,i.addons_json,o.tab_id,o.created_at FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id JOIN branch_restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id AND t.branch_id=o.branch_id WHERE i.company_id=? AND i.branch_id=? AND i.station=? AND i.status IN ('queued','preparing','ready') AND o.status IN ('sent','preparing','ready') AND t.status='open' ORDER BY o.created_at,i.created_at",(user["company_id"],branch_id,station)).fetchall()
-    return {"branch_id":branch_id,"station":station,"items":[{"id":r["id"],"order_id":r["order_id"],"tab_id":r["tab_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"addons":json.loads(r["addons_json"] or "[]"),"status":r["status"],"created_at":r["created_at"]} for r in rows]}
+    rows=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.status,i.station,i.addons_json,i.options_json,o.tab_id,o.created_at FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id JOIN branch_restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id AND t.branch_id=o.branch_id WHERE i.company_id=? AND i.branch_id=? AND i.station=? AND i.status IN ('queued','preparing','ready') AND o.status IN ('sent','preparing','ready') AND t.status='open' ORDER BY o.created_at,i.created_at",(user["company_id"],branch_id,station)).fetchall()
+    return {"branch_id":branch_id,"station":station,"items":[{"id":r["id"],"order_id":r["order_id"],"tab_id":r["tab_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"addons":json.loads(r["addons_json"] or "[]"),"options":json.loads(r["options_json"] or "[]"),"status":r["status"],"created_at":r["created_at"]} for r in rows]}
 
 
 @app.patch("/v1/branches/{branch_id}/restaurant/order-items/{item_id}")
@@ -2459,10 +2544,10 @@ def branch_restaurant_tab_detail(branch_id: str,tab_id: str,conn: DB,user: USER)
     require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
     tab=conn.execute("SELECT t.*,s.table_id FROM branch_restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id AND s.branch_id=t.branch_id WHERE t.id=? AND t.company_id=? AND t.branch_id=?",(tab_id,user["company_id"],branch_id)).fetchone()
     if not tab: raise HTTPException(404,"Comanda não encontrada nesta filial.")
-    rows=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,i.station,i.status,i.addons_json FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id WHERE o.tab_id=? AND i.company_id=? AND i.branch_id=? AND i.status<>'cancelled' ORDER BY o.created_at,i.created_at",(tab_id,user["company_id"],branch_id)).fetchall()
+    rows=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,i.station,i.status,i.addons_json,i.options_json FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id WHERE o.tab_id=? AND i.company_id=? AND i.branch_id=? AND i.status<>'cancelled' ORDER BY o.created_at,i.created_at",(tab_id,user["company_id"],branch_id)).fetchall()
     payments=conn.execute("SELECT amount_cents,method,received_at FROM branch_restaurant_tab_payments WHERE tab_id=? AND company_id=? AND branch_id=? ORDER BY received_at",(tab_id,user["company_id"],branch_id)).fetchall()
     total=sum((r["quantity_milli"]*r["unit_price_cents"]+500)//1000 for r in rows);paid=sum(r["amount_cents"] for r in payments)
-    return {"id":tab_id,"branch_id":branch_id,"service_id":tab["service_id"],"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"addons":json.loads(r["addons_json"] or "[]"),"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in rows],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
+    return {"id":tab_id,"branch_id":branch_id,"service_id":tab["service_id"],"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"addons":json.loads(r["addons_json"] or "[]"),"options":json.loads(r["options_json"] or "[]"),"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in rows],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
 
 
 @app.post("/v1/branches/{branch_id}/restaurant/tabs/{tab_id}/payments",status_code=201)
@@ -2916,7 +3001,7 @@ def restaurant_menu(conn: DB,user: USER):
     require_restaurant_floor(conn,user)
     cats=conn.execute("SELECT id,name FROM restaurant_menu_categories WHERE company_id=? AND active=1 ORDER BY name",(user["company_id"],)).fetchall()
     rows=conn.execute("SELECT m.id,m.category_id,c.name AS category,m.product_id,p.name,m.unit_price_cents AS price_cents,p.unit,m.station,m.active FROM restaurant_menu_items m JOIN restaurant_menu_categories c ON c.id=m.category_id AND c.company_id=m.company_id JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.company_id=? AND p.active=1 ORDER BY c.name,p.name",(user["company_id"],)).fetchall()
-    return {"categories":[dict(x) for x in cats],"items":[{"id":r["id"],"category_id":r["category_id"],"category":r["category"],"product_id":r["product_id"],"name":r["name"],"price":cents_to_money(r["price_cents"]),"unit":r["unit"],"station":r["station"],"active":bool(r["active"]),"addons":[{"id":a["id"],"name":a["name"],"price":cents_to_money(a["price_cents"])} for a in conn.execute("SELECT id,name,price_cents FROM restaurant_menu_addons WHERE company_id=? AND menu_item_id=? AND active=1 ORDER BY name,id",(user["company_id"],r["id"])).fetchall()]} for r in rows]}
+    return {"categories":[dict(x) for x in cats],"items":[{"id":r["id"],"category_id":r["category_id"],"category":r["category"],"product_id":r["product_id"],"name":r["name"],"price":cents_to_money(r["price_cents"]),"unit":r["unit"],"station":r["station"],"active":bool(r["active"]),"addons":[{"id":a["id"],"name":a["name"],"price":cents_to_money(a["price_cents"])} for a in conn.execute("SELECT id,name,price_cents FROM restaurant_menu_addons WHERE company_id=? AND menu_item_id=? AND active=1 ORDER BY name,id",(user["company_id"],r["id"])).fetchall()],"option_groups":[{"id":g["id"],"name":g["name"],"min_select":g["min_select"],"max_select":g["max_select"],"options":[{"id":o["id"],"name":o["name"],"price":cents_to_money(o["price_cents"])} for o in conn.execute("SELECT id,name,price_cents FROM restaurant_menu_options WHERE company_id=? AND group_id=? AND active=1 ORDER BY name,id",(user["company_id"],g["id"])).fetchall()]} for g in conn.execute("SELECT id,name,min_select,max_select FROM restaurant_menu_option_groups WHERE company_id=? AND menu_item_id=? AND active=1 ORDER BY name,id",(user["company_id"],r["id"])).fetchall()]} for r in rows]}
 
 @app.post("/v1/restaurant/menu/categories",status_code=201)
 def restaurant_create_category(data: RestaurantCategoryIn,conn: DB,user: USER):
@@ -2969,6 +3054,39 @@ def restaurant_disable_menu_addon(item_id: str,addon_id: str,conn: DB,user: USER
     return {"id":addon_id,"active":False}
 
 
+@app.post("/v1/restaurant/menu/items/{item_id}/option-groups",status_code=201)
+def restaurant_create_option_group(item_id: str,data: RestaurantOptionGroupIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.menu")
+    if data.min_select>data.max_select:raise HTTPException(422,"O mínimo não pode ser maior que o máximo.")
+    if not conn.execute("SELECT 1 FROM restaurant_menu_items WHERE id=? AND company_id=?",(item_id,user["company_id"])).fetchone():raise HTTPException(404,"Item de cardápio não encontrado.")
+    gid,now=new_id(),now_iso()
+    try:
+        with transaction(conn):conn.execute("INSERT INTO restaurant_menu_option_groups(id,company_id,menu_item_id,name,min_select,max_select,active,created_by,created_at) VALUES(?,?,?,?,?,?,1,?,?)",(gid,user["company_id"],item_id,data.name.strip(),data.min_select,data.max_select,user["id"],now));audit(conn,user["company_id"],user["id"],"restaurant.option_group_created","restaurant_menu_option_group",gid,{"menu_item_id":item_id,"min_select":data.min_select,"max_select":data.max_select})
+    except sqlite3.IntegrityError:raise HTTPException(409,"Grupo já existe para este item.")
+    return {"id":gid,"name":data.name.strip(),"min_select":data.min_select,"max_select":data.max_select,"active":True}
+
+
+@app.post("/v1/restaurant/menu/option-groups/{group_id}/options",status_code=201)
+def restaurant_create_option(group_id: str,data: RestaurantMenuOptionIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.menu")
+    if not conn.execute("SELECT 1 FROM restaurant_menu_option_groups WHERE id=? AND company_id=? AND active=1",(group_id,user["company_id"])).fetchone():raise HTTPException(404,"Grupo de opções não encontrado.")
+    oid,price,now=new_id(),decimal_money_cents(data.price),now_iso()
+    try:
+        with transaction(conn):conn.execute("INSERT INTO restaurant_menu_options(id,company_id,group_id,name,price_cents,active,created_by,created_at) VALUES(?,?,?,?,?,1,?,?)",(oid,user["company_id"],group_id,data.name.strip(),price,user["id"],now));audit(conn,user["company_id"],user["id"],"restaurant.menu_option_created","restaurant_menu_option",oid,{"group_id":group_id,"price_cents":price})
+    except sqlite3.IntegrityError:raise HTTPException(409,"Opção já existe neste grupo.")
+    return {"id":oid,"group_id":group_id,"name":data.name.strip(),"price":cents_to_money(price),"active":True}
+
+
+@app.delete("/v1/restaurant/menu/option-groups/{group_id}/options/{option_id}")
+def restaurant_disable_option(group_id: str,option_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.menu")
+    with transaction(conn):
+        row=conn.execute("SELECT name FROM restaurant_menu_options WHERE id=? AND group_id=? AND company_id=?",(option_id,group_id,user["company_id"])).fetchone()
+        if not row:raise HTTPException(404,"Opção não encontrada.")
+        conn.execute("UPDATE restaurant_menu_options SET active=0 WHERE id=? AND group_id=? AND company_id=?",(option_id,group_id,user["company_id"]));audit(conn,user["company_id"],user["id"],"restaurant.menu_option_disabled","restaurant_menu_option",option_id,{"group_id":group_id})
+    return {"id":option_id,"active":False}
+
+
 @app.patch("/v1/restaurant/menu/items/{item_id}/availability")
 def restaurant_menu_availability(item_id: str,data: RestaurantMenuAvailabilityIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.menu")
@@ -3019,7 +3137,8 @@ def restaurant_create_order(tab_id: str,data: RestaurantOrderIn,conn: DB,user: U
             menu=conn.execute("SELECT m.id,m.product_id,m.station,p.name,m.unit_price_cents AS price_cents FROM restaurant_menu_items m JOIN products p ON p.id=m.product_id AND p.company_id=m.company_id WHERE m.id=? AND m.company_id=? AND m.active=1 AND p.active=1",(line.menu_item_id,user["company_id"])).fetchone()
             if not menu: raise HTTPException(404,"Item de cardápio não encontrado.")
             addons,addon_cents=restaurant_addon_snapshot(conn,user["company_id"],menu["id"],line.addons,None)
-            conn.execute("INSERT INTO restaurant_order_items(id,company_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at,addons_json) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)",(new_id(),user["company_id"],oid,menu["id"],menu["product_id"],menu["name"],decimal_milli(line.quantity),int(menu["price_cents"])+addon_cents,menu["station"],now,json.dumps(addons)))
+            options,option_cents=restaurant_option_snapshot(conn,user["company_id"],menu["id"],line.options,None)
+            conn.execute("INSERT INTO restaurant_order_items(id,company_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at,addons_json,options_json) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?,?)",(new_id(),user["company_id"],oid,menu["id"],menu["product_id"],menu["name"],decimal_milli(line.quantity),int(menu["price_cents"])+addon_cents+option_cents,menu["station"],now,json.dumps(addons),json.dumps(options)))
         audit(conn,user["company_id"],user["id"],"restaurant.order_created","restaurant_order",oid,{"tab_id":tab_id,"item_count":len(data.items),"notes":data.notes})
         conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],tab_id,"order",oid,"created",json.dumps({"items":[x.menu_item_id for x in data.items],"notes":data.notes}),user["id"],now))
     return {"id":oid,"tab_id":tab_id,"status":"open","items":len(data.items)}
@@ -3078,7 +3197,7 @@ def restaurant_move_unsent_item(tab_id: str,data: RestaurantSplitItemIn,conn: DB
         if qty>int(item["quantity_milli"]):raise HTTPException(422,"Quantidade maior que o saldo do item.")
         now=now_iso();order_id=new_id();new_item_id=new_id()
         conn.execute("INSERT INTO restaurant_orders(id,company_id,tab_id,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,'open','',?,?,?)",(order_id,user["company_id"],data.target_tab_id,user["id"],now,now))
-        conn.execute("INSERT INTO restaurant_order_items(id,company_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at,addons_json) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)",(new_item_id,user["company_id"],order_id,item["menu_item_id"],item["product_id"],item["name_snapshot"],qty,item["unit_price_cents"],item["station"],now,item["addons_json"] or "[]"))
+        conn.execute("INSERT INTO restaurant_order_items(id,company_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at,addons_json,options_json) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?,?)",(new_item_id,user["company_id"],order_id,item["menu_item_id"],item["product_id"],item["name_snapshot"],qty,item["unit_price_cents"],item["station"],now,item["addons_json"] or "[]",item["options_json"] or "[]"))
         remaining=int(item["quantity_milli"])-qty
         if remaining:conn.execute("UPDATE restaurant_order_items SET quantity_milli=? WHERE id=? AND company_id=?",(remaining,data.item_id,user["company_id"]))
         else:conn.execute("UPDATE restaurant_order_items SET status='cancelled' WHERE id=? AND company_id=?",(data.item_id,user["company_id"]))
@@ -3111,8 +3230,8 @@ def restaurant_cancel_order(order_id: str,data: RestaurantCancelIn,conn: DB,user
 @app.get("/v1/restaurant/production")
 def restaurant_production(station: Literal["kitchen","bar","counter"],conn: DB,user: USER):
     require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.production")
-    rows=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.status,i.station,i.addons_json,o.tab_id,o.created_at FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE i.company_id=? AND i.station=? AND i.status IN ('queued','preparing','ready') AND o.status IN ('sent','preparing','ready') AND t.status='open' ORDER BY o.created_at,i.created_at",(user["company_id"],station)).fetchall()
-    return {"station":station,"items":[{"id":r["id"],"order_id":r["order_id"],"tab_id":r["tab_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"addons":json.loads(r["addons_json"] or "[]"),"status":r["status"],"created_at":r["created_at"]} for r in rows]}
+    rows=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.status,i.station,i.addons_json,i.options_json,o.tab_id,o.created_at FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id JOIN restaurant_tabs t ON t.id=o.tab_id AND t.company_id=o.company_id WHERE i.company_id=? AND i.station=? AND i.status IN ('queued','preparing','ready') AND o.status IN ('sent','preparing','ready') AND t.status='open' ORDER BY o.created_at,i.created_at",(user["company_id"],station)).fetchall()
+    return {"station":station,"items":[{"id":r["id"],"order_id":r["order_id"],"tab_id":r["tab_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"addons":json.loads(r["addons_json"] or "[]"),"options":json.loads(r["options_json"] or "[]"),"status":r["status"],"created_at":r["created_at"]} for r in rows]}
 
 @app.patch("/v1/restaurant/order-items/{item_id}")
 def restaurant_update_item(item_id: str,data: RestaurantItemStatusIn,conn: DB,user: USER):
@@ -3147,10 +3266,10 @@ def restaurant_tab_detail(tab_id: str,conn: DB,user: USER):
     require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders")
     tab=conn.execute("SELECT t.*,s.table_id FROM restaurant_tabs t JOIN restaurant_services s ON s.id=t.service_id AND s.company_id=t.company_id WHERE t.id=? AND t.company_id=?",(tab_id,user["company_id"])).fetchone()
     if not tab: raise HTTPException(404,"Comanda não encontrada.")
-    items=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,i.station,i.status,i.addons_json FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status<>'cancelled' ORDER BY o.created_at,i.created_at",(tab_id,user["company_id"])).fetchall()
+    items=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,i.station,i.status,i.addons_json,i.options_json FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status<>'cancelled' ORDER BY o.created_at,i.created_at",(tab_id,user["company_id"])).fetchall()
     payments=conn.execute("SELECT amount_cents,method,received_at FROM restaurant_tab_payments WHERE tab_id=? AND company_id=? ORDER BY received_at",(tab_id,user["company_id"])).fetchall()
     total=sum((r["quantity_milli"]*r["unit_price_cents"]+500)//1000 for r in items);paid=sum(r["amount_cents"] for r in payments)
-    return {"id":tab["id"],"service_id":tab["service_id"],"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"addons":json.loads(r["addons_json"] or "[]"),"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in items],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
+    return {"id":tab["id"],"service_id":tab["service_id"],"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"addons":json.loads(r["addons_json"] or "[]"),"options":json.loads(r["options_json"] or "[]"),"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in items],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
 
 @app.post("/v1/restaurant/tabs/{tab_id}/payments",status_code=201)
 def restaurant_tab_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: DB,user: USER):
