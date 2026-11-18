@@ -1055,6 +1055,8 @@ class RestaurantSplitItemIn(StrictModel):
     item_id: str
     target_tab_id: str
     quantity: Decimal = Field(gt=0,max_digits=12,decimal_places=3)
+class RestaurantMergeTabIn(StrictModel):
+    target_tab_id: str
 class RestaurantCashPaymentIn(StrictModel):
     amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
     received_amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
@@ -2285,6 +2287,31 @@ def branch_restaurant_send_order(branch_id: str,order_id: str,conn: DB,user: USE
     return {"id":order_id,"branch_id":branch_id,"status":"sent","sent_at":now}
 
 
+@app.post("/v1/branches/{branch_id}/restaurant/tabs/{tab_id}/merge")
+def branch_restaurant_merge_tabs(branch_id: str,tab_id: str,data: RestaurantMergeTabIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
+    now=now_iso()
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        tabs=conn.execute("SELECT * FROM branch_restaurant_tabs WHERE id IN (?,?) AND company_id=? AND branch_id=? ORDER BY id"+lock,(tab_id,data.target_tab_id,user["company_id"],branch_id)).fetchall()
+        by_id={r["id"]:r for r in tabs};source=by_id.get(tab_id);target=by_id.get(data.target_tab_id)
+        if not source or not target:raise HTTPException(404,"Comanda de origem ou destino não encontrada nesta filial.")
+        if source["id"]==target["id"]:raise HTTPException(409,"Escolha uma comanda destino diferente.")
+        if source["status"]!="open" or target["status"]!="open":raise HTTPException(409,"As duas comandas precisam estar abertas.")
+        if source["service_id"]!=target["service_id"]:raise HTTPException(409,"Só é possível juntar comandas do mesmo atendimento.")
+        service=conn.execute("SELECT status FROM restaurant_services WHERE id=? AND company_id=? AND branch_id=?"+lock,(source["service_id"],user["company_id"],branch_id)).fetchone()
+        if not service or service["status"]!="open":raise HTTPException(409,"Atendimento não está aberto.")
+        if conn.execute("SELECT 1 FROM branch_restaurant_tab_payments WHERE company_id=? AND branch_id=? AND tab_id IN (?,?) LIMIT 1",(user["company_id"],branch_id,tab_id,data.target_tab_id)).fetchone():raise HTTPException(409,"Não é possível juntar comandas com pagamentos registrados; finalize ou concilie cada comanda primeiro.")
+        moved=conn.execute("SELECT COUNT(*) FROM branch_restaurant_orders WHERE company_id=? AND branch_id=? AND tab_id=?",(user["company_id"],branch_id,tab_id)).fetchone()[0]
+        conn.execute("UPDATE branch_restaurant_orders SET tab_id=? WHERE company_id=? AND branch_id=? AND tab_id=?",(data.target_tab_id,user["company_id"],branch_id,tab_id))
+        conn.execute("UPDATE branch_restaurant_tabs SET status='closed',closed_at=? WHERE id=? AND company_id=? AND branch_id=? AND status='open'",(now,tab_id,user["company_id"],branch_id))
+        details={"source_tab_id":tab_id,"target_tab_id":data.target_tab_id,"moved_orders":int(moved),"source_label":source["label"],"target_label":target["label"]}
+        for event_tab,action in ((tab_id,"merged_into"),(data.target_tab_id,"merged_from")):
+            conn.execute("INSERT INTO branch_restaurant_events(id,company_id,branch_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],branch_id,event_tab,"tab",tab_id if action=="merged_into" else data.target_tab_id,action,json.dumps(details),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_tabs_merged","restaurant_tab",tab_id,{"branch_id":branch_id,**details})
+    return {"source_tab_id":tab_id,"target_tab_id":data.target_tab_id,"moved_orders":int(moved),"source_status":"closed","target_status":"open","merged_at":now}
+
+
 @app.post("/v1/branches/{branch_id}/restaurant/tabs/{tab_id}/move-item")
 def branch_restaurant_move_unsent_item(branch_id: str,tab_id: str,data: RestaurantSplitItemIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
@@ -2924,6 +2951,31 @@ def restaurant_send_order(order_id: str,conn: DB,user: USER):
         audit(conn,user["company_id"],user["id"],"restaurant.order_sent","restaurant_order",order_id,{"tab_id":order["tab_id"]})
         conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],order["tab_id"],"order",order_id,"sent",json.dumps({}),user["id"],now))
     return {"id":order_id,"status":"sent","sent_at":now}
+
+
+@app.post("/v1/restaurant/tabs/{tab_id}/merge")
+def restaurant_merge_tabs(tab_id: str,data: RestaurantMergeTabIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders");require_waiter_single_branch(conn,user)
+    now=now_iso()
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        tabs=conn.execute("SELECT * FROM restaurant_tabs WHERE id IN (?,?) AND company_id=? ORDER BY id"+lock,(tab_id,data.target_tab_id,user["company_id"])).fetchall()
+        by_id={r["id"]:r for r in tabs};source=by_id.get(tab_id);target=by_id.get(data.target_tab_id)
+        if not source or not target:raise HTTPException(404,"Comanda de origem ou destino não encontrada.")
+        if source["id"]==target["id"]:raise HTTPException(409,"Escolha uma comanda destino diferente.")
+        if source["status"]!="open" or target["status"]!="open":raise HTTPException(409,"As duas comandas precisam estar abertas.")
+        if source["service_id"]!=target["service_id"]:raise HTTPException(409,"Só é possível juntar comandas do mesmo atendimento.")
+        service=conn.execute("SELECT status FROM restaurant_services WHERE id=? AND company_id=?"+lock,(source["service_id"],user["company_id"])).fetchone()
+        if not service or service["status"]!="open":raise HTTPException(409,"Atendimento não está aberto.")
+        if conn.execute("SELECT 1 FROM restaurant_tab_payments WHERE company_id=? AND tab_id IN (?,?) LIMIT 1",(user["company_id"],tab_id,data.target_tab_id)).fetchone():raise HTTPException(409,"Não é possível juntar comandas com pagamentos registrados; finalize ou concilie cada comanda primeiro.")
+        moved=conn.execute("SELECT COUNT(*) FROM restaurant_orders WHERE company_id=? AND tab_id=?",(user["company_id"],tab_id)).fetchone()[0]
+        conn.execute("UPDATE restaurant_orders SET tab_id=? WHERE company_id=? AND tab_id=?",(data.target_tab_id,user["company_id"],tab_id))
+        conn.execute("UPDATE restaurant_tabs SET status='closed',closed_at=? WHERE id=? AND company_id=? AND status='open'",(now,tab_id,user["company_id"]))
+        details={"source_tab_id":tab_id,"target_tab_id":data.target_tab_id,"moved_orders":int(moved),"source_label":source["label"],"target_label":target["label"]}
+        for event_tab,action in ((tab_id,"merged_into"),(data.target_tab_id,"merged_from")):
+            conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],event_tab,"tab",tab_id if action=="merged_into" else data.target_tab_id,action,json.dumps(details),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.tabs_merged","restaurant_tab",tab_id,details)
+    return {"source_tab_id":tab_id,"target_tab_id":data.target_tab_id,"moved_orders":int(moved),"source_status":"closed","target_status":"open","merged_at":now}
 
 @app.post("/v1/restaurant/tabs/{tab_id}/move-item")
 def restaurant_move_unsent_item(tab_id: str,data: RestaurantSplitItemIn,conn: DB,user: USER):
