@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 21:21 | `c18ef4ce761af7797bac5796403608da40d0d5ec` | Restaurant reservation lifecycle with persisted no_show migration v17; audited whole-order cancellation before prep in legacy+branch. 128 passed/1 skipped; general `44207151784`+PostgreSQL `44207151742` green; dev `dep-dbuf05vf3r2c73ase270` live, health PostgreSQL. | Continue only restaurant scope. Remaining: item cancel after prep w/ compensating policy, modifiers/variants/combos/recipes, guest/payment splits, delivery, QR, operational settings/realtime, role-specific UI, authenticated E2E. |
+
+
+
 | 2026-11-17 21:03 | `999b3048d50acf2b15de8ae7a81a6aca4a7013c6` live | Reserva chega e vira serviço, cancel/no-show auditados; migration 17 persiste `no_show`; primeira UI de ações chegou; 125/1 e CI geral/Postgres success, dev live `dep-dbuengcipgvc738n5ck0`. Migration 17/status UI ampliados localmente, 126/1; ainda não enviados para CI. | Atualizar backend/test/frontend/doc, rerun general/Postgres; dev deploy only if green. |
 
 ## Work log / checkpoints
