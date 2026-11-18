@@ -1461,6 +1461,36 @@ def test_frontend_favicon_asset_is_served_and_linked(world):
 
 
 
+
+def test_restaurant_service_transfers_between_tables_atomically_and_keeps_tabs(world):
+    owner=company(world,name="Service transfer",slug="service-transfer",email="service-transfer@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Transfer room'}).json()
+    source=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'T-01','capacity':4}).json();dest=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'T-02','capacity':4}).json()
+    service=world.post(f"/v1/restaurant/tables/{source['id']}/open",headers=headers).json();tab=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Keeps tab'}).json()
+    moved=world.post(f"/v1/restaurant/services/{service['id']}/transfer",headers=headers,json={'target_table_id':dest['id']});assert moved.status_code==200,moved.text
+    floor={x['id']:x for x in world.get('/v1/restaurant/floor',headers=headers).json()['items']}
+    assert floor[source['id']]['status']=='available' and floor[source['id']]['service_id'] is None
+    assert floor[dest['id']]['status']=='occupied' and floor[dest['id']]['service_id']==service['id']
+    detail=world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers);assert detail.status_code==200 and detail.json()['table_id']==dest['id']
+    reversed_move=world.post(f"/v1/restaurant/services/{service['id']}/transfer",headers=headers,json={'target_table_id':source['id']});assert reversed_move.status_code==200
+    assert any(e['action']=='restaurant.service_transferred' and e['entity_id']==service['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
+
+
+def test_branch_restaurant_service_transfer_stays_within_branch_and_audits(world):
+    owner=company(world,name="Branch transfer",slug="branch-transfer",email="branch-transfer@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id'];other=world.post('/v1/company/branches',headers=headers,json={'code':'transfer-other','name':'Transfer other'}).json()['id']
+    area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Branch transfer room'}).json();source=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'BT-01','capacity':4}).json();dest=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'BT-02','capacity':4}).json()
+    service=world.post(f"/v1/branches/{branch}/restaurant/tables/{source['id']}/open",headers=headers).json();tab=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Branch keeps tab'}).json()
+    blocked_foreign=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/transfer",headers=headers,json={'target_table_id':'foreign-table-id'});assert blocked_foreign.status_code==404
+    moved=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/transfer",headers=headers,json={'target_table_id':dest['id']});assert moved.status_code==200,moved.text
+    floor={x['id']:x for x in world.get(f'/v1/branches/{branch}/restaurant/floor',headers=headers).json()['items']};assert floor[source['id']]['status']=='available' and floor[dest['id']]['status']=='occupied'
+    assert world.get(f"/v1/branches/{branch}/restaurant/tabs/{tab['id']}",headers=headers).json()['table_id']==dest['id']
+    assert world.get(f'/v1/branches/{other}/restaurant/floor',headers=headers).json()['items']==[]
+    assert any(e['action']=='restaurant.branch_service_transferred' and e['entity_id']==service['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
+
+
 def test_restaurant_menu_item_can_be_paused_and_reactivated_without_changing_stock_or_old_orders(world):
     owner=company(world,name="Menu availability",slug="menu-availability",email="menu-availability@example.test");headers=auth(owner)
     assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
