@@ -735,7 +735,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status'),(18,'restaurant_menu_item_price')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1456,6 +1456,41 @@ def test_frontend_favicon_asset_is_served_and_linked(world):
     assert response.headers['content-type'].startswith('image/png')
     assert response.content.startswith(b'\x89PNG\r\n\x1a\n')
 
+
+
+
+def test_restaurant_menu_price_is_independent_from_inventory_product_price_and_audited(world):
+    owner=company(world,name="Menu pricing",slug="menu-pricing",email="menu-pricing@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    p=product(world,owner,sku='MENU-PRICE-LEGACY',name='Menu price product',price='12.50')
+    category=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Menu price category'}).json()
+    menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':p['id'],'station':'kitchen','price':'18.90'});assert menu.status_code==201,menu.text
+    item=next(x for x in world.get('/v1/restaurant/menu',headers=headers).json()['items'] if x['id']==menu.json()['id'])
+    assert item['price']=='18.90'
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Pricing room'}).json();table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'MP-01','capacity':4}).json();service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json();tab=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Price snapshot'}).json()
+    order=world.post(f"/v1/restaurant/tabs/{tab['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu.json()['id'],'quantity':'2'}]}).json()
+    detail=world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers).json();assert detail['total']=='37.80' and detail['items'][0]['unit_price']=='18.90'
+    changed=world.patch(f"/v1/restaurant/menu/items/{menu.json()['id']}/price",headers=headers,json={'price':'20.00'});assert changed.status_code==200,changed.text
+    assert next(x for x in world.get('/v1/restaurant/menu',headers=headers).json()['items'] if x['id']==menu.json()['id'])['price']=='20.00'
+    assert world.get(f"/v1/restaurant/tabs/{tab['id']}",headers=headers).json()['total']=='37.80','Price already snapped in the order must not change retrospectively'
+    conn=main.connect_db();product_after=conn.execute('SELECT price_cents FROM products WHERE id=?',(p['id'],)).fetchone()[0];conn.close();assert product_after==1250
+    assert any(e['action']=='restaurant.menu_price_updated' and e['entity_id']==menu.json()['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
+
+
+def test_branch_restaurant_menu_price_is_branch_scoped_and_does_not_change_inventory_product(world):
+    owner=company(world,name="Branch menu pricing",slug="branch-menu-pricing",email="branch-menu-pricing@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id'];other=world.post('/v1/company/branches',headers=headers,json={'code':'second-price','name':'Segunda unidade preço'}).json()['id']
+    p=product(world,owner,sku='MENU-PRICE-BRANCH',name='Branch menu price product',price='11.00')
+    category=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Branch price category'}).json()
+    menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':category['id'],'product_id':p['id'],'station':'bar','price':'14.75'});assert menu.status_code==201,menu.text
+    assert next(x for x in world.get(f'/v1/branches/{branch}/restaurant/menu',headers=headers).json()['items'] if x['id']==menu.json()['id'])['price']=='14.75'
+    assert world.get(f'/v1/branches/{other}/restaurant/menu',headers=headers).json()['items']==[]
+    changed=world.patch(f"/v1/branches/{branch}/restaurant/menu/items/{menu.json()['id']}/price",headers=headers,json={'price':'16.25'});assert changed.status_code==200,changed.text
+    assert next(x for x in world.get(f'/v1/branches/{branch}/restaurant/menu',headers=headers).json()['items'] if x['id']==menu.json()['id'])['price']=='16.25'
+    assert world.get(f'/v1/branches/{other}/restaurant/menu',headers=headers).json()['items']==[]
+    conn=main.connect_db();product_price=conn.execute('SELECT price_cents FROM products WHERE id=?',(p['id'],)).fetchone()[0];conn.close();assert product_price==1100
+    assert any(e['action']=='restaurant.branch_menu_price_updated' and e['entity_id']==menu.json()['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
 
 
 def test_restaurant_order_cancellation_is_audited_and_only_before_preparation(world):
