@@ -1047,6 +1047,10 @@ class RestaurantItemStatusIn(StrictModel):
     status: Literal["preparing","ready","delivered","cancelled"]
 class RestaurantCancelIn(StrictModel):
     reason: str = Field(min_length=3,max_length=240)
+class RestaurantSplitItemIn(StrictModel):
+    item_id: str
+    target_tab_id: str
+    quantity: Decimal = Field(gt=0,max_digits=12,decimal_places=3)
 class RestaurantCashPaymentIn(StrictModel):
     amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
     received_amount: Decimal = Field(gt=0,max_digits=12,decimal_places=2)
@@ -2265,6 +2269,33 @@ def branch_restaurant_send_order(branch_id: str,order_id: str,conn: DB,user: USE
     return {"id":order_id,"branch_id":branch_id,"status":"sent","sent_at":now}
 
 
+@app.post("/v1/branches/{branch_id}/restaurant/tabs/{tab_id}/move-item")
+def branch_restaurant_move_unsent_item(branch_id: str,tab_id: str,data: RestaurantSplitItemIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
+    qty=decimal_milli(data.quantity)
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        source=conn.execute("SELECT * FROM branch_restaurant_tabs WHERE id=? AND company_id=? AND branch_id=? AND status='open'"+lock,(tab_id,user["company_id"],branch_id)).fetchone()
+        target=conn.execute("SELECT * FROM branch_restaurant_tabs WHERE id=? AND company_id=? AND branch_id=? AND status='open'"+lock,(data.target_tab_id,user["company_id"],branch_id)).fetchone()
+        if not source or not target:raise HTTPException(404,"Comanda de origem ou destino não encontrada nesta filial.")
+        if source["id"]==target["id"] or source["service_id"]!=target["service_id"]:raise HTTPException(409,"O item só pode ser movido para outra comanda aberta do mesmo atendimento.")
+        item=conn.execute("SELECT i.*,o.status AS order_status FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id WHERE i.id=? AND o.tab_id=? AND i.company_id=? AND i.branch_id=?"+lock,(data.item_id,tab_id,user["company_id"],branch_id)).fetchone()
+        if not item:raise HTTPException(404,"Item não encontrado na comanda de origem.")
+        if item["status"]!="queued" or item["order_status"]!="open":raise HTTPException(409,"Só é possível mover itens ainda não enviados à produção.")
+        if qty>int(item["quantity_milli"]):raise HTTPException(422,"Quantidade maior que o saldo do item.")
+        now=now_iso();order_id=new_id();new_item_id=new_id()
+        conn.execute("INSERT INTO branch_restaurant_orders(id,company_id,branch_id,tab_id,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,'open','',?,?,?)",(order_id,user["company_id"],branch_id,data.target_tab_id,user["id"],now,now))
+        conn.execute("INSERT INTO branch_restaurant_order_items(id,company_id,branch_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,'queued',?)",(new_item_id,user["company_id"],branch_id,order_id,item["menu_item_id"],item["product_id"],item["name_snapshot"],qty,item["unit_price_cents"],item["station"],now))
+        remaining=int(item["quantity_milli"])-qty
+        if remaining:conn.execute("UPDATE branch_restaurant_order_items SET quantity_milli=? WHERE id=? AND company_id=? AND branch_id=?",(remaining,data.item_id,user["company_id"],branch_id))
+        else:conn.execute("UPDATE branch_restaurant_order_items SET status='cancelled' WHERE id=? AND company_id=? AND branch_id=?",(data.item_id,user["company_id"],branch_id))
+        details={"source_tab_id":tab_id,"target_tab_id":data.target_tab_id,"source_item_id":data.item_id,"target_item_id":new_item_id,"quantity_milli":qty,"unit_price_cents":int(item["unit_price_cents"])}
+        for event_tab,action in ((tab_id,"item_moved_out"),(data.target_tab_id,"item_moved_in")):
+            conn.execute("INSERT INTO branch_restaurant_events(id,company_id,branch_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],branch_id,event_tab,"order_item",new_item_id,action,json.dumps(details),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_item_moved_between_tabs","restaurant_order_item",data.item_id,{"branch_id":branch_id,**details})
+    return {"source_tab_id":tab_id,"target_tab_id":data.target_tab_id,"order_id":order_id,"item_id":new_item_id,"quantity":milli_to_decimal(qty),"source_remaining":milli_to_decimal(remaining),"status":"queued"}
+
+
 @app.post("/v1/branches/{branch_id}/restaurant/orders/{order_id}/cancel")
 def branch_restaurant_cancel_order(branch_id: str,order_id: str,data: RestaurantCancelIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.orders")
@@ -2328,7 +2359,7 @@ def branch_restaurant_tab_detail(branch_id: str,tab_id: str,conn: DB,user: USER)
     rows=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,i.station,i.status FROM branch_restaurant_order_items i JOIN branch_restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id AND o.branch_id=i.branch_id WHERE o.tab_id=? AND i.company_id=? AND i.branch_id=? AND i.status<>'cancelled' ORDER BY o.created_at,i.created_at",(tab_id,user["company_id"],branch_id)).fetchall()
     payments=conn.execute("SELECT amount_cents,method,received_at FROM branch_restaurant_tab_payments WHERE tab_id=? AND company_id=? AND branch_id=? ORDER BY received_at",(tab_id,user["company_id"],branch_id)).fetchall()
     total=sum((r["quantity_milli"]*r["unit_price_cents"]+500)//1000 for r in rows);paid=sum(r["amount_cents"] for r in payments)
-    return {"id":tab_id,"branch_id":branch_id,"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in rows],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
+    return {"id":tab_id,"branch_id":branch_id,"service_id":tab["service_id"],"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in rows],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
 
 
 @app.post("/v1/branches/{branch_id}/restaurant/tabs/{tab_id}/payments",status_code=201)
@@ -2818,6 +2849,33 @@ def restaurant_send_order(order_id: str,conn: DB,user: USER):
         conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?, ?,?)",(new_id(),user["company_id"],order["tab_id"],"order",order_id,"sent",json.dumps({}),user["id"],now))
     return {"id":order_id,"status":"sent","sent_at":now}
 
+@app.post("/v1/restaurant/tabs/{tab_id}/move-item")
+def restaurant_move_unsent_item(tab_id: str,data: RestaurantSplitItemIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders");require_waiter_single_branch(conn,user)
+    qty=decimal_milli(data.quantity)
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        source=conn.execute("SELECT * FROM restaurant_tabs WHERE id=? AND company_id=? AND status='open'"+lock,(tab_id,user["company_id"])).fetchone()
+        target=conn.execute("SELECT * FROM restaurant_tabs WHERE id=? AND company_id=? AND status='open'"+lock,(data.target_tab_id,user["company_id"])).fetchone()
+        if not source or not target:raise HTTPException(404,"Comanda de origem ou destino não encontrada.")
+        if source["id"]==target["id"] or source["service_id"]!=target["service_id"]:raise HTTPException(409,"O item só pode ser movido para outra comanda aberta do mesmo atendimento.")
+        item=conn.execute("SELECT i.*,o.status AS order_status FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE i.id=? AND o.tab_id=? AND i.company_id=?"+lock,(data.item_id,tab_id,user["company_id"])).fetchone()
+        if not item:raise HTTPException(404,"Item não encontrado na comanda de origem.")
+        if item["status"]!="queued" or item["order_status"]!="open":raise HTTPException(409,"Só é possível mover itens ainda não enviados à produção.")
+        if qty>int(item["quantity_milli"]):raise HTTPException(422,"Quantidade maior que o saldo do item.")
+        now=now_iso();order_id=new_id();new_item_id=new_id()
+        conn.execute("INSERT INTO restaurant_orders(id,company_id,tab_id,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,'open','',?,?,?)",(order_id,user["company_id"],data.target_tab_id,user["id"],now,now))
+        conn.execute("INSERT INTO restaurant_order_items(id,company_id,order_id,menu_item_id,product_id,name_snapshot,quantity_milli,unit_price_cents,station,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?)",(new_item_id,user["company_id"],order_id,item["menu_item_id"],item["product_id"],item["name_snapshot"],qty,item["unit_price_cents"],item["station"],now))
+        remaining=int(item["quantity_milli"])-qty
+        if remaining:conn.execute("UPDATE restaurant_order_items SET quantity_milli=? WHERE id=? AND company_id=?",(remaining,data.item_id,user["company_id"]))
+        else:conn.execute("UPDATE restaurant_order_items SET status='cancelled' WHERE id=? AND company_id=?",(data.item_id,user["company_id"]))
+        details={"source_tab_id":tab_id,"target_tab_id":data.target_tab_id,"source_item_id":data.item_id,"target_item_id":new_item_id,"quantity_milli":qty,"unit_price_cents":int(item["unit_price_cents"])}
+        for event_tab,action in ((tab_id,"item_moved_out"),(data.target_tab_id,"item_moved_in")):
+            conn.execute("INSERT INTO restaurant_events(id,company_id,tab_id,entity_type,entity_id,action,details_json,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(new_id(),user["company_id"],event_tab,"order_item",new_item_id,action,json.dumps(details),user["id"],now))
+        audit(conn,user["company_id"],user["id"],"restaurant.item_moved_between_tabs","restaurant_order_item",data.item_id,details)
+    return {"source_tab_id":tab_id,"target_tab_id":data.target_tab_id,"order_id":order_id,"item_id":new_item_id,"quantity":milli_to_decimal(qty),"source_remaining":milli_to_decimal(remaining),"status":"queued"}
+
+
 @app.post("/v1/restaurant/orders/{order_id}/cancel")
 def restaurant_cancel_order(order_id: str,data: RestaurantCancelIn,conn: DB,user: USER):
     require_role(user,"owner","admin","manager");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.orders");require_waiter_single_branch(conn,user)
@@ -2879,7 +2937,7 @@ def restaurant_tab_detail(tab_id: str,conn: DB,user: USER):
     items=conn.execute("SELECT i.id,i.order_id,i.product_id,i.name_snapshot,i.quantity_milli,i.unit_price_cents,i.station,i.status FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id AND o.company_id=i.company_id WHERE o.tab_id=? AND i.company_id=? AND i.status<>'cancelled' ORDER BY o.created_at,i.created_at",(tab_id,user["company_id"])).fetchall()
     payments=conn.execute("SELECT amount_cents,method,received_at FROM restaurant_tab_payments WHERE tab_id=? AND company_id=? ORDER BY received_at",(tab_id,user["company_id"])).fetchall()
     total=sum((r["quantity_milli"]*r["unit_price_cents"]+500)//1000 for r in items);paid=sum(r["amount_cents"] for r in payments)
-    return {"id":tab["id"],"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in items],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
+    return {"id":tab["id"],"service_id":tab["service_id"],"label":tab["label"],"status":tab["status"],"table_id":tab["table_id"],"items":[{"id":r["id"],"order_id":r["order_id"],"product_id":r["product_id"],"name":r["name_snapshot"],"quantity":milli_to_decimal(r["quantity_milli"]),"unit_price":cents_to_money(r["unit_price_cents"]),"station":r["station"],"status":r["status"],"line_total":cents_to_money((r["quantity_milli"]*r["unit_price_cents"]+500)//1000)} for r in items],"total":cents_to_money(total),"paid":cents_to_money(paid),"remaining":cents_to_money(max(0,total-paid)),"payments":[{"amount":cents_to_money(r["amount_cents"]),"method":r["method"],"received_at":r["received_at"]} for r in payments]}
 
 @app.post("/v1/restaurant/tabs/{tab_id}/payments",status_code=201)
 def restaurant_tab_cash_payment(tab_id: str,data: RestaurantCashPaymentIn,conn: DB,user: USER):
