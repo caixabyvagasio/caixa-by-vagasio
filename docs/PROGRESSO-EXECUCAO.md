@@ -307,3 +307,9 @@
 - UI do salão dá toggle “Pausar item/Reativar item” para responsáveis e mostra estado.
 - Testes específicos e suite completa: 134 passed, 1 skipped. JS parser limpo. CI geral e PostgreSQL para HEAD `d2a43194acde8c385e29d8082a171257877735b6` passaram. Render dev deploy `dep-dbufiuifngtc73cktuug` live; health status ok/postgresql, pagamentos/fiscal false.
 - Status geral continua INCOMPLETO: sem validação E2E autenticada visual; addons/modificadores/variantes/combos, receita/ingredientes, delivery/retirada/QR, fluxo completo de papéis e relatórios por função continuam pendentes.
+
+
+## Restaurante — transferir atendimento entre mesas (2026-11-17 22:03 BRT)
+- Endpoint legado e branch-scoped move atomicamente um atendimento aberto, com todas as comandas existentes preservadas, de mesa ocupada para mesa livre; valida filial e estado das mesas, row locks Postgres e rollback atômico; actualiza source available/destination occupied e relação do serviço. Manager/owner only, permissão `restaurant.floor`, evento audit append-only. Sem alterar itens/pagamentos/estoque. UI no cartão de mesa lista somente mesas livres da filial selecionada e permite escolher destino.
+- Suite local **136 passed, 1 skipped** (após cobrir disponibilidade do menu e transferências). CI general e PG para `7c4a2f6ee7c63c95518d54454c58970914e04fd2` passou. Dev deploy `dep-dbufo10m7kps73c98khg` live e health PostgreSQL ok; integrations payments/fiscal false.
+- Segmento continua em desenvolvimento; restantes incluem adornos/receitas/inventário por ingredientes, delivery, takeout/QR, financeiro e relatórios operacionais, papéis completos e E2E autenticado/visual.
