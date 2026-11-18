@@ -988,6 +988,8 @@ class RestaurantReservationIn(StrictModel):
     party_size: int = Field(ge=1,le=100)
     starts_at: str = Field(min_length=10,max_length=40)
     ends_at: str = Field(min_length=10,max_length=40)
+class RestaurantReservationActionIn(StrictModel):
+    action: Literal["cancel","no_show"]
 class RestaurantCategoryIn(StrictModel):
     name: str = Field(min_length=2,max_length=80)
 class RestaurantMenuItemIn(StrictModel):
@@ -2394,10 +2396,44 @@ def branch_restaurant_close_empty_service(branch_id: str,service_id: str,conn: D
 
 
 @app.get("/v1/branches/{branch_id}/restaurant/reservations")
-def branch_restaurant_list_reservations(branch_id: str,conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","all"]="confirmed"):
+def branch_restaurant_list_reservations(branch_id: str,conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","all"]=Query(default="confirmed",alias="status")):
     require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
     rows=conn.execute("SELECT r.id,r.table_id,t.label AS table_label,a.name AS area,r.customer_name,r.party_size,r.starts_at,r.ends_at,r.status FROM restaurant_reservations r JOIN restaurant_tables t ON t.id=r.table_id AND t.company_id=r.company_id AND t.branch_id=r.branch_id JOIN restaurant_areas a ON a.id=t.area_id AND a.company_id=t.company_id AND a.branch_id=t.branch_id WHERE r.company_id=? AND r.branch_id=? AND (?='all' OR r.status=?) ORDER BY r.starts_at,r.id LIMIT 200",(user["company_id"],branch_id,status_filter,status_filter)).fetchall()
     return {"branch_id":branch_id,"items":[dict(r) for r in rows]}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/reservations/{reservation_id}/seat",status_code=201)
+def branch_restaurant_seat_reservation(branch_id: str,reservation_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    now=now_iso();service_id=new_id()
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        reservation=conn.execute("SELECT * FROM restaurant_reservations WHERE id=? AND company_id=? AND branch_id=?"+lock,(reservation_id,user["company_id"],branch_id)).fetchone()
+        if not reservation:raise HTTPException(404,"Reserva não encontrada nesta filial.")
+        if reservation["status"]!="confirmed":raise HTTPException(409,"Somente reservas confirmadas podem virar atendimento.")
+        table=conn.execute("SELECT id,label,status,waiter_id FROM restaurant_tables WHERE id=? AND company_id=? AND branch_id=? AND active=1"+lock,(reservation["table_id"],user["company_id"],branch_id)).fetchone()
+        if not table:raise HTTPException(404,"Mesa da reserva não está disponível nesta filial.")
+        if table["status"] not in {"available","reserved"}:raise HTTPException(409,"A mesa já está em atendimento.")
+        conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at,branch_id,waiter_id) VALUES(?,?,?,'open',?,?,NULL,?,?)",(service_id,user["company_id"],table["id"],user["id"],now,branch_id,table["waiter_id"]))
+        changed=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND branch_id=? AND status IN ('available','reserved')",(table["id"],user["company_id"],branch_id))
+        if changed.rowcount!=1:raise HTTPException(409,"A mesa mudou de estado; atualize o salão.")
+        conn.execute("UPDATE restaurant_reservations SET status='seated' WHERE id=? AND company_id=? AND branch_id=? AND status='confirmed'",(reservation_id,user["company_id"],branch_id))
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_reservation_seated","restaurant_reservation",reservation_id,{"branch_id":branch_id,"table_id":table["id"],"service_id":service_id,"party_size":reservation["party_size"]})
+    return {"reservation_id":reservation_id,"branch_id":branch_id,"service_id":service_id,"table_id":table["id"],"status":"seated","opened_at":now}
+
+
+@app.post("/v1/branches/{branch_id}/restaurant/reservations/{reservation_id}/cancel")
+def branch_restaurant_cancel_reservation(branch_id: str,reservation_id: str,data: RestaurantReservationActionIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        row=conn.execute("SELECT status FROM restaurant_reservations WHERE id=? AND company_id=? AND branch_id=?"+lock,(reservation_id,user["company_id"],branch_id)).fetchone()
+        if not row:raise HTTPException(404,"Reserva não encontrada nesta filial.")
+        if row["status"]!="confirmed":raise HTTPException(409,"Somente reservas confirmadas podem ser canceladas ou marcadas como não comparecimento.")
+        conn.execute("UPDATE restaurant_reservations SET status='cancelled' WHERE id=? AND company_id=? AND branch_id=?",(reservation_id,user["company_id"],branch_id))
+        action="no_show" if data.action=="no_show" else "cancelled"
+        audit(conn,user["company_id"],user["id"],"restaurant.branch_reservation_"+action,"restaurant_reservation",reservation_id,{"branch_id":branch_id,"action":action})
+    return {"id":reservation_id,"branch_id":branch_id,"status":"cancelled","outcome":data.action}
 
 
 @app.post("/v1/branches/{branch_id}/restaurant/reservations",status_code=201)
@@ -2579,10 +2615,44 @@ def restaurant_open_table(table_id: str,conn: DB,user: USER):
     return {"id":sid,"table_id":table_id,"status":"open","opened_at":now}
 
 @app.get("/v1/restaurant/reservations")
-def restaurant_list_reservations(conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","all"]="confirmed"):
+def restaurant_list_reservations(conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","all"]=Query(default="confirmed",alias="status")):
     require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor")
     rows=conn.execute("SELECT r.id,r.table_id,t.label AS table_label,a.name AS area,r.customer_name,r.party_size,r.starts_at,r.ends_at,r.status FROM restaurant_reservations r JOIN restaurant_tables t ON t.id=r.table_id AND t.company_id=r.company_id JOIN restaurant_areas a ON a.id=t.area_id AND a.company_id=t.company_id WHERE r.company_id=? AND (?='all' OR r.status=?) ORDER BY r.starts_at LIMIT 200",(user["company_id"],status_filter,status_filter)).fetchall()
     return {"items":[dict(r) for r in rows]}
+
+@app.post("/v1/restaurant/reservations/{reservation_id}/seat",status_code=201)
+def restaurant_seat_reservation(reservation_id: str,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_waiter_single_branch(conn,user)
+    now=now_iso();service_id=new_id()
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        reservation=conn.execute("SELECT * FROM restaurant_reservations WHERE id=? AND company_id=?"+lock,(reservation_id,user["company_id"])).fetchone()
+        if not reservation:raise HTTPException(404,"Reserva não encontrada nesta empresa.")
+        if reservation["status"]!="confirmed":raise HTTPException(409,"Somente reservas confirmadas podem virar atendimento.")
+        table=conn.execute("SELECT id,label,status,waiter_id FROM restaurant_tables WHERE id=? AND company_id=? AND active=1"+lock,(reservation["table_id"],user["company_id"])).fetchone()
+        if not table:raise HTTPException(404,"Mesa da reserva não está disponível.")
+        if table["status"] not in {"available","reserved"}:raise HTTPException(409,"A mesa já está em atendimento.")
+        conn.execute("INSERT INTO restaurant_services(id,company_id,table_id,status,opened_by,opened_at,closed_at,waiter_id) VALUES(?,?,?,'open',?,?,NULL,?)",(service_id,user["company_id"],table["id"],user["id"],now,table["waiter_id"]))
+        changed=conn.execute("UPDATE restaurant_tables SET status='occupied' WHERE id=? AND company_id=? AND status IN ('available','reserved')",(table["id"],user["company_id"]))
+        if changed.rowcount!=1:raise HTTPException(409,"A mesa mudou de estado; atualize o salão.")
+        conn.execute("UPDATE restaurant_reservations SET status='seated' WHERE id=? AND company_id=? AND status='confirmed'",(reservation_id,user["company_id"]))
+        audit(conn,user["company_id"],user["id"],"restaurant.reservation_seated","restaurant_reservation",reservation_id,{"table_id":table["id"],"service_id":service_id,"party_size":reservation["party_size"]})
+    return {"reservation_id":reservation_id,"service_id":service_id,"table_id":table["id"],"status":"seated","opened_at":now}
+
+
+@app.post("/v1/restaurant/reservations/{reservation_id}/cancel")
+def restaurant_cancel_reservation(reservation_id: str,data: RestaurantReservationActionIn,conn: DB,user: USER):
+    require_role(user,"owner","admin","manager","operator");require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor");require_waiter_single_branch(conn,user)
+    with transaction(conn,"READ COMMITTED"):
+        lock=" FOR UPDATE" if is_postgres(conn) else ""
+        row=conn.execute("SELECT status FROM restaurant_reservations WHERE id=? AND company_id=?"+lock,(reservation_id,user["company_id"])).fetchone()
+        if not row:raise HTTPException(404,"Reserva não encontrada nesta empresa.")
+        if row["status"]!="confirmed":raise HTTPException(409,"Somente reservas confirmadas podem ser canceladas ou marcadas como não comparecimento.")
+        conn.execute("UPDATE restaurant_reservations SET status='cancelled' WHERE id=? AND company_id=?",(reservation_id,user["company_id"]))
+        action="no_show" if data.action=="no_show" else "cancelled"
+        audit(conn,user["company_id"],user["id"],"restaurant.reservation_"+action,"restaurant_reservation",reservation_id,{"action":action})
+    return {"id":reservation_id,"status":"cancelled","outcome":data.action}
+
 
 @app.post("/v1/restaurant/reservations",status_code=201)
 def restaurant_reserve(data: RestaurantReservationIn,conn: DB,user: USER):
