@@ -2252,7 +2252,7 @@ def branch_restaurant_cancel_order(branch_id: str,order_id: str,data: Restaurant
         if not order:raise HTTPException(404,"Pedido não encontrado nesta filial.")
         if order["tab_status"]!="open" or order["status"] not in {"open","sent","preparing"}:raise HTTPException(409,"Pedido ou comanda não podem mais ser cancelados.")
         items=conn.execute("SELECT id,status FROM branch_restaurant_order_items WHERE order_id=? AND company_id=? AND branch_id=? ORDER BY id",(order_id,user["company_id"],branch_id)).fetchall()
-        if not items or any(x["status"]!="queued" for x in items):raise HTTPException(409,"Cancelamento integral só é permitido antes do início do preparo; solicite cancelamento dos itens ao gerente.")
+        if not items or not any(x["status"]=="queued" for x in items) or any(x["status"] not in {"queued","cancelled"} for x in items):raise HTTPException(409,"Cancelamento integral só é permitido antes do início do preparo; solicite cancelamento dos itens ao gerente.")
         conn.execute("UPDATE branch_restaurant_order_items SET status='cancelled' WHERE order_id=? AND company_id=? AND branch_id=? AND status='queued'",(order_id,user["company_id"],branch_id))
         conn.execute("UPDATE branch_restaurant_orders SET status='cancelled',updated_at=? WHERE id=? AND company_id=? AND branch_id=?",(now,order_id,user["company_id"],branch_id))
         details={"reason":data.reason.strip(),"item_count":len(items),"before_status":order["status"]}
@@ -2791,7 +2791,7 @@ def restaurant_cancel_order(order_id: str,data: RestaurantCancelIn,conn: DB,user
         if not order:raise HTTPException(404,"Pedido não encontrado nesta empresa.")
         if order["tab_status"]!="open" or order["status"] not in {"open","sent","preparing"}:raise HTTPException(409,"Pedido ou comanda não podem mais ser cancelados.")
         items=conn.execute("SELECT id,status FROM restaurant_order_items WHERE order_id=? AND company_id=? ORDER BY id",(order_id,user["company_id"])).fetchall()
-        if not items or any(x["status"]!="queued" for x in items):raise HTTPException(409,"Cancelamento integral só é permitido antes do início do preparo; solicite cancelamento dos itens ao gerente.")
+        if not items or not any(x["status"]=="queued" for x in items) or any(x["status"] not in {"queued","cancelled"} for x in items):raise HTTPException(409,"Cancelamento integral só é permitido antes do início do preparo; solicite cancelamento dos itens ao gerente.")
         conn.execute("UPDATE restaurant_order_items SET status='cancelled' WHERE order_id=? AND company_id=? AND status='queued'",(order_id,user["company_id"]))
         conn.execute("UPDATE restaurant_orders SET status='cancelled',updated_at=? WHERE id=? AND company_id=?",(now,order_id,user["company_id"]))
         details={"reason":data.reason.strip(),"item_count":len(items),"before_status":order["status"]}
