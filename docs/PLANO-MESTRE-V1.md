@@ -82,6 +82,10 @@
 
 ## Work log / checkpoints
 
+| 2026-11-17 20:55 | branch `development-v1` HEAD `671bc9f158cf0178e1557ab7426ed532a8195c36` | New functional slice local: reservation lifecycle seated/cancel/no-show, query filtering, desktop branch+legacy UI; 125 passed/1 skipped. Pending CI/PostgreSQL+dev deploy. | Keep scope to restaurant; next recipes/ingredient inventory and order cancel/reversal. |
+
+## Work log / checkpoints
+
 | 2026-11-17 14:49 | `a42548a9fd56771e79396752312f7d400a1a746d` | Legacy sales/cash/void and payable-row concurrency fixes local; 114 passed/1 skipped. Prior state on this commit is deployed/live. | CI general/Postgres; dev deploy on green. |
 
 ## Work log / checkpoints
