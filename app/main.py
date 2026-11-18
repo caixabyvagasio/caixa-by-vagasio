@@ -504,6 +504,22 @@ def apply_schema_migrations(conn) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS restaurant_waiter_tables ON restaurant_tables(company_id,waiter_id,status)")
         conn.execute("CREATE INDEX IF NOT EXISTS restaurant_waiter_tabs ON restaurant_tabs(company_id,waiter_id,status,opened_at)")
     migration(16,"restaurant_waiter_portal_and_assignments",create_waiter_portal)
+    def add_reservation_no_show_status():
+        # Rebuild only the reservation table to widen its status constraint; copy every
+        # existing row unchanged and preserve its nullable branch association.
+        conn.execute("""CREATE TABLE restaurant_reservations_v17 (
+            id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+            table_id TEXT NOT NULL REFERENCES restaurant_tables(id), customer_name TEXT NOT NULL,
+            party_size INTEGER NOT NULL CHECK(party_size BETWEEN 1 AND 100), starts_at TEXT NOT NULL,
+            ends_at TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('confirmed','seated','cancelled','completed','no_show')),
+            created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL,
+            branch_id TEXT REFERENCES branches(id), CHECK(ends_at>starts_at))""")
+        conn.execute("""INSERT INTO restaurant_reservations_v17(id,company_id,table_id,customer_name,party_size,starts_at,ends_at,status,created_by,created_at,branch_id)
+            SELECT id,company_id,table_id,customer_name,party_size,starts_at,ends_at,status,created_by,created_at,branch_id FROM restaurant_reservations""")
+        conn.execute("DROP TABLE restaurant_reservations")
+        conn.execute("ALTER TABLE restaurant_reservations_v17 RENAME TO restaurant_reservations")
+        conn.execute("CREATE INDEX IF NOT EXISTS restaurant_reservation_overlap ON restaurant_reservations(company_id,table_id,status,starts_at,ends_at)")
+    migration(17,"restaurant_reservation_no_show_status",add_reservation_no_show_status)
 
 
 def init_db() -> None:
@@ -2396,7 +2412,7 @@ def branch_restaurant_close_empty_service(branch_id: str,service_id: str,conn: D
 
 
 @app.get("/v1/branches/{branch_id}/restaurant/reservations")
-def branch_restaurant_list_reservations(branch_id: str,conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","all"]=Query(default="confirmed",alias="status")):
+def branch_restaurant_list_reservations(branch_id: str,conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","no_show","all"]=Query(default="confirmed",alias="status")):
     require_restaurant_branch(conn,user,branch_id);require_permission(conn,user,"restaurant.floor")
     rows=conn.execute("SELECT r.id,r.table_id,t.label AS table_label,a.name AS area,r.customer_name,r.party_size,r.starts_at,r.ends_at,r.status FROM restaurant_reservations r JOIN restaurant_tables t ON t.id=r.table_id AND t.company_id=r.company_id AND t.branch_id=r.branch_id JOIN restaurant_areas a ON a.id=t.area_id AND a.company_id=t.company_id AND a.branch_id=t.branch_id WHERE r.company_id=? AND r.branch_id=? AND (?='all' OR r.status=?) ORDER BY r.starts_at,r.id LIMIT 200",(user["company_id"],branch_id,status_filter,status_filter)).fetchall()
     return {"branch_id":branch_id,"items":[dict(r) for r in rows]}
@@ -2430,10 +2446,10 @@ def branch_restaurant_cancel_reservation(branch_id: str,reservation_id: str,data
         row=conn.execute("SELECT status FROM restaurant_reservations WHERE id=? AND company_id=? AND branch_id=?"+lock,(reservation_id,user["company_id"],branch_id)).fetchone()
         if not row:raise HTTPException(404,"Reserva não encontrada nesta filial.")
         if row["status"]!="confirmed":raise HTTPException(409,"Somente reservas confirmadas podem ser canceladas ou marcadas como não comparecimento.")
-        conn.execute("UPDATE restaurant_reservations SET status='cancelled' WHERE id=? AND company_id=? AND branch_id=?",(reservation_id,user["company_id"],branch_id))
         action="no_show" if data.action=="no_show" else "cancelled"
+        conn.execute("UPDATE restaurant_reservations SET status=? WHERE id=? AND company_id=? AND branch_id=?",(action,reservation_id,user["company_id"],branch_id))
         audit(conn,user["company_id"],user["id"],"restaurant.branch_reservation_"+action,"restaurant_reservation",reservation_id,{"branch_id":branch_id,"action":action})
-    return {"id":reservation_id,"branch_id":branch_id,"status":"cancelled","outcome":data.action}
+    return {"id":reservation_id,"branch_id":branch_id,"status":action,"outcome":data.action}
 
 
 @app.post("/v1/branches/{branch_id}/restaurant/reservations",status_code=201)
@@ -2615,7 +2631,7 @@ def restaurant_open_table(table_id: str,conn: DB,user: USER):
     return {"id":sid,"table_id":table_id,"status":"open","opened_at":now}
 
 @app.get("/v1/restaurant/reservations")
-def restaurant_list_reservations(conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","all"]=Query(default="confirmed",alias="status")):
+def restaurant_list_reservations(conn: DB,user: USER,status_filter: Literal["confirmed","seated","cancelled","completed","no_show","all"]=Query(default="confirmed",alias="status")):
     require_restaurant_floor(conn,user);require_permission(conn,user,"restaurant.floor")
     rows=conn.execute("SELECT r.id,r.table_id,t.label AS table_label,a.name AS area,r.customer_name,r.party_size,r.starts_at,r.ends_at,r.status FROM restaurant_reservations r JOIN restaurant_tables t ON t.id=r.table_id AND t.company_id=r.company_id JOIN restaurant_areas a ON a.id=t.area_id AND a.company_id=t.company_id WHERE r.company_id=? AND (?='all' OR r.status=?) ORDER BY r.starts_at LIMIT 200",(user["company_id"],status_filter,status_filter)).fetchall()
     return {"items":[dict(r) for r in rows]}
@@ -2648,10 +2664,10 @@ def restaurant_cancel_reservation(reservation_id: str,data: RestaurantReservatio
         row=conn.execute("SELECT status FROM restaurant_reservations WHERE id=? AND company_id=?"+lock,(reservation_id,user["company_id"])).fetchone()
         if not row:raise HTTPException(404,"Reserva não encontrada nesta empresa.")
         if row["status"]!="confirmed":raise HTTPException(409,"Somente reservas confirmadas podem ser canceladas ou marcadas como não comparecimento.")
-        conn.execute("UPDATE restaurant_reservations SET status='cancelled' WHERE id=? AND company_id=?",(reservation_id,user["company_id"]))
         action="no_show" if data.action=="no_show" else "cancelled"
+        conn.execute("UPDATE restaurant_reservations SET status=? WHERE id=? AND company_id=?",(action,reservation_id,user["company_id"]))
         audit(conn,user["company_id"],user["id"],"restaurant.reservation_"+action,"restaurant_reservation",reservation_id,{"action":action})
-    return {"id":reservation_id,"status":"cancelled","outcome":data.action}
+    return {"id":reservation_id,"status":action,"outcome":data.action}
 
 
 @app.post("/v1/restaurant/reservations",status_code=201)
