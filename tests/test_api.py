@@ -1521,6 +1521,48 @@ def test_branch_restaurant_menu_item_availability_is_isolated_to_branch(world):
     assert any(e['action']=='restaurant.branch_menu_availability_changed' and e['entity_id']==menu['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
 
 
+
+def test_restaurant_open_tabs_merge_moves_orders_closes_source_and_preserves_totals(world):
+    owner=company(world,name="Merge tabs",slug="merge-tabs",email="merge-tabs@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Merge room'}).json();table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'MG-01','capacity':5}).json();service=world.post(f"/v1/restaurant/tables/{table['id']}/open",headers=headers).json()
+    source=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Merge source'}).json();target=world.post(f"/v1/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Merge target'}).json()
+    p=product(world,owner,sku='MERGE-TABS',name='Merge dish',price='7.35');cat=world.post('/v1/restaurant/menu/categories',headers=headers,json={'name':'Merge category'}).json();menu=world.post('/v1/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json()
+    a=world.post(f"/v1/restaurant/tabs/{source['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'2'}]}).json();b=world.post(f"/v1/restaurant/tabs/{target['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1'}]}).json()
+    assert world.post(f"/v1/restaurant/orders/{a['id']}/send",headers=headers).status_code==200
+    merged=world.post(f"/v1/restaurant/tabs/{source['id']}/merge",headers=headers,json={'target_tab_id':target['id']});assert merged.status_code==200,merged.text;assert merged.json()['moved_orders']==1
+    a_detail=world.get(f"/v1/restaurant/tabs/{source['id']}",headers=headers).json();b_detail=world.get(f"/v1/restaurant/tabs/{target['id']}",headers=headers).json()
+    assert a_detail['status']=='closed' and a_detail['total']=='0.00'
+    assert b_detail['status']=='open' and b_detail['total']=='22.05' and {i['order_id'] for i in b_detail['items']}=={a['id'],b['id']}
+    assert world.get(f"/v1/restaurant/production?station=kitchen",headers=headers).json()['items'][0]['tab_id']==target['id']
+    assert world.post(f"/v1/restaurant/tabs/{source['id']}/merge",headers=headers,json={'target_tab_id':target['id']}).status_code==409
+    assert any(e['action']=='restaurant.tabs_merged' and e['entity_id']==source['id'] for e in world.get('/v1/audit-events',headers=headers).json()['items'])
+
+
+def test_branch_restaurant_tab_merge_is_branch_scoped_and_refuses_paid_tabs(world):
+    owner=company(world,name="Branch merge",slug="branch-merge",email="branch-merge@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    branch=world.get('/v1/company/branches',headers=headers).json()['items'][0]['id'];area=world.post(f'/v1/branches/{branch}/restaurant/areas',headers=headers,json={'name':'Branch merge room'}).json();table=world.post(f'/v1/branches/{branch}/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'BMG-01','capacity':5}).json();service=world.post(f"/v1/branches/{branch}/restaurant/tables/{table['id']}/open",headers=headers).json()
+    source=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Branch source'}).json();target=world.post(f"/v1/branches/{branch}/restaurant/services/{service['id']}/tabs",headers=headers,json={'label':'Branch target'}).json()
+    p=product(world,owner,sku='BRANCH-MERGE',name='Branch merge dish',price='10.00');cat=world.post(f'/v1/branches/{branch}/restaurant/menu/categories',headers=headers,json={'name':'Branch merge category'}).json();menu=world.post(f'/v1/branches/{branch}/restaurant/menu/items',headers=headers,json={'category_id':cat['id'],'product_id':p['id']}).json()
+    order=world.post(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}/orders",headers=headers,json={'items':[{'menu_item_id':menu['id'],'quantity':'1'}]}).json()
+    blocked=world.post(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}/merge",headers=headers,json={'target_tab_id':'no-such-tab'});assert blocked.status_code==404
+    order_item=world.get(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}",headers=headers).json()['items'][0]['id']
+    assert world.post(f"/v1/branches/{branch}/restaurant/orders/{order['id']}/send",headers=headers).status_code==200
+    for status in ('preparing','ready','delivered'):
+        updated=world.patch(f"/v1/branches/{branch}/restaurant/order-items/{order_item}",headers=headers,json={'status':status});assert updated.status_code==200,updated.text
+    conn=main.connect_db()
+    try:
+        tab_row=conn.execute("SELECT company_id,opened_by FROM branch_restaurant_tabs WHERE id=?",(source['id'],)).fetchone()
+        conn.execute("INSERT INTO branch_restaurant_tab_payments(id,company_id,branch_id,tab_id,amount_cents,method,idempotency_key,request_hash,received_by,received_at) VALUES(?,?,?,?,?,'cash',?,?,?,?)",(main.new_id(),tab_row['company_id'],branch,source['id'],200,'merge-guard-payment','qa-hash',tab_row['opened_by'],main.now_iso()))
+        conn.commit()
+    finally:conn.close()
+    refused=world.post(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}/merge",headers=headers,json={'target_tab_id':target['id']});assert refused.status_code==409
+    assert world.get(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}",headers=headers).json()['status']=='open'
+    assert world.get(f"/v1/branches/{branch}/restaurant/tabs/{target['id']}",headers=headers).json()['total']=='0.00'
+    assert order['id']==world.get(f"/v1/branches/{branch}/restaurant/tabs/{source['id']}",headers=headers).json()['items'][0]['order_id']
+
+
 def test_restaurant_unsent_item_can_be_split_between_open_tabs_same_service(world):
     owner=company(world,name="Item split",slug="item-split",email="item-split@example.test");headers=auth(owner)
     assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
