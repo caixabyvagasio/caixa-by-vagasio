@@ -735,7 +735,7 @@ def test_schema_migrations_are_versioned_and_idempotent(world):
     try:
         versions=[tuple(r) for r in conn.execute('SELECT version,name FROM schema_migrations ORDER BY version').fetchall()]
     finally: conn.close()
-    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments')]
+    assert versions==[(1,'sales_customer_id'),(2,'product_metadata'),(3,'company_barcode_unique_index'),(4,'backfill_legacy_paid_payables'),(5,'plans_branches_entitlements_permissions'),(6,'restaurant_menu_tabs_orders_cash_payments'),(7,'nullable_branch_scope_no_legacy_backfill'),(8,'branch_scoped_stock_ledger'),(9,'branch_scoped_cash_registers'),(10,'branch_purchase_scope_indexes'),(11,'branch_stock_sale_reversal_event_kinds'),(12,'nullable_restaurant_branch_scope'),(13,'branch_scoped_restaurant_menu'),(14,'branch_restaurant_menu_price_snapshot'),(15,'branch_restaurant_orders_cash_ledger'),(16,'restaurant_waiter_portal_and_assignments'),(17,'restaurant_reservation_no_show_status')]
 
 
 def test_legacy_paid_payables_are_backfilled_into_ledger_idempotently(world):
@@ -1951,6 +1951,23 @@ def test_concurrent_branch_table_open_creates_one_service_only(world):
 
 
 
+
+def test_reservation_no_show_migration_preserves_existing_reservations_and_is_idempotent(world):
+    owner=company(world,name="No-show migration",slug="no-show-migration",email="no-show-migration@example.test");headers=auth(owner)
+    assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
+    area=world.post('/v1/restaurant/areas',headers=headers,json={'name':'Migration room'}).json()
+    table=world.post('/v1/restaurant/tables',headers=headers,json={'area_id':area['id'],'label':'M-01','capacity':4}).json()
+    reservation=world.post('/v1/restaurant/reservations',headers=headers,json={'table_id':table['id'],'customer_name':'Preservado','party_size':2,'starts_at':'2026-12-18T18:00','ends_at':'2026-12-18T19:00'}).json()
+    conn=main.connect_db()
+    try:
+        conn.execute("UPDATE restaurant_reservations SET status='no_show' WHERE id=?",(reservation['id'],))
+        before=conn.execute('SELECT id,company_id,table_id,customer_name,party_size,starts_at,ends_at,status,branch_id FROM restaurant_reservations').fetchall()
+        main.apply_schema_migrations(conn);main.apply_schema_migrations(conn)
+        after=conn.execute('SELECT id,company_id,table_id,customer_name,party_size,starts_at,ends_at,status,branch_id FROM restaurant_reservations').fetchall()
+        assert [tuple(x) for x in after]==[tuple(x) for x in before]
+    finally:conn.close()
+
+
 def test_branch_reservation_lifecycle_seats_guest_and_opens_service_atomically(world):
     owner=company(world,name="Reservation lifecycle",slug="reservation-lifecycle",email="reservation-lifecycle@example.test");headers=auth(owner)
     assert world.put('/v1/company/profile',headers=headers,json={'primary_segment':'restaurant','answers':{'tables':True}}).status_code==200
@@ -1978,11 +1995,13 @@ def test_branch_reservation_can_cancel_or_record_no_show_with_audit(world):
         reservation=world.post(f'/v1/branches/{branch}/restaurant/reservations',headers=headers,json={'table_id':table['id'],'customer_name':f'Cliente {i}','party_size':2,'starts_at':f'2026-12-13T1{i}:00','ends_at':f'2026-12-13T1{i}:45'})
         assert reservation.status_code==201,reservation.text
         result=world.post(f"/v1/branches/{branch}/restaurant/reservations/{reservation.json()['id']}/cancel",headers=headers,json={'action':action})
-        assert result.status_code==200 and result.json()['outcome']==action
+        assert result.status_code==200 and result.json()['status']==('cancelled' if action=='cancel' else 'no_show')
         results.append(reservation.json()['id'])
     events=world.get('/v1/audit-events',headers=headers).json()['items']
     assert any(e['action']=='restaurant.branch_reservation_cancelled' and e['entity_id']==results[0] for e in events)
     assert any(e['action']=='restaurant.branch_reservation_no_show' and e['entity_id']==results[1] for e in events)
+    listed=world.get(f'/v1/branches/{branch}/restaurant/reservations?status=no_show',headers=headers).json()['items']
+    assert [row['id'] for row in listed]==[results[1]]
 
 
 def test_legacy_reservation_lifecycle_seats_guest_and_records_no_show(world):
